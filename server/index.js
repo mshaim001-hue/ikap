@@ -48,7 +48,7 @@ const classificationAgent = new Agent({
 - other: только если запрос совершенно не связан с инвестициями (погода, спорт, и т.д.)
 
 ПРАВИЛО: Если пользователь в процессе диалога (отвечает на вопросы, прикрепляет файлы) - ВСЕГДА выбирай investment_registration!`,
-  model: 'gpt-4o',
+  model: 'gpt-5',
   outputType: ClassificationAgentSchema,
   modelSettings: { store: true }
 })
@@ -131,7 +131,7 @@ const financialAnalystAgent = new Agent({
 - Будь точным с датами и периодами
 - Выдели ключевые моменты жирным шрифтом
 - Используй эмодзи для визуальной структуры`,
-  model: 'gpt-4o',
+  model: 'gpt-5',
   tools: [codeInterpreter],
   modelSettings: { store: true }
 })
@@ -243,7 +243,7 @@ const investmentAgent = new Agent({
 - НЕ ПОКАЗЫВАЙ КЛИЕНТУ детали анализа документов (суммы, обороты, остатки, БИН из файла и т.д.)
 - КЛИЕНТУ говори ТОЛЬКО: "Выписка принята" или "Декларация принята" + следующий запрос
 - ДЕТАЛЬНЫЙ АНАЛИЗ делай ВНУТРЕННЕ и сохраняй для итогового отчета менеджеру`,
-  model: 'gpt-4o',
+  model: 'gpt-5',
   tools: [codeInterpreter],
   modelSettings: { store: true }
 })
@@ -251,7 +251,7 @@ const investmentAgent = new Agent({
 const informationAgent = new Agent({
   name: 'Information Agent',
   instructions: 'Отвечай на вопросы о процессе привлечения инвестиций.',
-  model: 'gpt-4o',
+  model: 'gpt-5',
   modelSettings: { store: true }
 })
 
@@ -433,8 +433,11 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
         
         // Генерируем отчет асинхронно (не блокируем ответ клиенту)
         setImmediate(async () => {
+          // Определяем allFiles в начале для доступа в catch блоке
+          let allFiles = []
+          
           try {
-            const allFiles = sessionFiles.get(session) || []
+            allFiles = sessionFiles.get(session) || []
             if (allFiles.length === 0) {
               console.log(`⚠️ Нет файлов для анализа`)
               return
@@ -525,12 +528,30 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
               setTimeout(() => reject(new Error('Financial Analyst timeout (300s)')), 300000)
             )
             
-            const reportResult = await Promise.race([
-              reportRunner.run(analystWithFiles, [
-                { role: 'user', content: reportRequest }
-              ]),
-              analysisTimeout
-            ])
+            // Функция с повторной попыткой при rate limit
+            const runWithRetry = async (maxRetries = 3, retryDelay = 2000) => {
+              for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                  return await Promise.race([
+                    reportRunner.run(analystWithFiles, [
+                      { role: 'user', content: reportRequest }
+                    ]),
+                    analysisTimeout
+                  ])
+                } catch (error) {
+                  // Проверяем, это rate limit ошибка
+                  if (error.message && error.message.includes('Rate limit') && attempt < maxRetries) {
+                    console.log(`⚠️ Rate limit достигнут. Попытка ${attempt}/${maxRetries}. Ждем ${retryDelay}ms...`)
+                    await new Promise(resolve => setTimeout(resolve, retryDelay))
+                    retryDelay *= 2 // Увеличиваем задержку экспоненциально
+                    continue
+                  }
+                  throw error
+                }
+              }
+            }
+            
+            const reportResult = await runWithRetry()
             
             const analysisTime = ((Date.now() - startAnalysis) / 1000).toFixed(2)
             console.log(`⏱️ Анализ завершен за ${analysisTime}s`)
@@ -611,14 +632,11 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             console.error(`❌ Ошибка генерации отчета:`, error.message)
             console.error(`❌ Стек ошибки:`, error.stack)
             
-            // Получаем количество файлов из sessionFiles
-            const allFiles = sessionFiles.get(session) || []
-            
             // Сохраняем сообщение об ошибке как отчет
             sessionReports.set(session, {
               report: `Ошибка генерации отчета: ${error.message}`,
               generated: new Date().toISOString(),
-              filesCount: allFiles.length,
+              filesCount: allFiles.length || 0,
               error: true
             })
           }
