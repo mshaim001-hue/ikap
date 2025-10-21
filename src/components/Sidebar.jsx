@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useState, useEffect } from 'react'
 import { 
   Users, 
   Building, 
@@ -9,19 +9,55 @@ import {
   CreditCard, 
   Bell, 
   MessageCircle, 
-  Coins 
+  Coins,
+  ClipboardList
 } from 'lucide-react'
 import './Sidebar.css'
 
-const Sidebar = () => {
+const Sidebar = ({ onViewChange, activeView }) => {
+  const [newApplicationsCount, setNewApplicationsCount] = useState(0)
+
+  // Функция для получения количества новых заявок
+  const fetchNewApplicationsCount = async () => {
+    try {
+      const response = await fetch('/api/reports/new-count')
+      if (response.ok) {
+        const data = await response.json()
+        setNewApplicationsCount(data.count || 0)
+      }
+    } catch (error) {
+      console.error('Ошибка получения количества заявок:', error)
+    }
+  }
+
+  // Загружаем количество заявок при монтировании компонента
+  useEffect(() => {
+    fetchNewApplicationsCount()
+    
+    // Обновляем каждые 10 минут
+    const interval = setInterval(fetchNewApplicationsCount, 600000)
+    
+    return () => clearInterval(interval)
+  }, [])
+
+  const handleItemClick = (label) => {
+    if (label === 'Заявки') {
+      onViewChange('applications')
+    } else if (label === 'Владелец бизнеса') {
+      onViewChange('chat')
+    }
+    // Для других пунктов можно добавить логику позже
+  }
+
   const menuItems = [
     { icon: Users, label: 'Список сделок', active: false },
     { icon: Building, label: 'Портфель инвестора', active: false },
-    { icon: Briefcase, label: 'Владелец бизнеса', active: true },
+    { icon: Briefcase, label: 'Владелец бизнеса', active: activeView === 'chat' },
     { icon: Shield, label: 'Гарант', active: false },
     { icon: Calendar, label: 'Календарь платежей', active: false },
     { icon: FileText, label: 'Договоры', active: false },
     { icon: CreditCard, label: 'Платежи', active: false },
+    { icon: ClipboardList, label: 'Заявки', active: activeView === 'applications', badge: newApplicationsCount > 0 ? newApplicationsCount : null },
     { icon: Bell, label: 'Уведомления', active: false, badge: 5 },
     { icon: MessageCircle, label: 'Обращения', active: false },
     { icon: Coins, label: 'Дискуссии', active: false },
@@ -35,10 +71,11 @@ const Sidebar = () => {
           <div 
             key={index} 
             className={`nav-item ${item.active ? 'active' : ''}`}
+            onClick={() => handleItemClick(item.label)}
           >
             <item.icon size={20} />
             <span className="nav-label">{item.label}</span>
-            {item.badge && (
+            {item.badge && item.badge > 0 && (
               <span className="badge">{item.badge}</span>
             )}
           </div>

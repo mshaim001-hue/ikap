@@ -7,7 +7,7 @@ const AgentsChat = () => {
   const [messages, setMessages] = useState([
     {
       id: 1,
-      text: "Здравствуйте, как я могу к вам обращаться?",
+      text: "Здравствуйте, как я могу к Вам обращаться?",
       sender: 'bot',
       timestamp: new Date()
     }
@@ -20,9 +20,6 @@ const AgentsChat = () => {
   const [dialogState, setDialogState] = useState('greeting') // greeting, name_collected, terms_accepted, data_collection
   const [userName, setUserName] = useState('')
   const [isCompleted, setIsCompleted] = useState(false) // Флаг завершения заявки
-  const [showReportModal, setShowReportModal] = useState(false) // Модальное окно отчета
-  const [reportData, setReportData] = useState(null) // Данные отчета
-  const [loadingReport, setLoadingReport] = useState(false) // Загрузка отчета
   const fileInputRef = useRef(null)
   const messagesEndRef = useRef(null)
 
@@ -64,17 +61,28 @@ const AgentsChat = () => {
       setUserName(messageText)
       setDialogState('name_collected')
       
-      const botMessage = {
-        id: Date.now() + 1,
-        text: `Здравствуйте, ${messageText}. Вы находитесь на платформе по привлечению денег для вашего бизнеса. Прежде чем продолжить, пожалуйста, примите условия платформы.`,
-        sender: 'bot',
-        timestamp: new Date(),
-        showTermsButton: true
-      }
-      
-      setMessages(prev => [...prev, botMessage])
+      // Показываем спинер на 3 секунды
       setInputMessage('')
       setSelectedFile(null)
+      setIsLoading(true)
+      
+      setTimeout(() => {
+        const botMessage = {
+          id: Date.now() + 1,
+          text: `Здравствуйте, ${messageText}. Вы находитесь на платформе по привлечению денег для вашего бизнеса. 
+Получите финансирование от 10 млн до 1 млрд тенге под 2,5% годовых через нашу краудфандинговую платформу.
+Срок займа — от 4 до 36 месяцев.
+Быстрое одобрение, прозрачные условия, доступ к сообществу инвесторов, готовых поддержать ваш проект.
+Прежде чем продолжить, пожалуйста, примите условия платформы и подготовьте выписки с банка юр лица за этот год и предыдущий`,
+          sender: 'bot',
+          timestamp: new Date(),
+          showTermsButton: true
+        }
+        
+        setMessages(prev => [...prev, botMessage])
+        setIsLoading(false)
+      }, 3000)
+      
       return
     }
     
@@ -181,6 +189,19 @@ const AgentsChat = () => {
           console.log('🆔 Новый sessionId:', result.sessionId)
         }
         
+        // Проверяем, был ли запрос успешным
+        if (result.ok === false) {
+          console.error('⚠️ Сервер вернул ошибку:', result.message)
+          const errorMessage = {
+            id: Date.now() + 1,
+            text: result.message || "Произошла ошибка. Попробуйте еще раз.",
+            sender: 'bot',
+            timestamp: new Date()
+          }
+          setMessages(prev => [...prev, errorMessage])
+          return // Выходим, не обрабатываем дальше
+        }
+        
         const botMessage = {
           id: Date.now() + 1,
           text: result.message,
@@ -192,9 +213,9 @@ const AgentsChat = () => {
         console.log('💬 Добавляем сообщение бота:', result.message)
         setMessages(prev => [...prev, botMessage])
         
-        // Проверяем, завершена ли заявка
+        // Проверяем, завершена ли заявка  
         if (result.completed) {
-          console.log('✅ Заявка завершена!')
+          console.log('✅ Заявка завершена! Отчет генерируется в фоне.')
           setIsCompleted(true)
         }
       } catch (error) {
@@ -226,15 +247,21 @@ const AgentsChat = () => {
     setShowPrivacyModal(false)
     setDialogState('terms_accepted')
     
-    const botMessage = {
-      id: Date.now(),
-      text: "Какую сумму вы хотите получить?",
-      sender: 'bot',
-      timestamp: new Date()
-    }
+    // Показываем спиннер на 3 секунды
+    setIsLoading(true)
     
-    setMessages(prev => [...prev, botMessage])
-    console.log('🔄 Состояние изменено на: terms_accepted')
+    setTimeout(() => {
+      const botMessage = {
+        id: Date.now(),
+        text: "Какую сумму в тенге Вы хотите получить?",
+        sender: 'bot',
+        timestamp: new Date()
+      }
+      
+      setMessages(prev => [...prev, botMessage])
+      setIsLoading(false)
+      console.log('🔄 Состояние изменено на: terms_accepted')
+    }, 3000)
   }
 
   const handleDeclineTerms = () => {
@@ -257,34 +284,6 @@ const AgentsChat = () => {
     }
   }
 
-  const handleShowReport = async () => {
-    if (!sessionId) {
-      alert('Сессия не найдена')
-      return
-    }
-    
-    setLoadingReport(true)
-    setShowReportModal(true)
-    
-    try {
-      const resp = await fetch(`/api/agents/report/${sessionId}`)
-      const result = await resp.json()
-      
-      if (result.ok) {
-        setReportData(result)
-      } else {
-        setReportData({ error: result.message })
-        // Повторная попытка через 3 секунды
-        setTimeout(() => handleShowReport(), 3000)
-      }
-    } catch (error) {
-      console.error('❌ Ошибка загрузки отчета:', error)
-      setReportData({ error: 'Ошибка загрузки отчета' })
-    } finally {
-      setLoadingReport(false)
-    }
-  }
-
   return (
     <div className="agents-chat-container">
       <PrivacyPolicyModal 
@@ -296,7 +295,7 @@ const AgentsChat = () => {
       <div className="agents-chat-header">
         <div className="agents-chat-title">
           <Bot size={24} />
-          <span>AI Помощник по инвестициям (Agents SDK)</span>
+          <span>iKapitalist AI</span>
         </div>
       </div>
 
@@ -354,14 +353,8 @@ const AgentsChat = () => {
         {isCompleted ? (
           <div className="completion-message">
             <div className="completion-text">
-              Заявка завершена. Спасибо за предоставленную информацию!
+              ✅ Заявка завершена. Спасибо за предоставленную информацию! Мы анализируем ваши документы и свяжемся с вами в ближайшее время.
             </div>
-            <button 
-              onClick={handleShowReport}
-              className="report-button"
-            >
-              📊 Отчет для менеджера
-            </button>
           </div>
         ) : (
           <div className="input-container">
@@ -408,49 +401,6 @@ const AgentsChat = () => {
           style={{ display: 'none' }}
         />
       </div>
-      
-      {/* Модальное окно с отчетом */}
-      {showReportModal && (
-        <div className="report-modal-overlay" onClick={() => setShowReportModal(false)}>
-          <div className="report-modal-content" onClick={(e) => e.stopPropagation()}>
-            <div className="report-modal-header">
-              <h2>📊 Финансовый отчет для менеджера</h2>
-              <button 
-                onClick={() => setShowReportModal(false)}
-                className="report-modal-close"
-              >
-                ×
-              </button>
-            </div>
-            <div className="report-modal-body">
-              {loadingReport ? (
-                <div className="report-loading">
-                  <Loader size={32} className="animate-spin" />
-                  <p>Загрузка отчета...</p>
-                </div>
-              ) : reportData?.error ? (
-                <div className="report-error">
-                  <p>{reportData.error}</p>
-                  <p style={{ fontSize: '14px', color: '#666' }}>
-                    Отчет генерируется автоматически после завершения заявки. 
-                    Пожалуйста, подождите еще несколько секунд...
-                  </p>
-                </div>
-              ) : reportData?.report ? (
-                <div className="report-text">
-                  <pre style={{ whiteSpace: 'pre-wrap', fontFamily: 'inherit' }}>
-                    {reportData.report}
-                  </pre>
-                  <div className="report-meta">
-                    <small>Сгенерировано: {new Date(reportData.generated).toLocaleString('ru-RU')}</small>
-                    <small>Файлов проанализировано: {reportData.filesCount}</small>
-                  </div>
-                </div>
-              ) : null}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }

@@ -2,6 +2,7 @@ const express = require('express')
 const cors = require('cors')
 const multer = require('multer')
 const OpenAI = require('openai')
+const Database = require('better-sqlite3')
 require('dotenv').config()
 
 // Настройка multer для загрузки файлов
@@ -19,15 +20,34 @@ const app = express()
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
 
+// Инициализация SQLite базы данных
+const db = new Database('reports.db')
+db.exec(`
+  CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT UNIQUE NOT NULL,
+    company_bin TEXT,
+    amount TEXT,
+    term TEXT,
+    purpose TEXT,
+    name TEXT,
+    email TEXT,
+    phone TEXT,
+    report_text TEXT,
+    status TEXT DEFAULT 'generating',
+    files_count INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME
+  )
+`)
+console.log('✅ SQLite database initialized')
+
 // Хранилище для истории диалогов (в памяти)
 // В продакшене используйте Redis или базу данных
 const conversationHistory = new Map()
 
 // Хранилище для файлов по сессиям
 const sessionFiles = new Map()
-
-// Хранилище для финансовых отчетов
-const sessionReports = new Map()
 
 // Code Interpreter без предустановленных файлов
 // Файлы будут добавляться динамически
@@ -48,7 +68,7 @@ const classificationAgent = new Agent({
 - other: только если запрос совершенно не связан с инвестициями (погода, спорт, и т.д.)
 
 ПРАВИЛО: Если пользователь в процессе диалога (отвечает на вопросы, прикрепляет файлы) - ВСЕГДА выбирай investment_registration!`,
-  model: 'gpt-5',
+  model: 'gpt-5-nano',
   outputType: ClassificationAgentSchema,
   modelSettings: { store: true }
 })
@@ -143,13 +163,13 @@ const investmentAgent = new Agent({
 ТЕКУЩАЯ ДАТА: будет передана в начале каждого сообщения как [ДАТА: ...]
 
 ЭТАПЫ СБОРА ДАННЫХ (после принятия условий):
-1. "Какую сумму вы хотите получить?" - получи сумму
+1. "Какую сумму Вы хотите получить?" - получи сумму
 2. "На какой срок?" (в месяцах) - получи срок
-3. "Для чего вы привлекаете финансирование?" - получи цель
-4. "Пожалуйста, предоставьте ваш БИН" - получи БИН
+3. "Для чего Вы привлекаете финансирование?" - получи цель
+4. "Пожалуйста, предоставьте Ваш БИН" - получи БИН
 5. "Пожалуйста, прикрепите выписку с банка от юр лица за текущий год и предыдущий год" - получи выписки
 6. После получения выписок - запроси другие банки (повторяй до получения "нет")
-7. "Пожалуйста, оставьте ваши контактные данные: имя, фамилию, email и телефон" - получи контакты
+7. "Пожалуйста, оставьте Ваши контактные данные: имя, фамилию, email и телефон" - получи контакты
 8. После получения контактов - отправь финальное сообщение
 
 АНАЛИЗ БАНКОВСКИХ ВЫПИСОК:
@@ -223,7 +243,7 @@ const investmentAgent = new Agent({
 
 СБОР КОНТАКТНЫХ ДАННЫХ:
 Когда пользователь ответил "нет" на вопрос про другие банки:
-   КЛИЕНТУ: "Спасибо за предоставленные банковские выписки! Пожалуйста, оставьте ваши контактные данные для связи: имя, фамилию, email и телефон."
+   КЛИЕНТУ: "Спасибо за предоставленные банковские выписки! Пожалуйста, оставьте Ваши контактные данные для связи: имя, фамилию, email и телефон."
 
 ФИНАЛЬНЫЙ ЭТАП:
 Когда пользователь предоставил все контактные данные (имя, фамилия, email, телефон):
@@ -251,7 +271,7 @@ const investmentAgent = new Agent({
 const informationAgent = new Agent({
   name: 'Information Agent',
   instructions: 'Отвечай на вопросы о процессе привлечения инвестиций.',
-  model: 'gpt-5',
+  model: 'gpt-5-nano',
   modelSettings: { store: true }
 })
 
@@ -370,9 +390,10 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
         })
       }
       
-      // Запускаем агента с таймаутом
+      // Запускаем агента с увеличенным таймаутом (120 секунд для анализа файлов)
+      // Передаем всю историю - не можем обрезать из-за reasoning items в gpt-5
       const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Agent timeout (60s)')), 60000)
+        setTimeout(() => reject(new Error('Agent timeout (120s)')), 120000)
       )
       
       let inv
@@ -383,10 +404,11 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
         ])
       } catch (error) {
         if (error.message.includes('timeout')) {
-          console.error('⏰ Агент превысил таймаут 60 секунд')
+          console.error('⏰ Агент превысил таймаут 120 секунд')
+          // Возвращаем ok: true чтобы разблокировать фронтенд
           return res.json({
-            ok: false,
-            message: 'Обработка заняла слишком много времени. Попробуйте еще раз.',
+            ok: true,
+            message: 'Анализ файла занял слишком много времени. Пожалуйста, продолжите: напишите "да" если файл загружен, или прикрепите другой файл.',
             sessionId: session
           })
         }
@@ -463,7 +485,9 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             let termMonths = 'не указан'
             let purpose = 'не указана'
             let bin = 'не указан'
-            let contacts = 'не указаны'
+            let name = 'не указано'
+            let email = 'не указан'
+            let phone = 'не указан'
             
             // Парсим историю для извлечения данных
             const historyText = history.map(msg => {
@@ -482,18 +506,6 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             const binMatch = historyText.match(/\b(\d{12})\b/)
             if (binMatch) bin = binMatch[1]
             
-            const emailMatch = historyText.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i)
-            const phoneMatch = historyText.match(/(\+?\d[\d\s-]{9,})/g)
-            const nameMatch = historyText.match(/([А-Яа-яЁё]+\s+[А-Яа-яЁё]+)/i)
-            
-            if (emailMatch || phoneMatch || nameMatch) {
-              contacts = [
-                nameMatch ? nameMatch[1] : '',
-                emailMatch ? emailMatch[1] : '',
-                phoneMatch ? phoneMatch[phoneMatch.length - 1] : ''
-              ].filter(Boolean).join(', ')
-            }
-            
             // Ищем цель в сообщениях
             const purposeKeywords = ['новый бизнес', 'расширение', 'оборотные средства', 'инвестиции']
             for (const keyword of purposeKeywords) {
@@ -503,6 +515,33 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
               }
             }
             
+            // Извлекаем контакты из ПОСЛЕДНЕГО сообщения пользователя
+            const lastUserMessage = [...history].reverse().find(msg => msg.role === 'user')
+            if (lastUserMessage) {
+              const contactText = typeof lastUserMessage.content === 'string' 
+                ? lastUserMessage.content 
+                : (Array.isArray(lastUserMessage.content) 
+                  ? lastUserMessage.content.map(c => c.text || '').join(' ') 
+                  : '')
+              
+              const emailMatch = contactText.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i)
+              if (emailMatch) email = emailMatch[1]
+              
+              const phoneMatch = contactText.match(/(\+?\d[\d\s-]{9,})/g)
+              if (phoneMatch) phone = phoneMatch[phoneMatch.length - 1]
+              
+              const nameMatch = contactText.match(/([А-Яа-яЁё]+\s+[А-Яа-яЁё]+)/i)
+              if (nameMatch) name = nameMatch[1]
+            }
+            
+            // Сохраняем заявку в БД со статусом "generating"
+            const insertReport = db.prepare(`
+              INSERT OR REPLACE INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, status)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'generating')
+            `)
+            insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, allFiles.length)
+            console.log(`💾 Заявка сохранена в БД: ${session}`)
+            
             // Формируем компактный запрос
             const reportRequest = `Создай подробный финансовый отчет на основе предоставленных банковских выписок.
 
@@ -511,7 +550,7 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
 - Запрашиваемая сумма: ${amount}
 - Срок: ${termMonths}
 - Цель финансирования: ${purpose}
-- Контакты: ${contacts}
+- Контакты: ${name}, ${email}, ${phone}
 
 ЗАДАЧА:
 Проанализируй все ${allFiles.length} банковские выписки (файлы уже прикреплены) и создай полный финансовый отчет по структуре из твоих инструкций.`
@@ -523,9 +562,9 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             const reportRunner = new Runner({})
             const startAnalysis = Date.now()
             
-            // Добавляем таймаут на 300 секунд (5 минут) для анализа всех файлов
+            // Добавляем таймаут на 900 секунд (15 минут) для анализа всех файлов
             const analysisTimeout = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('Financial Analyst timeout (300s)')), 300000)
+              setTimeout(() => reject(new Error('Financial Analyst timeout (900s)')), 900000)
             )
             
             // Функция с повторной попыткой при rate limit
@@ -616,29 +655,36 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
               }
             }
             
-            // Сохраняем отчет
-            sessionReports.set(session, {
-              report,
-              generated: new Date().toISOString(),
-              filesCount: allFiles.length
-            })
+            // Сохраняем отчет в БД
+            const updateReport = db.prepare(`
+              UPDATE reports 
+              SET report_text = ?, status = 'completed', completed_at = CURRENT_TIMESTAMP
+              WHERE session_id = ?
+            `)
+            updateReport.run(report, session)
             
-            console.log(`✅ Финансовый отчет сгенерирован для сессии ${session}`)
+            console.log(`✅ Финансовый отчет сгенерирован и сохранен в БД для сессии ${session}`)
             console.log(`📊 ========== ОТЧЕТ ДЛЯ МЕНЕДЖЕРА ==========`)
-            console.log(report)
+            console.log(report.substring(0, 500) + '...')
             console.log(`📊 ==========================================\n`)
             
           } catch (error) {
             console.error(`❌ Ошибка генерации отчета:`, error.message)
             console.error(`❌ Стек ошибки:`, error.stack)
             
-            // Сохраняем сообщение об ошибке как отчет
-            sessionReports.set(session, {
-              report: `Ошибка генерации отчета: ${error.message}`,
-              generated: new Date().toISOString(),
-              filesCount: allFiles.length || 0,
-              error: true
-            })
+            // Если это таймаут — НЕ помечаем отчет как error, оставляем status=generating.
+            // Агент мог продолжить выполнение в OpenAI, и отчет придет позже.
+            if (String(error.message || '').includes('timeout')) {
+              console.warn('⏳ Financial Analyst не успел за таймаут. Статус оставлен generating, отчет может появиться позже.')
+            } else {
+              // Сохраняем ошибку в БД
+              const updateError = db.prepare(`
+                UPDATE reports 
+                SET report_text = ?, status = 'error', completed_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+              `)
+              updateError.run(`Ошибка генерации отчета: ${error.message}`, session)
+            }
           }
         })
       }
@@ -717,28 +763,86 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
 })
 
 // Эндпоинт для получения финансового отчета
-app.get('/api/agents/report/:sessionId', (req, res) => {
+// Эндпоинт для получения отчета по session_id
+app.get('/api/reports/:sessionId', (req, res) => {
   const { sessionId } = req.params
   
   console.log(`📊 Запрос отчета для сессии: ${sessionId}`)
   
-  const reportData = sessionReports.get(sessionId)
-  
-  if (!reportData) {
-    console.log(`⚠️ Отчет не найден для сессии ${sessionId}`)
+  try {
+    const report = db.prepare('SELECT * FROM reports WHERE session_id = ?').get(sessionId)
+    
+    if (!report) {
+      console.log(`⚠️ Отчет не найден для сессии ${sessionId}`)
+      return res.json({
+        ok: false,
+        message: 'Заявка не найдена'
+      })
+    }
+    
+    console.log(`✅ Отчет найден, статус: ${report.status}`)
     return res.json({
+      ok: true,
+      report: {
+        sessionId: report.session_id,
+        bin: report.company_bin,
+        amount: report.amount,
+        term: report.term,
+        purpose: report.purpose,
+        name: report.name,
+        email: report.email,
+        phone: report.phone,
+        filesCount: report.files_count,
+        status: report.status,
+        reportText: report.report_text,
+        createdAt: report.created_at,
+        completedAt: report.completed_at
+      }
+    })
+  } catch (error) {
+    console.error('❌ Ошибка получения отчета:', error)
+    return res.status(500).json({
       ok: false,
-      message: 'Отчет еще не сгенерирован. Подождите несколько секунд.'
+      message: 'Ошибка сервера'
     })
   }
-  
-  console.log(`✅ Отчет найден, отправляем клиенту`)
-  return res.json({
-    ok: true,
-    report: reportData.report,
-    generated: reportData.generated,
-    filesCount: reportData.filesCount
-  })
+})
+
+// Эндпоинт для получения списка всех заявок (для менеджера)
+app.get('/api/reports', (req, res) => {
+  try {
+    const reports = db.prepare(`
+      SELECT session_id, company_bin, amount, term, purpose, name, email, phone, 
+             status, files_count, created_at, completed_at
+      FROM reports 
+      ORDER BY created_at DESC
+    `).all()
+    
+    console.log(`📋 Получен список заявок: ${reports.length} шт.`)
+    return res.json({
+      ok: true,
+      reports: reports.map(r => ({
+        sessionId: r.session_id,
+        bin: r.company_bin,
+        amount: r.amount,
+        term: r.term,
+        purpose: r.purpose,
+        name: r.name,
+        email: r.email,
+        phone: r.phone,
+        filesCount: r.files_count,
+        status: r.status,
+        createdAt: r.created_at,
+        completedAt: r.completed_at
+      }))
+    })
+  } catch (error) {
+    console.error('❌ Ошибка получения списка заявок:', error)
+    return res.status(500).json({
+      ok: false,
+      message: 'Ошибка сервера'
+    })
+  }
 })
 
 const PORT = process.env.PORT || 8787

@@ -2,14 +2,14 @@ import React from 'react'
 import { Menu, ChevronDown, User } from 'lucide-react'
 import './Header.css'
 
-const Header = () => {
+const Header = ({ onLogoClick }) => {
   return (
     <header className="header">
       <div className="header-left">
         <button className="menu-button">
           <Menu size={20} />
         </button>
-        <div className="logo">
+        <div className="logo" onClick={onLogoClick}>
           <div className="logo-icon">i</div>
           <span className="logo-text">iKapitalist</span>
         </div>
