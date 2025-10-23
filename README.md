@@ -1,5 +1,5 @@
 # iKapitalist Frontend
-kjfhsal sdfsd
+kjfhsal sdfsd ыва
 Инвестиционная платформа iKapitalist с AI-чатботом на базе OpenAI ChatKit и Agent Builder для привлечения инвестиций.
 
 ## Установка и запуск
