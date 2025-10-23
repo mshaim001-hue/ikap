@@ -74,3 +74,44 @@ npm run dev
 5. **Перезапустите сервер разработки**
 
 **Примечание:** Для работы чат-бота необходимо настроить OpenAI API ключ и создать Agent Builder workflow.
+
+## Деплой на GitHub Pages
+
+Проект настроен для автоматического деплоя на GitHub Pages.
+
+### Автоматический деплой
+
+1. **Настройте GitHub Pages в репозитории:**
+   - Перейдите в Settings → Pages
+   - Выберите Source: "GitHub Actions"
+
+2. **Загрузите код в GitHub:**
+   ```bash
+   git add .
+   git commit -m "Setup GitHub Pages deployment"
+   git push origin main
+   ```
+
+3. **Деплой произойдет автоматически** при каждом push в ветку `main`
+
+### Ручной деплой
+
+Если нужно задеплоить вручную:
+
+```bash
+# Установите зависимости
+npm install
+
+# Соберите проект
+npm run build
+
+# Задеплойте на GitHub Pages
+npm run deploy
+```
+
+### URL проекта
+
+После деплоя проект будет доступен по адресу:
+`https://yourusername.github.io/ikap/`
+
+**Важно:** Убедитесь, что в `vite.config.js` правильно настроен `base` путь для вашего репозитория.
