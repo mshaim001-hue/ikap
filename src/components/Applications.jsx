@@ -13,6 +13,7 @@ import {
   XCircle,
   Trash2
 } from 'lucide-react'
+import { getApiUrl } from '../utils/api'
 import './Applications.css'
 
 const Applications = () => {
@@ -28,7 +29,7 @@ const Applications = () => {
   const fetchApplications = async () => {
     try {
       setLoading(true)
-      const response = await fetch('/api/reports')
+      const response = await fetch(getApiUrl('/api/reports'))
       const data = await response.json()
       
       if (data.ok) {
@@ -91,7 +92,7 @@ const Applications = () => {
     // Если отчет еще генерируется, загружаем его
     if (application.status === 'generating') {
       try {
-        const response = await fetch(`/api/reports/${application.sessionId}`)
+        const response = await fetch(getApiUrl(`/api/reports/${application.sessionId}`))
         const data = await response.json()
         
         if (data.ok && data.report) {
@@ -109,7 +110,7 @@ const Applications = () => {
     
     if (window.confirm('Вы уверены, что хотите удалить эту заявку?')) {
       try {
-        const response = await fetch(`/api/reports/${applicationId}`, {
+        const response = await fetch(getApiUrl(`/api/reports/${applicationId}`), {
           method: 'DELETE'
         })
         

@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react'
 import { Send, User, Paperclip } from 'lucide-react'
 import PrivacyPolicyModal from './PrivacyPolicyModal'
+import { getApiUrl } from '../utils/api'
 import './AgentsChat.css'
 
 // Иконка с буквами "iK" для iKapitalist
@@ -106,7 +107,7 @@ const AgentsChat = () => {
           
           try {
             console.log('📡 Запрос истории сессии:', savedSessionId)
-            const response = await fetch(`/api/sessions/${savedSessionId}/history`)
+            const response = await fetch(getApiUrl(`/api/sessions/${savedSessionId}/history`))
             
             if (response.ok) {
               const data = await response.json()
@@ -288,7 +289,7 @@ const AgentsChat = () => {
         console.log('📤 Отправляем запрос к серверу...')
         
         // call backend server
-        const resp = await fetch('/api/agents/run', {
+        const resp = await fetch(getApiUrl('/api/agents/run'), {
           method: 'POST',
           body: formData
         })
@@ -347,7 +348,7 @@ const AgentsChat = () => {
         console.log('📤 Отправляем запрос к серверу...')
         
         // call backend server
-        const resp = await fetch('/api/agents/run', {
+        const resp = await fetch(getApiUrl('/api/agents/run'), {
           method: 'POST',
           body: formData
         })

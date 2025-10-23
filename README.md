@@ -115,3 +115,54 @@ npm run deploy
 `https://yourusername.github.io/ikap/`
 
 **Важно:** Убедитесь, что в `vite.config.js` правильно настроен `base` путь для вашего репозитория.
+
+## Настройка переменных окружения для production
+
+Для работы приложения в production необходимо настроить GitHub Secrets:
+
+### 1. Добавьте секреты в GitHub:
+
+1. **Перейди в:** `https://github.com/mshaim001-hue/ikap/settings/secrets/actions`
+2. **Нажми "New repository secret"**
+3. **Добавь следующие секреты:**
+
+#### VITE_OPENAI_API_KEY
+- **Name:** `VITE_OPENAI_API_KEY`
+- **Value:** твой OpenAI API ключ (получи на https://platform.openai.com/api-keys)
+
+#### VITE_API_BASE_URL  
+- **Name:** `VITE_API_BASE_URL`
+- **Value:** URL твоего задеплоенного бэкенда (например: `https://your-backend.railway.app`)
+
+### 2. Деплой бэкенда
+
+Для работы приложения необходимо задеплоить бэкенд сервер (`server/index.js`):
+
+#### Варианты деплоя бэкенда:
+- **Railway:** https://railway.app (рекомендуется)
+- **Render:** https://render.com
+- **Heroku:** https://heroku.com
+- **Vercel:** https://vercel.com
+
+#### Инструкция для Railway:
+1. Зарегистрируйся на Railway
+2. Создай новый проект
+3. Подключи GitHub репозиторий
+4. Railway автоматически определит Node.js приложение
+5. Добавь переменные окружения в Railway:
+   - `OPENAI_API_KEY` - твой OpenAI API ключ
+   - `DATABASE_URL` - для SQLite (опционально)
+6. Скопируй URL приложения и добавь в GitHub Secrets как `VITE_API_BASE_URL`
+
+### 3. После настройки секретов:
+
+1. **Загрузи изменения:**
+   ```bash
+   git add .
+   git commit -m "Add environment variables for production"
+   git push origin main
+   ```
+
+2. **GitHub Actions автоматически пересоберет** приложение с переменными окружения
+
+3. **Проверь деплой** в разделе Actions

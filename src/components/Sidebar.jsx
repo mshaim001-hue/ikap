@@ -12,6 +12,7 @@ import {
   Coins,
   ClipboardList
 } from 'lucide-react'
+import { getApiUrl } from '../utils/api'
 import './Sidebar.css'
 
 const Sidebar = ({ onViewChange, activeView }) => {
@@ -20,7 +21,7 @@ const Sidebar = ({ onViewChange, activeView }) => {
   // Функция для получения количества новых заявок
   const fetchNewApplicationsCount = async () => {
     try {
-      const response = await fetch('/api/reports/new-count')
+      const response = await fetch(getApiUrl('/api/reports/new-count'))
       if (response.ok) {
         const data = await response.json()
         setNewApplicationsCount(data.count || 0)
