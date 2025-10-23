@@ -23,28 +23,39 @@ app.use(express.json({ limit: '10mb' }))
 // Глобальный OpenAI клиент для Assistants API
 const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// Инициализация SQLite базы данных
-const db = new Database('reports.db')
-db.exec(`
-  CREATE TABLE IF NOT EXISTS reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT UNIQUE NOT NULL,
-    company_bin TEXT,
-    amount TEXT,
-    term TEXT,
-    purpose TEXT,
-    name TEXT,
-    email TEXT,
-    phone TEXT,
-    report_text TEXT,
-    status TEXT DEFAULT 'generating',
-    files_count INTEGER DEFAULT 0,
-    files_data TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at DATETIME
-  )
-`)
-console.log('✅ SQLite database initialized')
+// Инициализация SQLite базы данных (отключено для production)
+// const db = new Database('reports.db')
+
+// Заглушка для базы данных в production
+const db = {
+  exec: () => {},
+  prepare: (sql) => ({
+    run: () => {},
+    get: () => null,
+    all: () => []
+  })
+}
+
+// db.exec(`
+//   CREATE TABLE IF NOT EXISTS reports (
+//     id INTEGER PRIMARY KEY AUTOINCREMENT,
+//     session_id TEXT UNIQUE NOT NULL,
+//     company_bin TEXT,
+//     amount TEXT,
+//     term TEXT,
+//     purpose TEXT,
+//     name TEXT,
+//     email TEXT,
+//     phone TEXT,
+//     report_text TEXT,
+//     status TEXT DEFAULT 'generating',
+//     files_count INTEGER DEFAULT 0,
+//     files_data TEXT,
+//     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+//     completed_at DATETIME
+//   )
+// `)
+console.log('✅ Database mock initialized for production')
 
 // Хранилище для истории диалогов (в памяти)
 // В продакшене используйте Redis или базу данных
