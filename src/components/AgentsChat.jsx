@@ -1,7 +1,31 @@
 import React, { useState, useRef, useEffect } from 'react'
-import { Send, Bot, User, Loader, Paperclip } from 'lucide-react'
+import { Send, User, Paperclip } from 'lucide-react'
 import PrivacyPolicyModal from './PrivacyPolicyModal'
 import './AgentsChat.css'
+
+// Иконка с буквами "iK" для iKapitalist
+const AIIcon = ({ size = 24 }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none">
+    <circle cx="12" cy="12" r="10" fill="url(#ikGradient)" />
+    <text 
+      x="12" 
+      y="16" 
+      fontFamily="system-ui, -apple-system, sans-serif" 
+      fontSize="11" 
+      fontWeight="700" 
+      fill="white" 
+      textAnchor="middle"
+    >
+      iK
+    </text>
+    <defs>
+      <linearGradient id="ikGradient" x1="2" y1="2" x2="22" y2="22">
+        <stop stopColor="#667eea" />
+        <stop offset="1" stopColor="#764ba2" />
+      </linearGradient>
+    </defs>
+  </svg>
+)
 
 const AgentsChat = () => {
   const [messages, setMessages] = useState([
@@ -20,6 +44,7 @@ const AgentsChat = () => {
   const [dialogState, setDialogState] = useState('greeting') // greeting, name_collected, terms_accepted, data_collection
   const [userName, setUserName] = useState('')
   const [isCompleted, setIsCompleted] = useState(false) // Флаг завершения заявки
+  const [isRestoringSession, setIsRestoringSession] = useState(false)
   const fileInputRef = useRef(null)
   const messagesEndRef = useRef(null)
 
@@ -30,6 +55,155 @@ const AgentsChat = () => {
   useEffect(() => {
     scrollToBottom()
   }, [messages])
+  
+  // Сохранение состояния в localStorage
+  useEffect(() => {
+    if (sessionId) {
+      localStorage.setItem('ikap_sessionId', sessionId)
+    }
+    if (dialogState) {
+      localStorage.setItem('ikap_dialogState', dialogState)
+    }
+    if (userName) {
+      localStorage.setItem('ikap_userName', userName)
+    }
+    if (isCompleted) {
+      localStorage.setItem('ikap_isCompleted', 'true')
+    }
+  }, [sessionId, dialogState, userName, isCompleted])
+  
+  // Восстановление сессии при загрузке компонента
+  useEffect(() => {
+    const restoreSession = async () => {
+      const savedSessionId = localStorage.getItem('ikap_sessionId')
+      const savedDialogState = localStorage.getItem('ikap_dialogState')
+      const savedUserName = localStorage.getItem('ikap_userName')
+      const savedIsCompleted = localStorage.getItem('ikap_isCompleted')
+      
+      console.log('🔄 Проверка сохраненного состояния:', {
+        sessionId: savedSessionId,
+        dialogState: savedDialogState,
+        userName: savedUserName
+      })
+      
+      // Если есть сохраненное состояние диалога (даже без sessionId)
+      if (savedDialogState && savedDialogState !== 'greeting') {
+        console.log('🔄 Восстанавливаем состояние диалога:', savedDialogState)
+        
+        // Восстанавливаем локальное состояние
+        if (savedUserName) {
+          setUserName(savedUserName)
+          console.log('👤 Имя восстановлено:', savedUserName)
+        }
+        
+        if (savedIsCompleted === 'true') {
+          setIsCompleted(true)
+        }
+        
+        // Если есть sessionId, пытаемся восстановить историю с сервера
+        if (savedSessionId) {
+          setIsRestoringSession(true)
+          
+          try {
+            console.log('📡 Запрос истории сессии:', savedSessionId)
+            const response = await fetch(`/api/sessions/${savedSessionId}/history`)
+            
+            if (response.ok) {
+              const data = await response.json()
+              console.log('✅ История сессии получена:', data)
+              
+              if (data.messages && data.messages.length > 0) {
+                // Восстанавливаем полную сессию
+                setSessionId(savedSessionId)
+                setMessages(data.messages)
+                setDialogState(savedDialogState)
+                
+                console.log('✅ Полная сессия восстановлена!')
+              } else {
+                // Если история пуста на сервере, восстанавливаем только локальное состояние
+                console.log('⚠️ История на сервере пуста, восстанавливаем локальное состояние')
+                setDialogState(savedDialogState)
+                
+                // Восстанавливаем приветственное сообщение в зависимости от состояния
+                if (savedDialogState === 'name_collected' && savedUserName) {
+                  setMessages([
+                    {
+                      id: 1,
+                      text: "Здравствуйте, как я могу к Вам обращаться?",
+                      sender: 'bot',
+                      timestamp: new Date()
+                    },
+                    {
+                      id: 2,
+                      text: savedUserName,
+                      sender: 'user',
+                      timestamp: new Date()
+                    },
+                    {
+                      id: 3,
+                      text: `Приятно познакомиться, ${savedUserName}! Для продолжения работы с платформой iKapitalist необходимо ознакомиться с условиями использования и политикой конфиденциальности.`,
+                      sender: 'bot',
+                      timestamp: new Date(),
+                      showTermsButton: true
+                    }
+                  ])
+                } else if (savedDialogState === 'terms_accepted') {
+                  setMessages([
+                    {
+                      id: 1,
+                      text: "Здравствуйте, как я могу к Вам обращаться?",
+                      sender: 'bot',
+                      timestamp: new Date()
+                    },
+                    {
+                      id: 2,
+                      text: savedUserName || 'Пользователь',
+                      sender: 'user',
+                      timestamp: new Date()
+                    },
+                    {
+                      id: 3,
+                      text: `Приятно познакомиться, ${savedUserName}! Для продолжения работы с платформой iKapitalist необходимо ознакомиться с условиями использования и политикой конфиденциальности.`,
+                      sender: 'bot',
+                      timestamp: new Date()
+                    },
+                    {
+                      id: 4,
+                      text: 'Условия приняты',
+                      sender: 'user',
+                      timestamp: new Date()
+                    },
+                    {
+                      id: 5,
+                      text: 'Спасибо! Теперь вы можете начать работу с платформой. Чем я могу вам помочь?',
+                      sender: 'bot',
+                      timestamp: new Date()
+                    }
+                  ])
+                }
+              }
+            } else {
+              // Если сессия не найдена на сервере, восстанавливаем локальное состояние
+              console.log('⚠️ Сессия не найдена на сервере, восстанавливаем локальное состояние')
+              setDialogState(savedDialogState)
+            }
+          } catch (error) {
+            console.error('❌ Ошибка восстановления сессии:', error)
+            // В случае ошибки все равно восстанавливаем локальное состояние
+            setDialogState(savedDialogState)
+          }
+          
+          setIsRestoringSession(false)
+        } else {
+          // Если нет sessionId, просто восстанавливаем состояние диалога
+          setDialogState(savedDialogState)
+          console.log('✅ Локальное состояние восстановлено (без sessionId)')
+        }
+      }
+    }
+    
+    restoreSession()
+  }, [])
 
   const handleFileSelect = (event) => {
     const file = event.target.files[0]
@@ -126,6 +300,7 @@ const AgentsChat = () => {
         // Сохраняем sessionId для следующих запросов
         if (result.sessionId && !sessionId) {
           setSessionId(result.sessionId)
+          localStorage.setItem('ikap_sessionId', result.sessionId)
           console.log('🆔 Новый sessionId:', result.sessionId)
         }
         
@@ -160,8 +335,6 @@ const AgentsChat = () => {
       console.log('🆔 SessionId:', sessionId)
       console.log('📎 Файл:', selectedFile?.name)
       
-      setInputMessage('')
-      setSelectedFile(null)
       setIsLoading(true)
 
       try {
@@ -186,6 +359,7 @@ const AgentsChat = () => {
         // Сохраняем sessionId для следующих запросов
         if (result.sessionId && !sessionId) {
           setSessionId(result.sessionId)
+          localStorage.setItem('ikap_sessionId', result.sessionId)
           console.log('🆔 Новый sessionId:', result.sessionId)
         }
         
@@ -199,6 +373,9 @@ const AgentsChat = () => {
             timestamp: new Date()
           }
           setMessages(prev => [...prev, errorMessage])
+          // Очищаем поля только после неуспешного ответа
+          setInputMessage('')
+          setSelectedFile(null)
           return // Выходим, не обрабатываем дальше
         }
         
@@ -213,10 +390,19 @@ const AgentsChat = () => {
         console.log('💬 Добавляем сообщение бота:', result.message)
         setMessages(prev => [...prev, botMessage])
         
+        // Очищаем поля после успешной отправки
+        setInputMessage('')
+        setSelectedFile(null)
+        
         // Проверяем, завершена ли заявка  
         if (result.completed) {
           console.log('✅ Заявка завершена! Отчет генерируется в фоне.')
           setIsCompleted(true)
+          // Очищаем localStorage после завершения заявки
+          // Пользователь больше не сможет продолжить эту сессию
+          localStorage.removeItem('ikap_sessionId')
+          localStorage.removeItem('ikap_dialogState')
+          localStorage.removeItem('ikap_userName')
         }
       } catch (error) {
         console.error('❌ Ошибка отправки сообщения:', error)
@@ -227,6 +413,9 @@ const AgentsChat = () => {
           timestamp: new Date()
         }
         setMessages(prev => [...prev, errorMessage])
+        // Очищаем поля после ошибки
+        setInputMessage('')
+        setSelectedFile(null)
       } finally {
         setIsLoading(false)
       }
@@ -294,16 +483,26 @@ const AgentsChat = () => {
       
       <div className="agents-chat-header">
         <div className="agents-chat-title">
-          <Bot size={24} />
+          <AIIcon size={28} />
           <span>iKapitalist AI</span>
         </div>
       </div>
 
       <div className="agents-chat-messages">
+        {isRestoringSession ? (
+          <div className="message bot">
+            <div className="message-avatar">
+              <AIIcon size={22} />
+            </div>
+            <div className="message-content">
+              <div className="message-text">Восстанавливаем вашу сессию...</div>
+            </div>
+          </div>
+        ) : null}
         {messages.map((message) => (
           <div key={message.id} className={`message ${message.sender}`}>
             <div className="message-avatar">
-              {message.sender === 'bot' ? <Bot size={20} /> : <User size={20} />}
+              {message.sender === 'bot' ? <AIIcon size={22} /> : <User size={20} />}
             </div>
             <div className="message-content">
               <div className="message-text">{message.text}</div>
@@ -335,12 +534,15 @@ const AgentsChat = () => {
         {isLoading && (
           <div className="message bot">
             <div className="message-avatar">
-              <Bot size={20} />
+              <AIIcon size={22} />
             </div>
             <div className="message-content">
               <div className="message-text">
-                <Loader size={16} className="animate-spin" />
-                Обрабатываю запрос...
+                <div className="loading-dots">
+                  <span></span>
+                  <span></span>
+                  <span></span>
+                </div>
               </div>
             </div>
           </div>
@@ -355,6 +557,25 @@ const AgentsChat = () => {
             <div className="completion-text">
               ✅ Заявка завершена. Спасибо за предоставленную информацию! Мы анализируем ваши документы и свяжемся с вами в ближайшее время.
             </div>
+            <button 
+              onClick={() => window.location.reload()}
+              className="new-application-button"
+              style={{
+                marginTop: '15px',
+                padding: '12px 24px',
+                background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+                color: 'white',
+                border: 'none',
+                borderRadius: '12px',
+                cursor: 'pointer',
+                fontSize: '14px',
+                fontWeight: '600',
+                boxShadow: '0 4px 15px rgba(102, 126, 234, 0.3)',
+                transition: 'all 0.3s ease'
+              }}
+            >
+              Подать новую заявку
+            </button>
           </div>
         ) : (
           <div className="input-container">

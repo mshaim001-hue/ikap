@@ -20,6 +20,9 @@ const app = express()
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
 
+// Глобальный OpenAI клиент для Assistants API
+const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+
 // Инициализация SQLite базы данных
 const db = new Database('reports.db')
 db.exec(`
@@ -36,6 +39,7 @@ db.exec(`
     report_text TEXT,
     status TEXT DEFAULT 'generating',
     files_count INTEGER DEFAULT 0,
+    files_data TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     completed_at DATETIME
   )
@@ -47,6 +51,7 @@ console.log('✅ SQLite database initialized')
 const conversationHistory = new Map()
 
 // Хранилище для файлов по сессиям
+// Формат: session -> [{fileId: string, originalName: string, size: number}]
 const sessionFiles = new Map()
 
 // Code Interpreter без предустановленных файлов
@@ -263,7 +268,7 @@ const investmentAgent = new Agent({
 - НЕ ПОКАЗЫВАЙ КЛИЕНТУ детали анализа документов (суммы, обороты, остатки, БИН из файла и т.д.)
 - КЛИЕНТУ говори ТОЛЬКО: "Выписка принята" или "Декларация принята" + следующий запрос
 - ДЕТАЛЬНЫЙ АНАЛИЗ делай ВНУТРЕННЕ и сохраняй для итогового отчета менеджеру`,
-  model: 'gpt-5',
+  model: 'gpt-5-nano',
   tools: [codeInterpreter],
   modelSettings: { store: true }
 })
@@ -324,7 +329,12 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
         if (!sessionFiles.has(session)) {
           sessionFiles.set(session, [])
         }
-        sessionFiles.get(session).push(uploadedFileId)
+        sessionFiles.get(session).push({
+          fileId: uploadedFileId,
+          originalName: file.originalname,
+          size: file.size,
+          uploadedAt: new Date().toISOString()
+        })
         console.log(`💾 Файл сохранен в сессии. Всего файлов: ${sessionFiles.get(session).length}`)
         
         // Добавляем информацию о файле в текст
@@ -468,13 +478,16 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             console.log(`📊 Генерация отчета с ${allFiles.length} файлами...`)
             console.log(`📎 Файлы для анализа:`, allFiles)
             
+            // Извлекаем только fileId для передачи в агента
+            const fileIds = allFiles.map(f => f.fileId)
+            
             // Создаем агента с доступом ко всем файлам
             const analystWithFiles = new Agent({
               ...financialAnalystAgent,
               tools: [codeInterpreterTool({ 
                 container: { 
                   type: 'auto', 
-                  file_ids: allFiles 
+                  file_ids: fileIds 
                 } 
               })]
             })
@@ -496,22 +509,86 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
               return ''
             }).join(' ')
             
-            // Простое извлечение данных (можно улучшить)
+            // Извлечение данных из истории сообщений
             const amountMatch = historyText.match(/(\d+)\s*мил/i)
             if (amountMatch) amount = `${amountMatch[1]} млн KZT`
             
-            const termMatch = historyText.match(/(\d+)\s*месяц/i) || historyText.match(/срок[:\s]*(\d+)/i)
-            if (termMatch) termMonths = `${termMatch[1]} месяцев`
+            // Ищем срок - сначала в последовательности вопрос-ответ
+            for (let i = 0; i < history.length; i++) {
+              const msg = history[i]
+              if (msg.role === 'assistant') {
+                const assistantText = typeof msg.content === 'string' 
+                  ? msg.content 
+                  : (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join(' ') : '')
+                
+                // Если агент спрашивает о сроке
+                if (assistantText.match(/срок|месяц/i)) {
+                  // Берем следующее сообщение пользователя
+                  if (i + 1 < history.length && history[i + 1].role === 'user') {
+                    const userResponse = typeof history[i + 1].content === 'string'
+                      ? history[i + 1].content
+                      : (Array.isArray(history[i + 1].content) ? history[i + 1].content.map(c => c.text || '').join(' ') : '')
+                    
+                    // Ищем число в ответе пользователя
+                    const numberMatch = userResponse.match(/(\d+)/)
+                    if (numberMatch) {
+                      termMonths = `${numberMatch[1]} месяцев`
+                      break
+                    }
+                  }
+                }
+              }
+            }
+            
+            // Если не нашли в последовательности, пробуем по ключевым словам
+            if (termMonths === 'не указан') {
+              const termMatch = historyText.match(/(\d+)\s*месяц/i) || 
+                               historyText.match(/срок[:\s]*(\d+)/i) ||
+                               historyText.match(/(\d+)\s*мес/i) ||
+                               historyText.match(/срок[^0-9]*(\d+)/i)
+              if (termMatch) termMonths = `${termMatch[1]} месяцев`
+            }
             
             const binMatch = historyText.match(/\b(\d{12})\b/)
             if (binMatch) bin = binMatch[1]
             
-            // Ищем цель в сообщениях
-            const purposeKeywords = ['новый бизнес', 'расширение', 'оборотные средства', 'инвестиции']
-            for (const keyword of purposeKeywords) {
-              if (historyText.toLowerCase().includes(keyword)) {
-                purpose = keyword
-                break
+            // Ищем цель финансирования в истории
+            // Сначала пытаемся найти в последовательности сообщений
+            for (let i = 0; i < history.length; i++) {
+              const msg = history[i]
+              if (msg.role === 'assistant') {
+                const assistantText = typeof msg.content === 'string' 
+                  ? msg.content 
+                  : (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join(' ') : '')
+                
+                // Если агент спрашивает о цели
+                if (assistantText.match(/для чего|цел[ьи]|привлекаете финансирование/i)) {
+                  // Берем следующее сообщение пользователя
+                  if (i + 1 < history.length && history[i + 1].role === 'user') {
+                    const userResponse = typeof history[i + 1].content === 'string'
+                      ? history[i + 1].content
+                      : (Array.isArray(history[i + 1].content) ? history[i + 1].content.map(c => c.text || '').join(' ') : '')
+                    
+                    // Очищаем от служебной информации о файлах и датах
+                    purpose = userResponse
+                      .replace(/\[Прикреплен файл.*?\]/g, '')
+                      .replace(/\[ДАТА:.*?\]/g, '')
+                      .replace(/^\s*\[.*?\]\s*/g, '') // Убираем любые [скобки] в начале
+                      .trim()
+                    if (purpose) break
+                  }
+                }
+              }
+            }
+            
+            // Если не нашли, пробуем по ключевым словам
+            if (purpose === 'не указана') {
+              const purposeKeywords = ['новый бизнес', 'расширение', 'оборотные средства', 'инвестиции', 'пополнение']
+              for (const keyword of purposeKeywords) {
+                if (historyText.toLowerCase().includes(keyword)) {
+                  purpose = keyword
+                  break
+                }
               }
             }
             
@@ -535,12 +612,13 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             }
             
             // Сохраняем заявку в БД со статусом "generating"
+            const filesData = JSON.stringify(allFiles)
             const insertReport = db.prepare(`
-              INSERT OR REPLACE INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, status)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'generating')
+              INSERT OR REPLACE INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generating')
             `)
-            insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, allFiles.length)
-            console.log(`💾 Заявка сохранена в БД: ${session}`)
+            insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, allFiles.length, filesData)
+            console.log(`💾 Заявка сохранена в БД: ${session}, файлов: ${allFiles.length}`)
             
             // Формируем компактный запрос
             const reportRequest = `Создай подробный финансовый отчет на основе предоставленных банковских выписок.
@@ -559,78 +637,195 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             console.log(reportRequest)
             console.log(`\n⏱️ Запускаем Financial Analyst Agent...`)
             
+            // Создаем обычный Runner (параметры polling не поддерживаются в этой версии SDK)
             const reportRunner = new Runner({})
             const startAnalysis = Date.now()
             
-            // Добавляем таймаут на 900 секунд (15 минут) для анализа всех файлов
+            // Добавляем таймаут на 30 минут для анализа всех файлов (PDF анализ может быть долгим)
+            const TIMEOUT_MS = 30 * 60 * 1000 // 30 минут
             const analysisTimeout = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error('Financial Analyst timeout (900s)')), 900000)
+              setTimeout(() => reject(new Error(`Financial Analyst timeout (${TIMEOUT_MS/1000}s)`)), TIMEOUT_MS)
             )
             
-            // Функция с повторной попыткой при rate limit
-            const runWithRetry = async (maxRetries = 3, retryDelay = 2000) => {
-              for (let attempt = 1; attempt <= maxRetries; attempt++) {
-                try {
-                  return await Promise.race([
-                    reportRunner.run(analystWithFiles, [
-                      { role: 'user', content: reportRequest }
-                    ]),
-                    analysisTimeout
-                  ])
-                } catch (error) {
-                  // Проверяем, это rate limit ошибка
-                  if (error.message && error.message.includes('Rate limit') && attempt < maxRetries) {
-                    console.log(`⚠️ Rate limit достигнут. Попытка ${attempt}/${maxRetries}. Ждем ${retryDelay}ms...`)
-                    await new Promise(resolve => setTimeout(resolve, retryDelay))
-                    retryDelay *= 2 // Увеличиваем задержку экспоненциально
-                    continue
-                  }
-                  throw error
-                }
-              }
+            // Функция для периодического логирования прогресса
+            const startProgressLogger = () => {
+              let elapsed = 0
+              const intervalId = setInterval(() => {
+                elapsed += 60
+                console.log(`⏰ Генерация отчета: прошло ${elapsed} секунд...`)
+              }, 60000) // Каждую минуту
+              
+              return () => clearInterval(intervalId)
             }
             
-            const reportResult = await runWithRetry()
+            // Функция для ручного polling с полным контролем
+            const runWithManualPolling = async () => {
+              console.log(`🚀 Создаем thread и run вручную для полного контроля...`)
+              
+              // Создаем assistant через OpenAI API
+              console.log(`📋 Создаем Financial Analyst Assistant...`)
+              const assistant = await openaiClient.beta.assistants.create({
+                name: 'Financial Analyst',
+                instructions: financialAnalystAgent.instructions,
+                model: 'gpt-4o',
+                tools: [{ type: 'code_interpreter' }]
+              })
+              console.log(`✅ Assistant создан: ${assistant.id}`)
+              
+              // Создаем thread
+              console.log(`📝 Создаем thread...`)
+              const thread = await openaiClient.beta.threads.create()
+              const threadId = thread.id
+              console.log(`✅ Thread создан: ${threadId}`)
+              
+              // Добавляем сообщение
+              console.log(`💬 Добавляем сообщение в thread...`)
+              await openaiClient.beta.threads.messages.create(threadId, {
+                role: 'user',
+                content: reportRequest,
+                attachments: fileIds.map(id => ({
+                  file_id: id,
+                  tools: [{ type: 'code_interpreter' }]
+                }))
+              })
+              
+              // Запускаем run
+              console.log(`⚙️ Запускаем run...`)
+              const run = await openaiClient.beta.threads.runs.create(threadId, {
+                assistant_id: assistant.id
+              })
+              const runId = run.id
+              console.log(`✅ Run создан: ${runId}`)
+              
+              // Ручной polling с логированием
+              const stopLogger = startProgressLogger()
+              let runStatus = run
+              let attempts = 0
+              const maxAttempts = 360 // 360 * 5 сек = 30 минут
+              
+              console.log(`🔄 Начинаем polling статуса run...`)
+              
+              while (runStatus.status !== 'completed' && runStatus.status !== 'failed' && runStatus.status !== 'cancelled') {
+                await new Promise(resolve => setTimeout(resolve, 5000)) // Ждем 5 секунд
+                
+                runStatus = await openaiClient.beta.threads.runs.retrieve(runId, { thread_id: threadId })
+                attempts++
+                
+                console.log(`📊 Polling ${attempts}/${maxAttempts}: status=${runStatus.status}`)
+                
+                if (attempts >= maxAttempts) {
+                  stopLogger()
+                  throw new Error(`Run не завершился за ${maxAttempts * 5} секунд`)
+                }
+              }
+              
+              stopLogger()
+              
+              if (runStatus.status === 'failed') {
+                console.error(`❌ Run failed:`, runStatus.last_error)
+                throw new Error(`Run failed: ${runStatus.last_error?.message || 'Unknown error'}`)
+              }
+              
+              if (runStatus.status === 'cancelled') {
+                throw new Error('Run was cancelled')
+              }
+              
+              console.log(`✅ Run completed! Получаем сообщения...`)
+              
+              // Получаем сообщения
+              const messages = await openaiClient.beta.threads.messages.list(threadId)
+              
+              // Формируем результат в формате runner.run()
+              const newItems = []
+              for (const message of messages.data) {
+                if (message.role === 'assistant' && message.run_id === runId) {
+                  newItems.push({
+                    rawItem: message
+                  })
+                }
+              }
+              
+              console.log(`📦 Получено ${newItems.length} новых сообщений от assistant`)
+              
+              // Удаляем временный assistant
+              await openaiClient.beta.assistants.delete(assistant.id)
+              console.log(`🗑️ Временный assistant удален`)
+              
+              return { newItems }
+            }
             
+            console.log(`⏳ Ожидание ответа от Financial Analyst Agent...`)
+            console.log(`🔄 Начинаем runWithManualPolling с полным контролем...`)
+            
+            // Запускаем с таймаутом
+            const reportResult = await Promise.race([
+              runWithManualPolling(),
+              analysisTimeout
+            ])
+            
+            console.log(`✅ runWithRetry завершен успешно`)
             const analysisTime = ((Date.now() - startAnalysis) / 1000).toFixed(2)
             console.log(`⏱️ Анализ завершен за ${analysisTime}s`)
             console.log(`📦 Получено элементов: ${reportResult.newItems.length}`)
+            console.log(`✅ Отчет успешно получен от OpenAI`)
             
             // Логируем структуру ответа для отладки
-            console.log(`🔍 Структура ответа:`)
-            console.log(JSON.stringify(reportResult.newItems.map((item, i) => ({
-              index: i,
-              role: item.rawItem?.role,
-              contentType: item.rawItem?.content?.[0]?.type,
-              hasText: !!item.rawItem?.content?.[0]?.text,
-              textLength: item.rawItem?.content?.[0]?.text?.length || 0
-            })), null, 2))
+            console.log(`🔍 Структура ответа (newItems: ${reportResult.newItems?.length || 0}):`)
+            
+            // Детальное логирование каждого элемента
+            reportResult.newItems?.forEach((item, i) => {
+              console.log(`\n📦 Элемент ${i}:`)
+              console.log(`  - role: ${item.rawItem?.role}`)
+              console.log(`  - content type: ${Array.isArray(item.rawItem?.content) ? 'array' : typeof item.rawItem?.content}`)
+              
+              if (Array.isArray(item.rawItem?.content)) {
+                item.rawItem.content.forEach((c, ci) => {
+                  console.log(`  - content[${ci}].type: ${c?.type}`)
+                  if (c?.type === 'text') {
+                    console.log(`  - content[${ci}].text length: ${c?.text?.length || 0}`)
+                    if (c?.text) {
+                      console.log(`  - content[${ci}].text preview: ${c.text.substring(0, 100)}...`)
+                    }
+                  }
+                })
+              } else if (typeof item.rawItem?.content === 'string') {
+                console.log(`  - content (string) length: ${item.rawItem.content.length}`)
+                console.log(`  - content preview: ${item.rawItem.content.substring(0, 100)}...`)
+              }
+            })
             
             // Извлекаем отчет - пробуем все варианты
-            let report = 'Отчет не сгенерирован'
+            let report = null
             
             // Вариант 1: ищем последний assistant message с текстом
             for (let i = reportResult.newItems.length - 1; i >= 0; i--) {
               const item = reportResult.newItems[i]
               if (item.rawItem?.role === 'assistant') {
-                console.log(`🔍 Проверяем элемент ${i}:`, {
-                  role: item.rawItem.role,
-                  contentLength: item.rawItem.content?.length,
-                  firstContentType: item.rawItem.content?.[0]?.type,
-                  hasText: !!item.rawItem.content?.[0]?.text
-                })
+                console.log(`\n🔍 Проверяем элемент ${i} (assistant):`)
                 
-                if (item.rawItem.content?.[0]?.text) {
-                  report = item.rawItem.content[0].text
-                  console.log(`✅ Найден отчет в элементе ${i}, длина: ${report.length} символов`)
-                  break
+                // Проверяем разные форматы content
+                if (Array.isArray(item.rawItem.content)) {
+                  // content - массив объектов
+                  for (const contentItem of item.rawItem.content) {
+                    if (contentItem?.type === 'text' && contentItem?.text) {
+                      report = contentItem.text
+                      console.log(`✅ Найден отчет (text type) в элементе ${i}, длина: ${report.length} символов`)
+                      break
+                    }
+                  }
+                } else if (typeof item.rawItem.content === 'string') {
+                  // content - строка
+                  report = item.rawItem.content
+                  console.log(`✅ Найден отчет (string) в элементе ${i}, длина: ${report.length} символов`)
                 }
+                
+                if (report) break
               }
             }
             
             // Вариант 2: если не нашли, пробуем через content.value
-            if (report === 'Отчет не сгенерирован') {
-              console.log(`⚠️ Вариант 1 не сработал, пробуем альтернативные пути...`)
+            if (!report) {
+              console.log(`⚠️ Вариант 1 не сработал, пробуем альтернативные пути (content.text.value)...`)
               for (let i = reportResult.newItems.length - 1; i >= 0; i--) {
                 const item = reportResult.newItems[i]
                 if (item.rawItem?.role === 'assistant' && item.rawItem.content) {
@@ -641,27 +836,44 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
                       break
                     }
                   }
-                  if (report !== 'Отчет не сгенерирован') break
+                  if (report) break
                 }
               }
             }
             
-            // Вариант 3: если все еще не нашли, выводим полную структуру первого assistant message
-            if (report === 'Отчет не сгенерирован' && reportResult.newItems.length > 0) {
-              console.log(`⚠️ Вариант 2 не сработал. Полная структура первого assistant message:`)
-              const assistantItem = reportResult.newItems.find(item => item.rawItem?.role === 'assistant')
-              if (assistantItem) {
-                console.log(JSON.stringify(assistantItem.rawItem, null, 2))
-              }
+            // Вариант 3: если все еще не нашли, выводим полную структуру всех assistant messages
+            if (!report && reportResult.newItems.length > 0) {
+              console.log(`⚠️ Вариант 2 не сработал. Полная структура всех assistant messages:`)
+              reportResult.newItems.forEach((item, i) => {
+                if (item.rawItem?.role === 'assistant') {
+                  console.log(`\n--- Assistant message ${i} ---`)
+                  console.log(JSON.stringify(item.rawItem, null, 2))
+                }
+              })
+            }
+            
+            // Если все еще не нашли, устанавливаем дефолтное сообщение
+            if (!report) {
+              report = 'Отчет не сгенерирован - не удалось извлечь текст из ответа агента. Проверьте логи выше.'
+              console.error(`❌ Не удалось извлечь отчет из ${reportResult.newItems.length} элементов`)
             }
             
             // Сохраняем отчет в БД
+            console.log(`💾 Сохраняем отчет в БД...`)
+            console.log(`📝 Длина отчета: ${report ? report.length : 0} символов`)
+            
             const updateReport = db.prepare(`
               UPDATE reports 
               SET report_text = ?, status = 'completed', completed_at = CURRENT_TIMESTAMP
               WHERE session_id = ?
             `)
-            updateReport.run(report, session)
+            const updateResult = updateReport.run(report, session)
+            console.log(`💾 Отчет сохранен в БД для сессии: ${session}, изменено строк: ${updateResult.changes}`)
+            
+            // Проверяем что действительно сохранилось
+            const checkReport = db.prepare('SELECT status, LENGTH(report_text) as report_length FROM reports WHERE session_id = ?')
+            const checkResult = checkReport.get(session)
+            console.log(`🔍 Проверка БД: статус=${checkResult?.status}, длина отчета=${checkResult?.report_length}`)
             
             console.log(`✅ Финансовый отчет сгенерирован и сохранен в БД для сессии ${session}`)
             console.log(`📊 ========== ОТЧЕТ ДЛЯ МЕНЕДЖЕРА ==========`)
@@ -801,6 +1013,83 @@ app.get('/api/reports/:sessionId', (req, res) => {
     })
   } catch (error) {
     console.error('❌ Ошибка получения отчета:', error)
+    return res.status(500).json({
+      ok: false,
+      message: 'Ошибка сервера'
+    })
+  }
+})
+
+// Эндпоинт для восстановления истории сессии
+app.get('/api/sessions/:sessionId/history', (req, res) => {
+  const { sessionId } = req.params
+  console.log(`📖 Запрос истории сессии: ${sessionId}`)
+  
+  try {
+    // Проверяем, есть ли история для этой сессии
+    const history = conversationHistory.get(sessionId)
+    
+    if (!history || history.length === 0) {
+      console.log(`⚠️ История не найдена для сессии: ${sessionId}`)
+      return res.status(404).json({
+        ok: false,
+        message: 'Сессия не найдена'
+      })
+    }
+    
+    // Преобразуем историю в формат сообщений для фронтенда
+    const messages = []
+    
+    // Добавляем приветственное сообщение
+    messages.push({
+      id: 1,
+      text: "Здравствуйте, как я могу к Вам обращаться?",
+      sender: 'bot',
+      timestamp: new Date()
+    })
+    
+    // Преобразуем историю
+    history.forEach((item, index) => {
+      if (item.role === 'user') {
+        let text = ''
+        if (typeof item.content === 'string') {
+          text = item.content
+        } else if (Array.isArray(item.content)) {
+          text = item.content.map(c => c.text || '').join(' ')
+        }
+        
+        messages.push({
+          id: Date.now() + index * 2,
+          text: text,
+          sender: 'user',
+          timestamp: new Date()
+        })
+      } else if (item.role === 'assistant') {
+        let text = ''
+        if (typeof item.content === 'string') {
+          text = item.content
+        } else if (Array.isArray(item.content)) {
+          text = item.content.map(c => c.text || '').join(' ')
+        }
+        
+        if (text) {
+          messages.push({
+            id: Date.now() + index * 2 + 1,
+            text: text,
+            sender: 'bot',
+            timestamp: new Date()
+          })
+        }
+      }
+    })
+    
+    console.log(`✅ История восстановлена: ${messages.length} сообщений`)
+    return res.json({
+      ok: true,
+      messages: messages
+    })
+  } catch (error) {
+    console.error('❌ Ошибка восстановления истории:', error)
     return res.status(500).json({
       ok: false,
       message: 'Ошибка сервера'
