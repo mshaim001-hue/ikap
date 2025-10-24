@@ -193,6 +193,7 @@ const investmentAgent = new Agent({
 ОБЯЗАТЕЛЬНАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ:
 1. Собрать выписки за ТЕКУЩИЙ год (2025) - минимум 8 месяцев
 2. Собрать выписки за ПРЕДЫДУЩИЙ год (2024) - полный год 12 месяцев
+3. Если клиент прикрепил только выписку за один год. и не предоставляет выписки за другой год, то спросить почему нет выписок за другой год и после ответа попросить собрать все выпииски и подать заявку заново
 3. ОБЯЗАТЕЛЬНО спросить про другие банки
 4. Если клиент прикрепил еще выписки → спросить СНОВА про другие банки
 5. Повторять пункт 4 до тех пор, пока клиент НЕ скажет "нет"
@@ -794,8 +795,12 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
                   console.log(`  - content[${ci}].type: ${c?.type}`)
                   if (c?.type === 'text') {
                     console.log(`  - content[${ci}].text length: ${c?.text?.length || 0}`)
-                    if (c?.text) {
+                    if (c?.text && typeof c.text === 'string') {
                       console.log(`  - content[${ci}].text preview: ${c.text.substring(0, 100)}...`)
+                    } else if (c?.text && typeof c.text === 'object') {
+                      console.log(`  - content[${ci}].text is object: ${JSON.stringify(c.text).substring(0, 100)}...`)
+                    } else {
+                      console.log(`  - content[${ci}].text type: ${typeof c.text}`)
                     }
                   }
                 })
@@ -819,9 +824,17 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
                   // content - массив объектов
                   for (const contentItem of item.rawItem.content) {
                     if (contentItem?.type === 'text' && contentItem?.text) {
-                      report = contentItem.text
-                      console.log(`✅ Найден отчет (text type) в элементе ${i}, длина: ${report.length} символов`)
-                      break
+                      if (typeof contentItem.text === 'string') {
+                        report = contentItem.text
+                        console.log(`✅ Найден отчет (text type) в элементе ${i}, длина: ${report.length} символов`)
+                        break
+                      } else if (typeof contentItem.text === 'object' && contentItem.text.value) {
+                        report = contentItem.text.value
+                        console.log(`✅ Найден отчет (text.value) в элементе ${i}, длина: ${report.length} символов`)
+                        break
+                      } else {
+                        console.log(`⚠️ contentItem.text не является строкой: ${typeof contentItem.text}`)
+                      }
                     }
                   }
                 } else if (typeof item.rawItem.content === 'string') {
