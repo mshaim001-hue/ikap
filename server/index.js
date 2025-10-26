@@ -71,24 +71,6 @@ const codeInterpreter = codeInterpreterTool({
   container: { type: 'auto' }
 })
 
-const ClassificationAgentSchema = z.object({
-  classification: z.enum(['investment_registration', 'get_information', 'other'])
-})
-
-const classificationAgent = new Agent({
-  name: 'Classification Agent',
-  instructions: `Определи намерение пользователя:
-
-- investment_registration: если пользователь хочет привлечь инвестиции, займ, облигации, долю бизнеса, или отвечает на вопросы о регистрации. ВАЖНО: любые числа, суммы, названия компаний, реквизиты, БИН, email, телефон, файлы, "да", "нет", краткие ответы - это тоже investment_registration!
-- get_information: ТОЛЬКО если пользователь явно спрашивает "как?", "что такое?", "расскажите о..." И НЕ находится в процессе регистрации
-- other: только если запрос совершенно не связан с инвестициями (погода, спорт, и т.д.)
-
-ПРАВИЛО: Если пользователь в процессе диалога (отвечает на вопросы, прикрепляет файлы) - ВСЕГДА выбирай investment_registration!`,
-  model: 'gpt-5-nano',
-  outputType: ClassificationAgentSchema,
-  modelSettings: { store: true }
-})
-
 const InvestmentAgentSchema = z.object({
   amount: z.number().nullable().optional(),
   term_months: z.number().nullable().optional(),
@@ -190,7 +172,7 @@ const financialAnalystAgent = new Agent({
 - Выдели ключевые моменты жирным шрифтом
 - Используй эмодзи для визуальной структуры
 - ФОКУСИРУЙСЯ на чистой выручке от реализации, а не на общих оборотах`,
-  model: 'gpt-5',
+  model: 'gpt-5-mini',
   tools: [codeInterpreter],
   modelSettings: { store: true }
 })
@@ -342,29 +324,8 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
     
     const runner = new Runner({})
 
-      console.log(`🔍 Классификация запроса...`)
-      // Для классификации используем только последнее сообщение
-      let cls
-      try {
-        cls = await runner.run(classificationAgent, [userMessage])
-      } catch (error) {
-        if (error.status === 429 || error.code === 'insufficient_quota') {
-          console.error('💳 OpenAI квота исчерпана')
-          return res.json({
-            ok: false,
-            message: 'Сервис временно недоступен. Пожалуйста, попробуйте позже.',
-            sessionId: session
-          })
-        }
-        throw error
-      }
-      if (!cls.finalOutput) throw new Error('classification empty')
-    const classification = cls.finalOutput.classification
-    console.log(`📊 Классификация: ${classification}`)
-
-    if (classification === 'investment_registration') {
-      console.log(`💰 Запуск Investment Agent...`)
-      console.log(`📚 История для агента: ${history.length} сообщений`)
+    console.log(`💰 Запуск Investment Agent...`)
+    console.log(`📚 История для агента: ${history.length} сообщений`)
       
       const startTime = Date.now()
       console.log(`⏱️ Начало выполнения агента: ${new Date().toLocaleTimeString()}`)
@@ -898,67 +859,6 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
         sessionId: session,
         completed: isFinalMessage  // Флаг для фронтенда
       })
-    }
-
-    if (classification === 'get_information') {
-      console.log(`ℹ️ Запуск Information Agent...`)
-      const info = await runner.run(informationAgent, [...history])
-      
-      // Сохраняем ответ в историю
-      history.push(...info.newItems.map(item => item.rawItem))
-      
-      let infoMessage = 'Готово'
-      for (let i = info.newItems.length - 1; i >= 0; i--) {
-        const item = info.newItems[i]
-        if (item.rawItem?.role === 'assistant' && item.rawItem?.content?.[0]?.text) {
-          infoMessage = item.rawItem.content[0].text
-          break
-        }
-      }
-      
-      console.log(`💬 Ответ Information Agent: "${infoMessage}"`)
-      return res.json({ ok: true, message: infoMessage, sessionId: session })
-    }
-
-    // Для других классификаций - если у нас уже есть история, скорее всего это часть диалога
-    if (history.length > 1) {
-      console.log(`❓ Классификация "${classification}", но есть история - отправляем в Investment Agent`)
-      
-      const startTime = Date.now()
-      console.log(`⏱️ Начало выполнения агента: ${new Date().toLocaleTimeString()}`)
-      
-      const inv = await runner.run(investmentAgent, [...history])
-      
-      const duration = ((Date.now() - startTime) / 1000).toFixed(2)
-      console.log(`⏱️ Агент выполнен за ${duration}s`)
-      console.log(`🤖 Агент вернул: ${inv.newItems.length} новых элементов`)
-      
-      let agentMessage = 'Продолжаем сбор данных'
-      for (let i = inv.newItems.length - 1; i >= 0; i--) {
-        const item = inv.newItems[i]
-        if (item.rawItem?.role === 'assistant' && item.rawItem?.content?.[0]?.text) {
-          agentMessage = item.rawItem.content[0].text
-          break
-        }
-      }
-      
-      console.log(`💬 Ответ агента: "${agentMessage}"`)
-      
-      if (agentMessage.includes('=== ФИНАНСОВЫЙ АНАЛИЗ ===') || 
-          agentMessage.includes('=== ИТОГОВЫЙ ОТЧЕТ ПО ЗАЯВКЕ ===')) {
-        console.log(`\n📊 ========== ОТЧЕТ ДЛЯ МЕНЕДЖЕРА ==========`)
-        console.log(agentMessage)
-        console.log(`📊 ==========================================\n`)
-      }
-      
-      history.push(...inv.newItems.map(item => item.rawItem))
-      console.log(`💾 История обновлена: ${history.length} сообщений`)
-      
-      return res.json({ ok: true, message: agentMessage, sessionId: session })
-    }
-
-    console.log(`❓ Неизвестная классификация: ${classification}`)
-    return res.json({ ok: true, message: 'Не понял запрос', sessionId: session })
   } catch (e) {
     console.error('agents error', e)
     return res.status(500).json({ ok: false, error: String(e) })
