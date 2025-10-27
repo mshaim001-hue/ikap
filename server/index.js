@@ -274,7 +274,7 @@ const investmentAgent = new Agent({
 const informationAgent = new Agent({
   name: 'Information Agent',
   instructions: 'Отвечай на вопросы о процессе привлечения инвестиций.',
-  model: 'gpt-5-mini',
+  model: 'gpt-5',
   modelSettings: { store: true }
 })
 
