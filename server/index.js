@@ -172,7 +172,7 @@ const financialAnalystAgent = new Agent({
 - Выдели ключевые моменты жирным шрифтом
 - Используй эмодзи для визуальной структуры
 - ФОКУСИРУЙСЯ на чистой выручке от реализации, а не на общих оборотах`,
-  model: 'gpt-4.1',
+  model: 'gpt-5',
   tools: [codeInterpreter],
   modelSettings: { store: true }
 })
@@ -447,18 +447,6 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             // Извлекаем только fileId для передачи в агента
             const fileIds = allFiles.map(f => f.fileId)
             
-            // Создаем агента с доступом ко всем файлам
-            const analystWithFiles = new Agent({
-              ...financialAnalystAgent,
-              tools: [codeInterpreterTool({ 
-                container: { 
-                  type: 'auto', 
-                  file_ids: fileIds 
-                } 
-              })]
-            })
-            console.log(`✅ Financial Analyst Agent создан с файлами`)
-            
             // Извлекаем ключевую информацию из истории (без передачи всех сообщений)
             let amount = 'не указана'
             let termMonths = 'не указан'
@@ -603,8 +591,6 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             console.log(reportRequest)
             console.log(`\n⏱️ Запускаем Financial Analyst Agent...`)
             
-            // Создаем обычный Runner (параметры polling не поддерживаются в этой версии SDK)
-            const reportRunner = new Runner({})
             const startAnalysis = Date.now()
             
             // Добавляем таймаут на 30 минут для анализа всех файлов (PDF анализ может быть долгим)
@@ -624,112 +610,57 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
               return () => clearInterval(intervalId)
             }
             
-            // Функция для ручного polling с полным контролем
-            const runWithManualPolling = async () => {
-              console.log(`🚀 Создаем thread и run вручную для полного контроля...`)
+            // Функция для запуска Financial Analyst Agent через Agents SDK
+            const runWithAgentSDK = async () => {
+              console.log(`🚀 Запускаем Financial Analyst Agent через Agents SDK...`)
               
-              // Создаем assistant через OpenAI API
-              console.log(`📋 Создаем Financial Analyst Assistant...`)
-              const assistant = await openaiClient.beta.assistants.create({
-                name: 'Financial Analyst',
-                instructions: financialAnalystAgent.instructions,
-                model: 'gpt-5',
-                tools: [{ type: 'code_interpreter' }]
+              // Создаем агента с доступом ко всем файлам
+              const analystWithFiles = new Agent({
+                ...financialAnalystAgent,
+                tools: [codeInterpreterTool({ 
+                  container: { 
+                    type: 'auto', 
+                    file_ids: fileIds 
+                  } 
+                })]
               })
-              console.log(`✅ Assistant создан: ${assistant.id}`)
+              console.log(`✅ Financial Analyst Agent создан с файлами (model: ${financialAnalystAgent.model})`)
               
-              // Создаем thread
-              console.log(`📝 Создаем thread...`)
-              const thread = await openaiClient.beta.threads.create()
-              const threadId = thread.id
-              console.log(`✅ Thread создан: ${threadId}`)
+              // Создаем Runner
+              const reportRunner = new Runner({})
               
-              // Добавляем сообщение
-              console.log(`💬 Добавляем сообщение в thread...`)
-              await openaiClient.beta.threads.messages.create(threadId, {
-                role: 'user',
-                content: reportRequest,
-                attachments: fileIds.map(id => ({
-                  file_id: id,
-                  tools: [{ type: 'code_interpreter' }]
-                }))
-              })
-              
-              // Запускаем run
-              console.log(`⚙️ Запускаем run...`)
-              const run = await openaiClient.beta.threads.runs.create(threadId, {
-                assistant_id: assistant.id
-              })
-              const runId = run.id
-              console.log(`✅ Run создан: ${runId}`)
-              
-              // Ручной polling с логированием
+              // Запускаем агента с таймаутом
               const stopLogger = startProgressLogger()
-              let runStatus = run
-              let attempts = 0
-              const maxAttempts = 360 // 360 * 5 сек = 30 минут
               
-              console.log(`🔄 Начинаем polling статуса run...`)
+              console.log(`⚙️ Запускаем агента с запросом: "${reportRequest.substring(0, 100)}..."`)
               
-              while (runStatus.status !== 'completed' && runStatus.status !== 'failed' && runStatus.status !== 'cancelled') {
-                await new Promise(resolve => setTimeout(resolve, 5000)) // Ждем 5 секунд
+              try {
+                // Запускаем агента с одним сообщением пользователя
+                const result = await reportRunner.run(analystWithFiles, [{
+                  role: 'user',
+                  content: [{ type: 'input_text', text: reportRequest }]
+                }])
                 
-                runStatus = await openaiClient.beta.threads.runs.retrieve(runId, { thread_id: threadId })
-                attempts++
+                stopLogger()
+                console.log(`✅ Agent completed! Получено ${result.newItems.length} новых элементов`)
                 
-                console.log(`📊 Polling ${attempts}/${maxAttempts}: status=${runStatus.status}`)
-                
-                if (attempts >= maxAttempts) {
-                  stopLogger()
-                  throw new Error(`Run не завершился за ${maxAttempts * 5} секунд`)
-                }
+                return result
+              } catch (error) {
+                stopLogger()
+                throw error
               }
-              
-              stopLogger()
-              
-              if (runStatus.status === 'failed') {
-                console.error(`❌ Run failed:`, runStatus.last_error)
-                throw new Error(`Run failed: ${runStatus.last_error?.message || 'Unknown error'}`)
-              }
-              
-              if (runStatus.status === 'cancelled') {
-                throw new Error('Run was cancelled')
-              }
-              
-              console.log(`✅ Run completed! Получаем сообщения...`)
-              
-              // Получаем сообщения
-              const messages = await openaiClient.beta.threads.messages.list(threadId)
-              
-              // Формируем результат в формате runner.run()
-              const newItems = []
-              for (const message of messages.data) {
-                if (message.role === 'assistant' && message.run_id === runId) {
-                  newItems.push({
-                    rawItem: message
-                  })
-                }
-              }
-              
-              console.log(`📦 Получено ${newItems.length} новых сообщений от assistant`)
-              
-              // Удаляем временный assistant
-              await openaiClient.beta.assistants.delete(assistant.id)
-              console.log(`🗑️ Временный assistant удален`)
-              
-              return { newItems }
             }
             
             console.log(`⏳ Ожидание ответа от Financial Analyst Agent...`)
-            console.log(`🔄 Начинаем runWithManualPolling с полным контролем...`)
+            console.log(`🔄 Начинаем runWithAgentSDK через Agents SDK...`)
             
             // Запускаем с таймаутом
             const reportResult = await Promise.race([
-              runWithManualPolling(),
+              runWithAgentSDK(),
               analysisTimeout
             ])
             
-            console.log(`✅ runWithRetry завершен успешно`)
+            console.log(`✅ Financial Analyst Agent завершен успешно`)
             const analysisTime = ((Date.now() - startAnalysis) / 1000).toFixed(2)
             console.log(`⏱️ Анализ завершен за ${analysisTime}s`)
             console.log(`📦 Получено элементов: ${reportResult.newItems.length}`)
