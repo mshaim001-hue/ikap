@@ -45,7 +45,6 @@ const AgentsChat = () => {
   const [dialogState, setDialogState] = useState('greeting') // greeting, name_collected, terms_accepted, data_collection
   const [userName, setUserName] = useState('')
   const [isCompleted, setIsCompleted] = useState(false) // Флаг завершения заявки
-  const [isRestoringSession, setIsRestoringSession] = useState(false)
   const fileInputRef = useRef(null)
   const messagesEndRef = useRef(null)
 
@@ -53,158 +52,99 @@ const AgentsChat = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }
 
+
+  // Функция для создания сообщения бота
+  const createBotMessage = (text, options = {}) => ({
+    id: Date.now() + (options.idOffset || 1),
+    text,
+    sender: 'bot',
+    timestamp: new Date(),
+    ...options
+  })
+
+  // Функция для создания сообщения пользователя  
+  const createUserMessage = (text, file = null) => ({
+    id: Date.now(),
+    text: text + (file ? ` (файл: ${file.name})` : ''),
+    sender: 'user',
+    timestamp: new Date()
+  })
+
+  // Общая функция для отправки сообщений к агенту
+  const sendToAgent = async (messageText, selectedFile) => {
+    setIsLoading(true)
+
+    try {
+      // Подготавливаем FormData для отправки файла
+      const formData = new FormData()
+      formData.append('text', messageText)
+      if (sessionId) formData.append('sessionId', sessionId)
+      if (selectedFile) formData.append('file', selectedFile)
+
+      // call backend server
+      const resp = await fetch(getApiUrl('/api/agents/run'), {
+        method: 'POST',
+        body: formData
+      })
+      
+      const result = await resp.json()
+      
+      // Сохраняем sessionId для следующих запросов
+      if (result.sessionId && !sessionId) {
+        setSessionId(result.sessionId)
+        localStorage.setItem('ikap_sessionId', result.sessionId)
+      }
+      
+      // Проверяем, был ли запрос успешным
+      if (result.ok === false) {
+        console.error('⚠️ Сервер вернул ошибку:', result.message)
+        const errorMessage = createBotMessage(
+          result.message || "Произошла ошибка. Попробуйте еще раз."
+        )
+        setMessages(prev => [...prev, errorMessage])
+        return false // Возвращаем false для индикации ошибки
+      }
+      
+      const botMessage = createBotMessage(result.message, { data: result.data })
+      setMessages(prev => [...prev, botMessage])
+      
+      // Проверяем, завершена ли заявка  
+      if (result.completed) {
+        setIsCompleted(true)
+        // Очищаем sessionId после завершения заявки
+        localStorage.removeItem('ikap_sessionId')
+      }
+      
+      return true // Возвращаем true для индикации успеха
+    } catch (error) {
+      console.error('❌ Ошибка отправки сообщения:', error)
+      const errorMessage = createBotMessage("Извините, произошла ошибка. Попробуйте еще раз.")
+      setMessages(prev => [...prev, errorMessage])
+      return false
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
   useEffect(() => {
     scrollToBottom()
   }, [messages])
   
-  // Сохранение состояния в localStorage
+  // Инициализация sessionId из localStorage при первой загрузке
+  useEffect(() => {
+    const savedSessionId = localStorage.getItem('ikap_sessionId')
+    if (savedSessionId) {
+      setSessionId(savedSessionId)
+    }
+  }, [])
+
+  // Сохранение sessionId в localStorage для продолжения диалога с сервером
   useEffect(() => {
     if (sessionId) {
       localStorage.setItem('ikap_sessionId', sessionId)
     }
-    if (dialogState) {
-      localStorage.setItem('ikap_dialogState', dialogState)
-    }
-    if (userName) {
-      localStorage.setItem('ikap_userName', userName)
-    }
-    if (isCompleted) {
-      localStorage.setItem('ikap_isCompleted', 'true')
-    }
-  }, [sessionId, dialogState, userName, isCompleted])
+  }, [sessionId])
   
-  // Восстановление сессии при загрузке компонента
-  useEffect(() => {
-    const restoreSession = async () => {
-      const savedSessionId = localStorage.getItem('ikap_sessionId')
-      const savedDialogState = localStorage.getItem('ikap_dialogState')
-      const savedUserName = localStorage.getItem('ikap_userName')
-      const savedIsCompleted = localStorage.getItem('ikap_isCompleted')
-      
-      console.log('🔄 Проверка сохраненного состояния:', {
-        sessionId: savedSessionId,
-        dialogState: savedDialogState,
-        userName: savedUserName
-      })
-      
-      // Если есть сохраненное состояние диалога (даже без sessionId)
-      if (savedDialogState && savedDialogState !== 'greeting') {
-        console.log('🔄 Восстанавливаем состояние диалога:', savedDialogState)
-        
-        // Восстанавливаем локальное состояние
-        if (savedUserName) {
-          setUserName(savedUserName)
-          console.log('👤 Имя восстановлено:', savedUserName)
-        }
-        
-        if (savedIsCompleted === 'true') {
-          setIsCompleted(true)
-        }
-        
-        // Если есть sessionId, пытаемся восстановить историю с сервера
-        if (savedSessionId) {
-          setIsRestoringSession(true)
-          
-          try {
-            console.log('📡 Запрос истории сессии:', savedSessionId)
-            const response = await fetch(getApiUrl(`/api/sessions/${savedSessionId}/history`))
-            
-            if (response.ok) {
-              const data = await response.json()
-              console.log('✅ История сессии получена:', data)
-              
-              if (data.messages && data.messages.length > 0) {
-                // Восстанавливаем полную сессию
-                setSessionId(savedSessionId)
-                setMessages(data.messages)
-                setDialogState(savedDialogState)
-                
-                console.log('✅ Полная сессия восстановлена!')
-              } else {
-                // Если история пуста на сервере, восстанавливаем только локальное состояние
-                console.log('⚠️ История на сервере пуста, восстанавливаем локальное состояние')
-                setDialogState(savedDialogState)
-                
-                // Восстанавливаем приветственное сообщение в зависимости от состояния
-                if (savedDialogState === 'name_collected' && savedUserName) {
-                  setMessages([
-                    {
-                      id: 1,
-                      text: "Здравствуйте, как я могу к Вам обращаться?",
-                      sender: 'bot',
-                      timestamp: new Date()
-                    },
-                    {
-                      id: 2,
-                      text: savedUserName,
-                      sender: 'user',
-                      timestamp: new Date()
-                    },
-                    {
-                      id: 3,
-                      text: `Приятно познакомиться, ${savedUserName}! Для продолжения работы с платформой iKapitalist необходимо ознакомиться с условиями использования и политикой конфиденциальности.`,
-                      sender: 'bot',
-                      timestamp: new Date(),
-                      showTermsButton: true
-                    }
-                  ])
-                } else if (savedDialogState === 'terms_accepted') {
-                  setMessages([
-                    {
-                      id: 1,
-                      text: "Здравствуйте, как я могу к Вам обращаться?",
-                      sender: 'bot',
-                      timestamp: new Date()
-                    },
-                    {
-                      id: 2,
-                      text: savedUserName || 'Пользователь',
-                      sender: 'user',
-                      timestamp: new Date()
-                    },
-                    {
-                      id: 3,
-                      text: `Приятно познакомиться, ${savedUserName}! Для продолжения работы с платформой iKapitalist необходимо ознакомиться с условиями использования и политикой конфиденциальности.`,
-                      sender: 'bot',
-                      timestamp: new Date()
-                    },
-                    {
-                      id: 4,
-                      text: 'Условия приняты',
-                      sender: 'user',
-                      timestamp: new Date()
-                    },
-                    {
-                      id: 5,
-                      text: 'Спасибо! Теперь вы можете начать работу с платформой. Чем я могу вам помочь?',
-                      sender: 'bot',
-                      timestamp: new Date()
-                    }
-                  ])
-                }
-              }
-            } else {
-              // Если сессия не найдена на сервере, восстанавливаем локальное состояние
-              console.log('⚠️ Сессия не найдена на сервере, восстанавливаем локальное состояние')
-              setDialogState(savedDialogState)
-            }
-          } catch (error) {
-            console.error('❌ Ошибка восстановления сессии:', error)
-            // В случае ошибки все равно восстанавливаем локальное состояние
-            setDialogState(savedDialogState)
-          }
-          
-          setIsRestoringSession(false)
-        } else {
-          // Если нет sessionId, просто восстанавливаем состояние диалога
-          setDialogState(savedDialogState)
-          console.log('✅ Локальное состояние восстановлено (без sessionId)')
-        }
-      }
-    }
-    
-    restoreSession()
-  }, [])
 
   const handleFileSelect = (event) => {
     const file = event.target.files[0]
@@ -217,15 +157,8 @@ const AgentsChat = () => {
   const handleSendMessage = async () => {
     if ((!inputMessage.trim() && !selectedFile) || isLoading) return
 
-    console.log('🔍 Текущее состояние диалога:', dialogState)
-    console.log('📝 Сообщение пользователя:', inputMessage.trim())
 
-    const userMessage = {
-      id: Date.now(),
-      text: inputMessage + (selectedFile ? ` (файл: ${selectedFile.name})` : ''),
-      sender: 'user',
-      timestamp: new Date()
-    }
+    const userMessage = createUserMessage(inputMessage, selectedFile)
 
     setMessages(prev => [...prev, userMessage])
     
@@ -242,17 +175,10 @@ const AgentsChat = () => {
       setIsLoading(true)
       
       setTimeout(() => {
-        const botMessage = {
-          id: Date.now() + 1,
-          text: `Здравствуйте, ${messageText}. Вы находитесь на платформе по привлечению денег для вашего бизнеса. 
-Получите финансирование от 10 млн до 1 млрд тенге под 2,5% годовых через нашу краудфандинговую платформу.
-Срок займа — от 4 до 36 месяцев.
-Быстрое одобрение, прозрачные условия, доступ к сообществу инвесторов, готовых поддержать ваш проект.
-Прежде чем продолжить, пожалуйста, примите условия платформы и подготовьте выписки с банка юр лица за этот год и предыдущий`,
-          sender: 'bot',
-          timestamp: new Date(),
-          showTermsButton: true
-        }
+        const botMessage = createBotMessage(
+          `Здравствуйте, ${messageText}! Наша платформа помогает бизнесу привлекать финансирование от 10 млн до 1 млрд ₸ под 2,5% годовых. Срок займа — 4–36 месяцев. Быстрое одобрение, прозрачные условия, инвесторы, готовые поддержать ваш проект. Примите условия платформы и подготовьте актуальные банковские выписки за последние 12 месяцев.`,
+          { showTermsButton: true }
+        )
         
         setMessages(prev => [...prev, botMessage])
         setIsLoading(false)
@@ -267,162 +193,26 @@ const AgentsChat = () => {
     }
     
     if (dialogState === 'terms_accepted') {
-      console.log('🔄 Переходим в режим сбора данных')
       setDialogState('data_collection')
       
       // Сразу отправляем в агента после изменения состояния
-      console.log('🚀 Отправляем в агента:', messageText)
-      console.log('🆔 SessionId:', sessionId)
-      console.log('📎 Файл:', selectedFile?.name)
+      await sendToAgent(messageText, selectedFile)
       
+      // Очищаем поля после отправки
       setInputMessage('')
       setSelectedFile(null)
-      setIsLoading(true)
-
-      try {
-        // Подготавливаем FormData для отправки файла
-        const formData = new FormData()
-        formData.append('text', messageText)
-        if (sessionId) formData.append('sessionId', sessionId)
-        if (selectedFile) formData.append('file', selectedFile)
-
-        console.log('📤 Отправляем запрос к серверу...')
-        
-        // call backend server
-        const resp = await fetch(getApiUrl('/api/agents/run'), {
-          method: 'POST',
-          body: formData
-        })
-        
-        console.log('📥 Получен ответ от сервера:', resp.status)
-        const result = await resp.json()
-        console.log('📋 Результат:', result)
-        
-        // Сохраняем sessionId для следующих запросов
-        if (result.sessionId && !sessionId) {
-          setSessionId(result.sessionId)
-          localStorage.setItem('ikap_sessionId', result.sessionId)
-          console.log('🆔 Новый sessionId:', result.sessionId)
-        }
-        
-        const botMessage = {
-          id: Date.now() + 1,
-          text: result.message,
-          sender: 'bot',
-          timestamp: new Date(),
-          data: result.data
-        }
-
-        console.log('💬 Добавляем сообщение бота:', result.message)
-        setMessages(prev => [...prev, botMessage])
-      } catch (error) {
-        console.error('❌ Ошибка отправки сообщения:', error)
-        const errorMessage = {
-          id: Date.now() + 1,
-          text: "Извините, произошла ошибка. Попробуйте еще раз.",
-          sender: 'bot',
-          timestamp: new Date()
-        }
-        setMessages(prev => [...prev, errorMessage])
-      } finally {
-        setIsLoading(false)
-      }
       return
     }
     
     // Если мы в режиме сбора данных, отправляем в агента
     if (dialogState === 'data_collection') {
-      console.log('🚀 Отправляем в агента:', messageText)
-      console.log('🆔 SessionId:', sessionId)
-      console.log('📎 Файл:', selectedFile?.name)
+      await sendToAgent(messageText, selectedFile)
       
-      setIsLoading(true)
-
-      try {
-        // Подготавливаем FormData для отправки файла
-        const formData = new FormData()
-        formData.append('text', messageText)
-        if (sessionId) formData.append('sessionId', sessionId)
-        if (selectedFile) formData.append('file', selectedFile)
-
-        console.log('📤 Отправляем запрос к серверу...')
-        
-        // call backend server
-        const resp = await fetch(getApiUrl('/api/agents/run'), {
-          method: 'POST',
-          body: formData
-        })
-        
-        console.log('📥 Получен ответ от сервера:', resp.status)
-        const result = await resp.json()
-        console.log('📋 Результат:', result)
-        
-        // Сохраняем sessionId для следующих запросов
-        if (result.sessionId && !sessionId) {
-          setSessionId(result.sessionId)
-          localStorage.setItem('ikap_sessionId', result.sessionId)
-          console.log('🆔 Новый sessionId:', result.sessionId)
-        }
-        
-        // Проверяем, был ли запрос успешным
-        if (result.ok === false) {
-          console.error('⚠️ Сервер вернул ошибку:', result.message)
-          const errorMessage = {
-            id: Date.now() + 1,
-            text: result.message || "Произошла ошибка. Попробуйте еще раз.",
-            sender: 'bot',
-            timestamp: new Date()
-          }
-          setMessages(prev => [...prev, errorMessage])
-          // Очищаем поля только после неуспешного ответа
-          setInputMessage('')
-          setSelectedFile(null)
-          return // Выходим, не обрабатываем дальше
-        }
-        
-        const botMessage = {
-          id: Date.now() + 1,
-          text: result.message,
-          sender: 'bot',
-          timestamp: new Date(),
-          data: result.data
-        }
-
-        console.log('💬 Добавляем сообщение бота:', result.message)
-        setMessages(prev => [...prev, botMessage])
-        
-        // Очищаем поля после успешной отправки
-        setInputMessage('')
-        setSelectedFile(null)
-        
-        // Проверяем, завершена ли заявка  
-        if (result.completed) {
-          console.log('✅ Заявка завершена! Отчет генерируется в фоне.')
-          setIsCompleted(true)
-          // Очищаем localStorage после завершения заявки
-          // Пользователь больше не сможет продолжить эту сессию
-          localStorage.removeItem('ikap_sessionId')
-          localStorage.removeItem('ikap_dialogState')
-          localStorage.removeItem('ikap_userName')
-        }
-      } catch (error) {
-        console.error('❌ Ошибка отправки сообщения:', error)
-        const errorMessage = {
-          id: Date.now() + 1,
-          text: "Извините, произошла ошибка. Попробуйте еще раз.",
-          sender: 'bot',
-          timestamp: new Date()
-        }
-        setMessages(prev => [...prev, errorMessage])
-        // Очищаем поля после ошибки
-        setInputMessage('')
-        setSelectedFile(null)
-      } finally {
-        setIsLoading(false)
-      }
+      // Очищаем поля после отправки
+      setInputMessage('')
+      setSelectedFile(null)
     } else {
       // Если не в режиме сбора данных, просто очищаем поле
-      console.log('🧹 Очищаем поле ввода (не в режиме сбора данных)')
       setInputMessage('')
       setSelectedFile(null)
     }
@@ -433,7 +223,6 @@ const AgentsChat = () => {
   }
 
   const handleAcceptTerms = () => {
-    console.log('✅ Пользователь принял условия')
     setShowPrivacyModal(false)
     setDialogState('terms_accepted')
     
@@ -441,29 +230,18 @@ const AgentsChat = () => {
     setIsLoading(true)
     
     setTimeout(() => {
-      const botMessage = {
-        id: Date.now(),
-        text: "Какую сумму в тенге Вы хотите получить?",
-        sender: 'bot',
-        timestamp: new Date()
-      }
-      
+      const botMessage = createBotMessage("Какую сумму в тенге Вы хотите получить?")
       setMessages(prev => [...prev, botMessage])
       setIsLoading(false)
-      console.log('🔄 Состояние изменено на: terms_accepted')
     }, 3000)
   }
 
   const handleDeclineTerms = () => {
     setShowPrivacyModal(false)
     
-    const botMessage = {
-      id: Date.now(),
-      text: "Для продолжения необходимо принять условия платформы. Если у вас есть вопросы, обратитесь к нам по email info@ikapitalist.kz",
-      sender: 'bot',
-      timestamp: new Date()
-    }
-    
+    const botMessage = createBotMessage(
+      "Для продолжения необходимо принять условия платформы. Если у вас есть вопросы, обратитесь к нам по email info@ikapitalist.kz"
+    )
     setMessages(prev => [...prev, botMessage])
   }
 
@@ -490,16 +268,6 @@ const AgentsChat = () => {
       </div>
 
       <div className="agents-chat-messages">
-        {isRestoringSession ? (
-          <div className="message bot">
-            <div className="message-avatar">
-              <AIIcon size={22} />
-            </div>
-            <div className="message-content">
-              <div className="message-text">Восстанавливаем вашу сессию...</div>
-            </div>
-          </div>
-        ) : null}
         {messages.map((message) => (
           <div key={message.id} className={`message ${message.sender}`}>
             <div className="message-avatar">

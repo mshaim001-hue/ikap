@@ -23,42 +23,109 @@ app.use(express.json({ limit: '10mb' }))
 // Глобальный OpenAI клиент для Assistants API
 const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// Инициализация SQLite базы данных (отключено для production)
-// const db = new Database('reports.db')
+// Инициализация SQLite базы данных
+const db = new Database('reports.db')
 
-// Заглушка для базы данных в production
-const db = {
-  exec: () => {},
-  prepare: (sql) => ({
-    run: () => {},
-    get: () => null,
-    all: () => []
-  })
+// Создание таблиц
+db.exec(`
+  -- Таблица для заявок
+  CREATE TABLE IF NOT EXISTS reports (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT UNIQUE NOT NULL,
+    company_bin TEXT,
+    amount TEXT,
+    term TEXT,
+    purpose TEXT,
+    name TEXT,
+    email TEXT,
+    phone TEXT,
+    report_text TEXT,
+    status TEXT DEFAULT 'generating',
+    files_count INTEGER DEFAULT 0,
+    files_data TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME
+  );
+
+  -- Таблица для сообщений (переписка)
+  CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL, -- 'user' или 'assistant'
+    content TEXT NOT NULL,
+    content_type TEXT DEFAULT 'text', -- 'text', 'file', 'mixed'
+    message_order INTEGER NOT NULL, -- порядок сообщения в диалоге
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES reports(session_id)
+  );
+
+  -- Таблица для файлов (метаданные)
+  CREATE TABLE IF NOT EXISTS files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    file_id TEXT NOT NULL, -- ID файла в OpenAI
+    original_name TEXT NOT NULL,
+    file_size INTEGER,
+    mime_type TEXT,
+    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (session_id) REFERENCES reports(session_id)
+  );
+
+  -- Индексы для быстрого поиска
+  CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+  CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
+  CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
+`)
+
+console.log('✅ Database initialized with all tables')
+
+// Вспомогательные функции для работы с БД
+const saveMessageToDB = (sessionId, role, content, messageOrder) => {
+  try {
+    const insertMessage = db.prepare(`
+      INSERT INTO messages (session_id, role, content, message_order)
+      VALUES (?, ?, ?, ?)
+    `)
+    insertMessage.run(sessionId, role, JSON.stringify(content), messageOrder)
+    console.log(`💾 Сообщение сохранено в БД: ${role} #${messageOrder}`)
+  } catch (error) {
+    console.error(`❌ Ошибка сохранения сообщения в БД:`, error)
+  }
 }
 
-// db.exec(`
-//   CREATE TABLE IF NOT EXISTS reports (
-//     id INTEGER PRIMARY KEY AUTOINCREMENT,
-//     session_id TEXT UNIQUE NOT NULL,
-//     company_bin TEXT,
-//     amount TEXT,
-//     term TEXT,
-//     purpose TEXT,
-//     name TEXT,
-//     email TEXT,
-//     phone TEXT,
-//     report_text TEXT,
-//     status TEXT DEFAULT 'generating',
-//     files_count INTEGER DEFAULT 0,
-//     files_data TEXT,
-//     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-//     completed_at DATETIME
-//   )
-// `)
-console.log('✅ Database mock initialized for production')
+const saveFileToDB = (sessionId, fileId, originalName, fileSize, mimeType) => {
+  try {
+    const insertFile = db.prepare(`
+      INSERT INTO files (session_id, file_id, original_name, file_size, mime_type)
+      VALUES (?, ?, ?, ?, ?)
+    `)
+    insertFile.run(sessionId, fileId, originalName, fileSize, mimeType)
+    console.log(`📎 Файл сохранен в БД: ${originalName}`)
+  } catch (error) {
+    console.error(`❌ Ошибка сохранения файла в БД:`, error)
+  }
+}
 
-// Хранилище для истории диалогов (в памяти)
-// В продакшене используйте Redis или базу данных
+const getMessagesFromDB = (sessionId) => {
+  try {
+    const getMessages = db.prepare(`
+      SELECT role, content, message_order
+      FROM messages 
+      WHERE session_id = ? 
+      ORDER BY message_order ASC
+    `)
+    const messages = getMessages.all(sessionId)
+    return messages.map(msg => ({
+      role: msg.role,
+      content: JSON.parse(msg.content)
+    }))
+  } catch (error) {
+    console.error(`❌ Ошибка получения сообщений из БД:`, error)
+    return []
+  }
+}
+
+// Хранилище для истории диалогов (в памяти) - теперь дублируется в БД
 const conversationHistory = new Map()
 
 // Хранилище для файлов по сессиям
@@ -320,8 +387,15 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
     
     // Получаем или создаем историю для этой сессии
     if (!conversationHistory.has(session)) {
-      conversationHistory.set(session, [])
-      console.log(`🆕 Создана новая сессия`)
+      // Пытаемся восстановить историю из БД
+      const dbMessages = getMessagesFromDB(session)
+      if (dbMessages.length > 0) {
+        conversationHistory.set(session, dbMessages)
+        console.log(`🔄 История восстановлена из БД: ${dbMessages.length} сообщений`)
+      } else {
+        conversationHistory.set(session, [])
+        console.log(`🆕 Создана новая сессия`)
+      }
     } else {
       console.log(`📚 История сессии: ${conversationHistory.get(session).length} сообщений`)
     }
@@ -352,7 +426,7 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
         uploadedFileId = uploadedFile.id
         console.log(`✅ Файл загружен в OpenAI: ${uploadedFileId}`)
         
-        // ВАЖНО: Сохраняем файл в sessionFiles для последующего анализа
+        // Сохраняем файл в sessionFiles для последующего анализа
         if (!sessionFiles.has(session)) {
           sessionFiles.set(session, [])
         }
@@ -363,6 +437,9 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
           uploadedAt: new Date().toISOString()
         })
         console.log(`💾 Файл сохранен в сессии. Всего файлов: ${sessionFiles.get(session).length}`)
+        
+        // Сохраняем метаданные файла в БД
+        saveFileToDB(session, uploadedFileId, file.originalname, file.size, file.mimetype)
         
         // Добавляем информацию о файле в текст
         // Code Interpreter автоматически получит доступ к файлу через file_id в контейнере
@@ -376,6 +453,10 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
     // Добавляем новое сообщение пользователя
     const userMessage = { role: 'user', content: messageContent }
     history.push(userMessage)
+    
+    // Сохраняем сообщение пользователя в БД
+    const messageOrder = history.length
+    saveMessageToDB(session, 'user', messageContent, messageOrder)
     
     const runner = new Runner({})
 
@@ -448,8 +529,15 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
       console.log(`💬 Ответ агента: "${agentMessage}"`)
       
       // Сохраняем ответ агента в историю
-      history.push(...inv.newItems.map(item => item.rawItem))
+      const newItems = inv.newItems.map(item => item.rawItem)
+      history.push(...newItems)
       console.log(`💾 История обновлена: ${history.length} сообщений`)
+      
+      // Сохраняем новые сообщения агента в БД
+      newItems.forEach((item, index) => {
+        const messageOrder = history.length - newItems.length + index + 1
+        saveMessageToDB(session, item.role, item.content, messageOrder)
+      })
       
       // Проверяем, это финальное сообщение (заявка завершена)
       const isFinalMessage = agentMessage.includes('Ваша заявка принята на рассмотрение') || 
@@ -464,9 +552,25 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
           let allFiles = []
           
           try {
-            allFiles = sessionFiles.get(session) || []
+            // Получаем файлы из БД вместо памяти
+            const getSessionFiles = db.prepare(`
+              SELECT file_id, original_name, file_size, mime_type, uploaded_at
+              FROM files 
+              WHERE session_id = ? 
+              ORDER BY uploaded_at ASC
+            `)
+            const dbFiles = getSessionFiles.all(session)
+            
+            // Преобразуем в формат, совместимый со старым кодом
+            allFiles = dbFiles.map(f => ({
+              fileId: f.file_id,
+              originalName: f.original_name,
+              size: f.file_size,
+              uploadedAt: f.uploaded_at
+            }))
+            
             if (allFiles.length === 0) {
-              console.log(`⚠️ Нет файлов для анализа`)
+              console.log(`⚠️ Нет файлов для анализа в БД`)
               return
             }
             
@@ -903,11 +1007,11 @@ app.get('/api/sessions/:sessionId/history', (req, res) => {
   console.log(`📖 Запрос истории сессии: ${sessionId}`)
   
   try {
-    // Проверяем, есть ли история для этой сессии
-    const history = conversationHistory.get(sessionId)
+    // Получаем историю из БД
+    const history = getMessagesFromDB(sessionId)
     
     if (!history || history.length === 0) {
-      console.log(`⚠️ История не найдена для сессии: ${sessionId}`)
+      console.log(`⚠️ История не найдена в БД для сессии: ${sessionId}`)
       return res.status(404).json({
         ok: false,
         message: 'Сессия не найдена'
@@ -925,7 +1029,7 @@ app.get('/api/sessions/:sessionId/history', (req, res) => {
       timestamp: new Date()
     })
     
-    // Преобразуем историю
+    // Преобразуем историю из БД
     history.forEach((item, index) => {
       if (item.role === 'user') {
         let text = ''
@@ -960,13 +1064,47 @@ app.get('/api/sessions/:sessionId/history', (req, res) => {
       }
     })
     
-    console.log(`✅ История восстановлена: ${messages.length} сообщений`)
+    console.log(`✅ История восстановлена из БД: ${messages.length} сообщений`)
     return res.json({
       ok: true,
       messages: messages
     })
   } catch (error) {
     console.error('❌ Ошибка восстановления истории:', error)
+    return res.status(500).json({
+      ok: false,
+      message: 'Ошибка сервера'
+    })
+  }
+})
+
+// Эндпоинт для получения файлов сессии
+app.get('/api/sessions/:sessionId/files', (req, res) => {
+  const { sessionId } = req.params
+  console.log(`📎 Запрос файлов для сессии: ${sessionId}`)
+  
+  try {
+    const getFiles = db.prepare(`
+      SELECT file_id, original_name, file_size, mime_type, uploaded_at
+      FROM files 
+      WHERE session_id = ? 
+      ORDER BY uploaded_at ASC
+    `)
+    const files = getFiles.all(sessionId)
+    
+    console.log(`✅ Найдено файлов для сессии ${sessionId}: ${files.length}`)
+    return res.json({
+      ok: true,
+      files: files.map(f => ({
+        fileId: f.file_id,
+        originalName: f.original_name,
+        fileSize: f.file_size,
+        mimeType: f.mime_type,
+        uploadedAt: f.uploaded_at
+      }))
+    })
+  } catch (error) {
+    console.error('❌ Ошибка получения файлов:', error)
     return res.status(500).json({
       ok: false,
       message: 'Ошибка сервера'
