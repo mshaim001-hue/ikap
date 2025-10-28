@@ -9,7 +9,8 @@
     "dev:vite": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "deploy": "npm run build && gh-pages -d dist"
+    "deploy": "npm run build && gh-pages -d dist",
+    "postinstall": "npm rebuild better-sqlite3"
   },
   "dependencies": {
     "@openai/agents": "^0.1.9",
