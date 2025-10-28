@@ -3,7 +3,7 @@
 .agents-chat-container {
   display: flex;
   flex-direction: column;
-  height: 100%;
+  height: 120%;
   background: #ffffff;
   border-radius: 16px;
   box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
@@ -94,7 +94,7 @@
 
 .message-text {
   background: #ffffff;
-  padding: 16px 20px;
+  padding: 5px 10px;
   border-radius: 20px;
   font-size: 15px;
   line-height: 1.6;
