@@ -2,7 +2,7 @@ const express = require('express')
 const cors = require('cors')
 const multer = require('multer')
 const OpenAI = require('openai')
-const Database = require('better-sqlite3')
+const { Pool } = require('pg')
 require('dotenv').config()
 
 // Настройка multer для загрузки файлов
@@ -23,99 +23,92 @@ app.use(express.json({ limit: '10mb' }))
 // Глобальный OpenAI клиент для Assistants API
 const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// Инициализация SQLite базы данных
-const db = new Database('reports.db')
+// Инициализация пула Postgres
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
+})
 
-// Создание таблиц
-db.exec(`
-  -- Таблица для заявок
-  CREATE TABLE IF NOT EXISTS reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT UNIQUE NOT NULL,
-    company_bin TEXT,
-    amount TEXT,
-    term TEXT,
-    purpose TEXT,
-    name TEXT,
-    email TEXT,
-    phone TEXT,
-    report_text TEXT,
-    status TEXT DEFAULT 'generating',
-    files_count INTEGER DEFAULT 0,
-    files_data TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at DATETIME
-  );
+const initDb = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reports (
+      id SERIAL PRIMARY KEY,
+      session_id TEXT UNIQUE NOT NULL,
+      company_bin TEXT,
+      amount TEXT,
+      term TEXT,
+      purpose TEXT,
+      name TEXT,
+      email TEXT,
+      phone TEXT,
+      report_text TEXT,
+      status TEXT DEFAULT 'generating',
+      files_count INTEGER DEFAULT 0,
+      files_data TEXT,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      completed_at TIMESTAMPTZ
+    );
+    CREATE TABLE IF NOT EXISTS messages (
+      id SERIAL PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      content TEXT NOT NULL,
+      content_type TEXT DEFAULT 'text',
+      message_order INTEGER NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS files (
+      id SERIAL PRIMARY KEY,
+      session_id TEXT NOT NULL,
+      file_id TEXT NOT NULL,
+      original_name TEXT NOT NULL,
+      file_size INTEGER,
+      mime_type TEXT,
+      uploaded_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+    CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
+    CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
+  `)
+  console.log('✅ Postgres initialized with all tables')
+}
+initDb().catch((e) => {
+  console.error('❌ Failed to initialize Postgres', e)
+  process.exit(1)
+})
 
-  -- Таблица для сообщений (переписка)
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    role TEXT NOT NULL, -- 'user' или 'assistant'
-    content TEXT NOT NULL,
-    content_type TEXT DEFAULT 'text', -- 'text', 'file', 'mixed'
-    message_order INTEGER NOT NULL, -- порядок сообщения в диалоге
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES reports(session_id)
-  );
-
-  -- Таблица для файлов (метаданные)
-  CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    file_id TEXT NOT NULL, -- ID файла в OpenAI
-    original_name TEXT NOT NULL,
-    file_size INTEGER,
-    mime_type TEXT,
-    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES reports(session_id)
-  );
-
-  -- Индексы для быстрого поиска
-  CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-  CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
-  CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
-`)
-
-console.log('✅ Database initialized with all tables')
-
-// Вспомогательные функции для работы с БД
-const saveMessageToDB = (sessionId, role, content, messageOrder) => {
+// Вспомогательные функции для работы с БД (Postgres)
+const saveMessageToDB = async (sessionId, role, content, messageOrder) => {
   try {
-    const insertMessage = db.prepare(`
-      INSERT INTO messages (session_id, role, content, message_order)
-      VALUES (?, ?, ?, ?)
-    `)
-    insertMessage.run(sessionId, role, JSON.stringify(content), messageOrder)
+    await pool.query(
+      `INSERT INTO messages (session_id, role, content, message_order) VALUES ($1, $2, $3, $4)`,
+      [sessionId, role, JSON.stringify(content), messageOrder]
+    )
     console.log(`💾 Сообщение сохранено в БД: ${role} #${messageOrder}`)
   } catch (error) {
     console.error(`❌ Ошибка сохранения сообщения в БД:`, error)
   }
 }
 
-const saveFileToDB = (sessionId, fileId, originalName, fileSize, mimeType) => {
+const saveFileToDB = async (sessionId, fileId, originalName, fileSize, mimeType) => {
   try {
-    const insertFile = db.prepare(`
-      INSERT INTO files (session_id, file_id, original_name, file_size, mime_type)
-      VALUES (?, ?, ?, ?, ?)
-    `)
-    insertFile.run(sessionId, fileId, originalName, fileSize, mimeType)
+    await pool.query(
+      `INSERT INTO files (session_id, file_id, original_name, file_size, mime_type) VALUES ($1, $2, $3, $4, $5)`,
+      [sessionId, fileId, originalName, fileSize, mimeType]
+    )
     console.log(`📎 Файл сохранен в БД: ${originalName}`)
   } catch (error) {
     console.error(`❌ Ошибка сохранения файла в БД:`, error)
   }
 }
 
-const getMessagesFromDB = (sessionId) => {
+const getMessagesFromDB = async (sessionId) => {
   try {
-    const getMessages = db.prepare(`
-      SELECT role, content, message_order
-      FROM messages 
-      WHERE session_id = ? 
-      ORDER BY message_order ASC
-    `)
-    const messages = getMessages.all(sessionId)
-    return messages.map(msg => ({
+    const { rows } = await pool.query(
+      `SELECT role, content, message_order FROM messages WHERE session_id = $1 ORDER BY message_order ASC`,
+      [sessionId]
+    )
+    return rows.map(msg => ({
       role: msg.role,
       content: JSON.parse(msg.content)
     }))
@@ -262,10 +255,10 @@ const investmentAgent = new Agent({
 - Какой следующий вопрос нужно задать
 
 ЭТАПЫ СБОРА ДАННЫХ (после принятия условий):
-1. "Какую сумму Вы хотите получить?" - получи сумму (мин 10миллионов- макс 1 миллиярд)
-2. "На какой срок?" (в месяцах) - получи срок
+1. "Какую сумму Вы хотите получить?" - получи сумму и убедись  что сумма между мин 10 миллионов- макс 1 миллиярд тенге
+2. "На какой срок?" (в месяцах) - получи срок и убедись что срок между 4 и 36 месяцев
 3. "Для чего Вы привлекаете финансирование?" - получи цель
-4. "Пожалуйста, предоставьте Ваш БИН" - получи БИН
+4. "Пожалуйста, предоставьте Ваш БИН" - получи БИН и убедись что БИН состоит из 12 цифр
 5. "Пожалуйста, прикрепите выписку с банка от юр лица за 12 месяцев" - получи выписки
 6. После получения выписки - запроси выписки других банков за тот же период(повторяй до получения "нет")
 7. "Пожалуйста, оставьте Ваши контактные данные: имя, фамилию, email и телефон" - получи контакты
@@ -388,7 +381,7 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
     // Получаем или создаем историю для этой сессии
     if (!conversationHistory.has(session)) {
       // Пытаемся восстановить историю из БД
-      const dbMessages = getMessagesFromDB(session)
+      const dbMessages = await getMessagesFromDB(session)
       if (dbMessages.length > 0) {
         conversationHistory.set(session, dbMessages)
         console.log(`🔄 История восстановлена из БД: ${dbMessages.length} сообщений`)
@@ -439,7 +432,7 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
         console.log(`💾 Файл сохранен в сессии. Всего файлов: ${sessionFiles.get(session).length}`)
         
         // Сохраняем метаданные файла в БД
-        saveFileToDB(session, uploadedFileId, file.originalname, file.size, file.mimetype)
+        await saveFileToDB(session, uploadedFileId, file.originalname, file.size, file.mimetype)
         
         // Добавляем информацию о файле в текст
         // Code Interpreter автоматически получит доступ к файлу через file_id в контейнере
@@ -456,7 +449,7 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
     
     // Сохраняем сообщение пользователя в БД
     const messageOrder = history.length
-    saveMessageToDB(session, 'user', messageContent, messageOrder)
+    await saveMessageToDB(session, 'user', messageContent, messageOrder)
     
     const runner = new Runner({})
 
@@ -534,10 +527,11 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
       console.log(`💾 История обновлена: ${history.length} сообщений`)
       
       // Сохраняем новые сообщения агента в БД
-      newItems.forEach((item, index) => {
+      for (let index = 0; index < newItems.length; index++) {
+        const item = newItems[index]
         const messageOrder = history.length - newItems.length + index + 1
-        saveMessageToDB(session, item.role, item.content, messageOrder)
-      })
+        await saveMessageToDB(session, item.role, item.content, messageOrder)
+      }
       
       // Проверяем, это финальное сообщение (заявка завершена)
       const isFinalMessage = agentMessage.includes('Ваша заявка принята на рассмотрение') || 
@@ -553,13 +547,10 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
           
           try {
             // Получаем файлы из БД вместо памяти
-            const getSessionFiles = db.prepare(`
-              SELECT file_id, original_name, file_size, mime_type, uploaded_at
-              FROM files 
-              WHERE session_id = ? 
-              ORDER BY uploaded_at ASC
-            `)
-            const dbFiles = getSessionFiles.all(session)
+            const { rows: dbFiles } = await pool.query(
+              `SELECT file_id, original_name, file_size, mime_type, uploaded_at FROM files WHERE session_id = $1 ORDER BY uploaded_at ASC`,
+              [session]
+            )
             
             // Преобразуем в формат, совместимый со старым кодом
             allFiles = dbFiles.map(f => ({
@@ -700,11 +691,12 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             
             // Сохраняем заявку в БД со статусом "generating"
             const filesData = JSON.stringify(allFiles)
-            const insertReport = db.prepare(`
-              INSERT OR REPLACE INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generating')
-            `)
-            insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, allFiles.length, filesData)
+            await pool.query(
+              `INSERT INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'generating')
+               ON CONFLICT (session_id) DO UPDATE SET company_bin=EXCLUDED.company_bin, amount=EXCLUDED.amount, term=EXCLUDED.term, purpose=EXCLUDED.purpose, name=EXCLUDED.name, email=EXCLUDED.email, phone=EXCLUDED.phone, files_count=EXCLUDED.files_count, files_data=EXCLUDED.files_data, status='generating'`,
+              [session, bin, amount, termMonths, purpose, name, email, phone, allFiles.length, filesData]
+            )
             console.log(`💾 Заявка сохранена в БД: ${session}, файлов: ${allFiles.length}`)
             
             // Формируем компактный запрос
@@ -904,17 +896,15 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             console.log(`💾 Сохраняем отчет в БД...`)
             console.log(`📝 Длина отчета: ${report ? report.length : 0} символов`)
             
-            const updateReport = db.prepare(`
-              UPDATE reports 
-              SET report_text = ?, status = 'completed', completed_at = CURRENT_TIMESTAMP
-              WHERE session_id = ?
-            `)
-            const updateResult = updateReport.run(report, session)
-            console.log(`💾 Отчет сохранен в БД для сессии: ${session}, изменено строк: ${updateResult.changes}`)
+            const updateResult = await pool.query(
+              `UPDATE reports SET report_text = $1, status = 'completed', completed_at = NOW() WHERE session_id = $2`,
+              [report, session]
+            )
+            console.log(`💾 Отчет сохранен в БД для сессии: ${session}, изменено строк: ${updateResult.rowCount}`)
             
             // Проверяем что действительно сохранилось
-            const checkReport = db.prepare('SELECT status, LENGTH(report_text) as report_length FROM reports WHERE session_id = ?')
-            const checkResult = checkReport.get(session)
+            const { rows: checkRows } = await pool.query('SELECT status, LENGTH(report_text) as report_length FROM reports WHERE session_id = $1',[session])
+            const checkResult = checkRows[0]
             console.log(`🔍 Проверка БД: статус=${checkResult?.status}, длина отчета=${checkResult?.report_length}`)
             
             console.log(`✅ Финансовый отчет сгенерирован и сохранен в БД для сессии ${session}`)
@@ -932,12 +922,10 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
               console.warn('⏳ Financial Analyst не успел за таймаут. Статус оставлен generating, отчет может появиться позже.')
             } else {
               // Сохраняем ошибку в БД
-              const updateError = db.prepare(`
-                UPDATE reports 
-                SET report_text = ?, status = 'error', completed_at = CURRENT_TIMESTAMP
-                WHERE session_id = ?
-              `)
-              updateError.run(`Ошибка генерации отчета: ${error.message}`, session)
+              await pool.query(
+                `UPDATE reports SET report_text = $1, status = 'error', completed_at = NOW() WHERE session_id = $2`,
+                [`Ошибка генерации отчета: ${error.message}`, session]
+              )
             }
           }
         })
@@ -957,13 +945,14 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
 
 // Эндпоинт для получения финансового отчета
 // Эндпоинт для получения отчета по session_id
-app.get('/api/reports/:sessionId', (req, res) => {
+app.get('/api/reports/:sessionId', async (req, res) => {
   const { sessionId } = req.params
   
   console.log(`📊 Запрос отчета для сессии: ${sessionId}`)
   
   try {
-    const report = db.prepare('SELECT * FROM reports WHERE session_id = ?').get(sessionId)
+    const { rows } = await pool.query('SELECT * FROM reports WHERE session_id = $1', [sessionId])
+    const report = rows[0]
     
     if (!report) {
       console.log(`⚠️ Отчет не найден для сессии ${sessionId}`)
@@ -1002,13 +991,13 @@ app.get('/api/reports/:sessionId', (req, res) => {
 })
 
 // Эндпоинт для восстановления истории сессии
-app.get('/api/sessions/:sessionId/history', (req, res) => {
+app.get('/api/sessions/:sessionId/history', async (req, res) => {
   const { sessionId } = req.params
   console.log(`📖 Запрос истории сессии: ${sessionId}`)
   
   try {
     // Получаем историю из БД
-    const history = getMessagesFromDB(sessionId)
+    const history = await getMessagesFromDB(sessionId)
     
     if (!history || history.length === 0) {
       console.log(`⚠️ История не найдена в БД для сессии: ${sessionId}`)
@@ -1079,18 +1068,15 @@ app.get('/api/sessions/:sessionId/history', (req, res) => {
 })
 
 // Эндпоинт для получения файлов сессии
-app.get('/api/sessions/:sessionId/files', (req, res) => {
+app.get('/api/sessions/:sessionId/files', async (req, res) => {
   const { sessionId } = req.params
   console.log(`📎 Запрос файлов для сессии: ${sessionId}`)
   
   try {
-    const getFiles = db.prepare(`
-      SELECT file_id, original_name, file_size, mime_type, uploaded_at
-      FROM files 
-      WHERE session_id = ? 
-      ORDER BY uploaded_at ASC
-    `)
-    const files = getFiles.all(sessionId)
+    const { rows: files } = await pool.query(
+      `SELECT file_id, original_name, file_size, mime_type, uploaded_at FROM files WHERE session_id = $1 ORDER BY uploaded_at ASC`,
+      [sessionId]
+    )
     
     console.log(`✅ Найдено файлов для сессии ${sessionId}: ${files.length}`)
     return res.json({
@@ -1113,14 +1099,11 @@ app.get('/api/sessions/:sessionId/files', (req, res) => {
 })
 
 // Эндпоинт для получения списка всех заявок (для менеджера)
-app.get('/api/reports', (req, res) => {
+app.get('/api/reports', async (req, res) => {
   try {
-    const reports = db.prepare(`
-      SELECT session_id, company_bin, amount, term, purpose, name, email, phone, 
-             status, files_count, created_at, completed_at
-      FROM reports 
-      ORDER BY created_at DESC
-    `).all()
+    const { rows: reports } = await pool.query(
+      `SELECT session_id, company_bin, amount, term, purpose, name, email, phone, status, files_count, created_at, completed_at FROM reports ORDER BY created_at DESC`
+    )
     
     console.log(`📋 Получен список заявок: ${reports.length} шт.`)
     return res.json({
