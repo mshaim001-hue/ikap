@@ -24,17 +24,39 @@ app.use(express.json({ limit: '10mb' }))
 // Глобальный OpenAI клиент для Assistants API
 const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// Инициализация пула Postgres
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false },
-  // Force IPv4 to avoid ENETUNREACH when IPv6 is preferred on some hosts
-  lookup: (hostname, options, callback) => {
-    return dns.lookup(hostname, { ...options, family: 4, all: false }, callback)
+// Инициализация пула Postgres (форсим IPv4)
+const buildPool = async () => {
+  const url = new URL(process.env.DATABASE_URL)
+  const hostname = url.hostname
+  let ipv4 = hostname
+  try {
+    const res = await new Promise((resolve, reject) => {
+      dns.lookup(hostname, { family: 4 }, (err, address) => {
+        if (err) return reject(err)
+        resolve(address)
+      })
+    })
+    if (res) ipv4 = String(res)
+  } catch (e) {
+    console.warn('[db] IPv4 lookup failed, using hostname directly', e.message)
   }
-})
+  return new Pool({
+    host: ipv4,
+    port: Number(url.port || 5432),
+    database: decodeURIComponent(url.pathname.replace(/^\//, '')),
+    user: decodeURIComponent(url.username),
+    password: decodeURIComponent(url.password),
+    ssl: { rejectUnauthorized: false },
+    keepAlive: true
+  })
+}
+
+let pool
+// создаем пул лениво после DNS-резолва
+(async () => { pool = await buildPool() })()
 
 const initDb = async () => {
+  if (!pool) pool = await buildPool()
   await pool.query(`
     CREATE TABLE IF NOT EXISTS reports (
       id SERIAL PRIMARY KEY,
