@@ -50,16 +50,28 @@ app.use(express.json({ limit: '10mb' }))
 // Глобальный OpenAI клиент для Assistants API
 const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// Инициализация пула Postgres с агрессивным IPv4 форсингом
+// Инициализация пула Postgres через отдельные переменные (как в рабочем проекте)
 const buildPool = () => {
-  console.log('[db] Using original URL with aggressive IPv4 forcing')
-  console.log(`[db] DATABASE_URL: ${process.env.DATABASE_URL}`)
+  // Используем отдельные переменные как в рабочем проекте raw_desire
+  const host = process.env.SUPABASE_HOST || process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL).hostname : 'db.rjrkgghhphlkwwrleznu.supabase.co'
+  const port = process.env.SUPABASE_PORT || process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL).port : '5432'
+  const user = process.env.SUPABASE_USER || process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL).username : 'postgres'
+  const password = process.env.SUPABASE_PASSWORD || process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL).password : '2114343RrQwerty'
+  const database = process.env.SUPABASE_DATABASE || process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL).pathname.replace('/', '') : 'postgres'
+  const sslMode = process.env.SUPABASE_SSL_MODE || 'require'
+  
+  console.log('[db] Using separate Supabase environment variables (like working project)')
+  console.log(`[db] Host: ${host}, Port: ${port}, User: ${user}, Database: ${database}`)
   
   return new Pool({
-    connectionString: process.env.DATABASE_URL,
+    host: host,
+    port: parseInt(port),
+    user: user,
+    password: password,
+    database: database,
     ssl: { rejectUnauthorized: false },
     keepAlive: true,
-    // Дополнительное IPv4 форсинг на уровне pg
+    // IPv4 форсинг на уровне pg
     lookup: (hostname, options, callback) => {
       console.log(`[db] DNS lookup for ${hostname} with IPv4 forcing`)
       return dns.lookup(hostname, { ...options, family: 4, all: false }, callback)
