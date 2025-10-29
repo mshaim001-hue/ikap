@@ -4,8 +4,32 @@ const multer = require('multer')
 const OpenAI = require('openai')
 const { Pool } = require('pg')
 const dns = require('dns')
-// Предпочитать IPv4 при резолве (Node >= 18)
-try { dns.setDefaultResultOrder('ipv4first') } catch (_) {}
+const net = require('net')
+
+// Агрессивно форсим IPv4
+try { 
+  dns.setDefaultResultOrder('ipv4first') 
+  dns.setDefaultResultOrder('ipv4first')
+} catch (_) {}
+
+// Переопределяем net.connect для принудительного IPv4
+const originalConnect = net.connect
+net.connect = function(options, callback) {
+  if (typeof options === 'object' && options.host) {
+    // Принудительно используем IPv4
+    dns.lookup(options.host, { family: 4 }, (err, address) => {
+      if (err) {
+        console.warn(`[net] IPv4 lookup failed for ${options.host}, using original:`, err.message)
+        return originalConnect.call(this, options, callback)
+      }
+      console.log(`[net] Forcing IPv4 for ${options.host} -> ${address}`)
+      const newOptions = { ...options, host: address }
+      return originalConnect.call(this, newOptions, callback)
+    })
+  } else {
+    return originalConnect.call(this, options, callback)
+  }
+}
 require('dotenv').config()
 
 // Настройка multer для загрузки файлов
@@ -26,32 +50,20 @@ app.use(express.json({ limit: '10mb' }))
 // Глобальный OpenAI клиент для Assistants API
 const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// Инициализация пула Postgres через Supabase Connection Pooling
+// Инициализация пула Postgres с агрессивным IPv4 форсингом
 const buildPool = () => {
-  const url = new URL(process.env.DATABASE_URL)
-  
-  // Если это уже pooler URL, используем как есть
-  if (url.hostname.includes('pooler') || url.port === '6543') {
-    console.log('[db] Using Supabase Connection Pooling (PgBouncer)')
-    return new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: { rejectUnauthorized: false },
-      keepAlive: true
-    })
-  }
-  
-  // Правильный формат pooler для Supabase
-  const poolerHost = url.hostname.replace('db.', '').replace('.supabase.co', '.pooler.supabase.com')
-  const poolerUrl = `postgresql://${url.username}:${url.password}@${poolerHost}:6543${url.pathname}?pgbouncer=true&connection_limit=1&sslmode=require`
-  
-  console.log('[db] Converting to Supabase Connection Pooling URL')
-  console.log(`[db] Pooler host: ${poolerHost}`)
-  console.log(`[db] Pooler URL: ${poolerUrl}`)
+  console.log('[db] Using original URL with aggressive IPv4 forcing')
+  console.log(`[db] DATABASE_URL: ${process.env.DATABASE_URL}`)
   
   return new Pool({
-    connectionString: poolerUrl,
+    connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false },
-    keepAlive: true
+    keepAlive: true,
+    // Дополнительное IPv4 форсинг на уровне pg
+    lookup: (hostname, options, callback) => {
+      console.log(`[db] DNS lookup for ${hostname} with IPv4 forcing`)
+      return dns.lookup(hostname, { ...options, family: 4, all: false }, callback)
+    }
   })
 }
 
@@ -59,7 +71,7 @@ let pool
 // создаем пул сразу (больше не нужно ждать DNS)
 pool = buildPool()
 
-const initDb = async (retries = 3) => {
+const initDb = async (retries = 5) => {
   if (!pool) pool = buildPool()
   
   for (let i = 0; i < retries; i++) {
@@ -108,24 +120,11 @@ const initDb = async (retries = 3) => {
       return
     } catch (error) {
       console.error(`❌ Postgres init attempt ${i + 1}/${retries} failed:`, error.message)
-      
-      // Если это ошибка DNS для pooler, попробуем оригинальный URL
-      if (error.code === 'ENOTFOUND' && i === 0) {
-        console.log('[db] Pooler failed, trying original URL with IPv4 forcing...')
-        pool = new Pool({
-          connectionString: process.env.DATABASE_URL,
-          ssl: { rejectUnauthorized: false },
-          keepAlive: true,
-          lookup: (hostname, options, callback) => {
-            return dns.lookup(hostname, { ...options, family: 4, all: false }, callback)
-          }
-        })
-        continue
-      }
+      console.error(`❌ Error code: ${error.code}, syscall: ${error.syscall}`)
       
       if (i === retries - 1) throw error
-      console.log(`⏳ Retrying in 2 seconds...`)
-      await new Promise(resolve => setTimeout(resolve, 2000))
+      console.log(`⏳ Retrying in 3 seconds...`)
+      await new Promise(resolve => setTimeout(resolve, 3000))
     }
   }
 }
