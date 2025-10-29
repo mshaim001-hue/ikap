@@ -532,7 +532,12 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
       for (let index = 0; index < newItems.length; index++) {
         const item = newItems[index]
         const messageOrder = history.length - newItems.length + index + 1
-        await saveMessageToDB(session, item.role, item.content, messageOrder)
+        const role = item && item.role
+        if (role === 'assistant' || role === 'user') {
+          await saveMessageToDB(session, role, item.content, messageOrder)
+        } else {
+          console.warn(`⚠️ Пропущено сохранение сообщения без валидной роли: ${role}`)
+        }
       }
       
       // Проверяем, это финальное сообщение (заявка завершена)
@@ -549,10 +554,13 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
           
           try {
             // Получаем файлы из БД вместо памяти
-            const { rows: dbFiles } = await pool.query(
-              `SELECT file_id, original_name, file_size, mime_type, uploaded_at FROM files WHERE session_id = $1 ORDER BY uploaded_at ASC`,
-              [session]
-            )
+            const getSessionFiles = db.prepare(`
+              SELECT file_id, original_name, file_size, mime_type, uploaded_at
+              FROM files 
+              WHERE session_id = ? 
+              ORDER BY uploaded_at ASC
+            `)
+            const dbFiles = getSessionFiles.all(session)
             
             // Преобразуем в формат, совместимый со старым кодом
             allFiles = dbFiles.map(f => ({
@@ -693,12 +701,11 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             
             // Сохраняем заявку в БД со статусом "generating"
             const filesData = JSON.stringify(allFiles)
-            await pool.query(
-              `INSERT INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'generating')
-               ON CONFLICT (session_id) DO UPDATE SET company_bin=EXCLUDED.company_bin, amount=EXCLUDED.amount, term=EXCLUDED.term, purpose=EXCLUDED.purpose, name=EXCLUDED.name, email=EXCLUDED.email, phone=EXCLUDED.phone, files_count=EXCLUDED.files_count, files_data=EXCLUDED.files_data, status='generating'`,
-              [session, bin, amount, termMonths, purpose, name, email, phone, allFiles.length, filesData]
-            )
+            const insertReport = db.prepare(`
+              INSERT OR REPLACE INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generating')
+            `)
+            insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, allFiles.length, filesData)
             console.log(`💾 Заявка сохранена в БД: ${session}, файлов: ${allFiles.length}`)
             
             // Формируем компактный запрос
@@ -898,15 +905,17 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             console.log(`💾 Сохраняем отчет в БД...`)
             console.log(`📝 Длина отчета: ${report ? report.length : 0} символов`)
             
-            const updateResult = await pool.query(
-              `UPDATE reports SET report_text = $1, status = 'completed', completed_at = NOW() WHERE session_id = $2`,
-              [report, session]
-            )
-            console.log(`💾 Отчет сохранен в БД для сессии: ${session}, изменено строк: ${updateResult.rowCount}`)
+            const updateReport = db.prepare(`
+              UPDATE reports 
+              SET report_text = ?, status = 'completed', completed_at = CURRENT_TIMESTAMP
+              WHERE session_id = ?
+            `)
+            const updateResult = updateReport.run(report, session)
+            console.log(`💾 Отчет сохранен в БД для сессии: ${session}, изменено строк: ${updateResult.changes}`)
             
             // Проверяем что действительно сохранилось
-            const { rows: checkRows } = await pool.query('SELECT status, LENGTH(report_text) as report_length FROM reports WHERE session_id = $1',[session])
-            const checkResult = checkRows[0]
+            const checkReport = db.prepare('SELECT status, LENGTH(report_text) as report_length FROM reports WHERE session_id = ?')
+            const checkResult = checkReport.get(session)
             console.log(`🔍 Проверка БД: статус=${checkResult?.status}, длина отчета=${checkResult?.report_length}`)
             
             console.log(`✅ Финансовый отчет сгенерирован и сохранен в БД для сессии ${session}`)
@@ -924,10 +933,12 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
               console.warn('⏳ Financial Analyst не успел за таймаут. Статус оставлен generating, отчет может появиться позже.')
             } else {
               // Сохраняем ошибку в БД
-              await pool.query(
-                `UPDATE reports SET report_text = $1, status = 'error', completed_at = NOW() WHERE session_id = $2`,
-                [`Ошибка генерации отчета: ${error.message}`, session]
-              )
+              const updateError = db.prepare(`
+                UPDATE reports 
+                SET report_text = ?, status = 'error', completed_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+              `)
+              updateError.run(`Ошибка генерации отчета: ${error.message}`, session)
             }
           }
         })
