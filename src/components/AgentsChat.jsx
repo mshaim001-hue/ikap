@@ -51,6 +51,12 @@ const AgentsChat = () => {
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" })
   }
+  // Форматирование чисел: 10000000 -> 10 000 000 (только отображение)
+  const formatNumbersForDisplay = (text) => {
+    if (!text || typeof text !== 'string') return text
+    return text.replace(/\b\d{4,}\b/g, (num) => num.replace(/\B(?=(\d{3})+(?!\d))/g, ' '))
+  }
+
 
 
   // Функция для создания сообщения бота
@@ -274,7 +280,7 @@ const AgentsChat = () => {
               {message.sender === 'bot' ? <AIIcon size={22} /> : <User size={20} />}
             </div>
             <div className="message-content">
-              <div className="message-text">{message.text}</div>
+              <div className="message-text">{formatNumbersForDisplay(message.text)}</div>
               {message.showTermsButton && (
                 <div className="message-actions">
                   <button 
