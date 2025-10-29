@@ -29,6 +29,7 @@ const buildPool = async () => {
   const url = new URL(process.env.DATABASE_URL)
   const hostname = url.hostname
   let ipv4 = hostname
+  
   try {
     const res = await new Promise((resolve, reject) => {
       dns.lookup(hostname, { family: 4 }, (err, address) => {
@@ -37,9 +38,21 @@ const buildPool = async () => {
       })
     })
     if (res) ipv4 = String(res)
+    console.log(`[db] Resolved ${hostname} to IPv4: ${ipv4}`)
   } catch (e) {
     console.warn('[db] IPv4 lookup failed, using hostname directly', e.message)
+    // Fallback to connection string with IPv4 forcing
+    return new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      keepAlive: true,
+      // Force IPv4 even in fallback
+      lookup: (hostname, options, callback) => {
+        return dns.lookup(hostname, { ...options, family: 4, all: false }, callback)
+      }
+    })
   }
+  
   return new Pool({
     host: ipv4,
     port: Number(url.port || 5432),
@@ -55,52 +68,64 @@ let pool
 // создаем пул лениво после DNS-резолва
 (async () => { pool = await buildPool() })()
 
-const initDb = async () => {
+const initDb = async (retries = 3) => {
   if (!pool) pool = await buildPool()
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS reports (
-      id SERIAL PRIMARY KEY,
-      session_id TEXT UNIQUE NOT NULL,
-      company_bin TEXT,
-      amount TEXT,
-      term TEXT,
-      purpose TEXT,
-      name TEXT,
-      email TEXT,
-      phone TEXT,
-      report_text TEXT,
-      status TEXT DEFAULT 'generating',
-      files_count INTEGER DEFAULT 0,
-      files_data TEXT,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      completed_at TIMESTAMPTZ
-    );
-    CREATE TABLE IF NOT EXISTS messages (
-      id SERIAL PRIMARY KEY,
-      session_id TEXT NOT NULL,
-      role TEXT NOT NULL,
-      content TEXT NOT NULL,
-      content_type TEXT DEFAULT 'text',
-      message_order INTEGER NOT NULL,
-      created_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE TABLE IF NOT EXISTS files (
-      id SERIAL PRIMARY KEY,
-      session_id TEXT NOT NULL,
-      file_id TEXT NOT NULL,
-      original_name TEXT NOT NULL,
-      file_size INTEGER,
-      mime_type TEXT,
-      uploaded_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-    CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
-    CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
-  `)
-  console.log('✅ Postgres initialized with all tables')
+  
+  for (let i = 0; i < retries; i++) {
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS reports (
+          id SERIAL PRIMARY KEY,
+          session_id TEXT UNIQUE NOT NULL,
+          company_bin TEXT,
+          amount TEXT,
+          term TEXT,
+          purpose TEXT,
+          name TEXT,
+          email TEXT,
+          phone TEXT,
+          report_text TEXT,
+          status TEXT DEFAULT 'generating',
+          files_count INTEGER DEFAULT 0,
+          files_data TEXT,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          completed_at TIMESTAMPTZ
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+          id SERIAL PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          role TEXT NOT NULL,
+          content TEXT NOT NULL,
+          content_type TEXT DEFAULT 'text',
+          message_order INTEGER NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS files (
+          id SERIAL PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          file_id TEXT NOT NULL,
+          original_name TEXT NOT NULL,
+          file_size INTEGER,
+          mime_type TEXT,
+          uploaded_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+        CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
+        CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
+      `)
+      console.log('✅ Postgres initialized with all tables')
+      return
+    } catch (error) {
+      console.error(`❌ Postgres init attempt ${i + 1}/${retries} failed:`, error.message)
+      if (i === retries - 1) throw error
+      console.log(`⏳ Retrying in 2 seconds...`)
+      await new Promise(resolve => setTimeout(resolve, 2000))
+    }
+  }
 }
+
 initDb().catch((e) => {
-  console.error('❌ Failed to initialize Postgres', e)
+  console.error('❌ Failed to initialize Postgres after all retries', e)
   process.exit(1)
 })
 
@@ -288,7 +313,7 @@ const investmentAgent = new Agent({
 4. "Пожалуйста, предоставьте Ваш БИН" - получи БИН и убедись что БИН состоит из 12 цифр
 5. "Пожалуйста, прикрепите выписку с банка от юр лица за 12 месяцев" - получи выписки
 6. После получения выписки - запроси выписки других банков за тот же период(повторяй до получения "нет")
-7. "Пожалуйста, оставьте Ваши контактные данные: имя, фамилию, email и телефон" - получи контакты
+7. "Пожалуйста, оставьте Ваши контактные данные: имя, фамилию, email и телефон" - получи контакты и убедись что номер принадлежит какому либо из Казахстана и состоит из 11 цифр
 8. После получения контактов - отправь финальное сообщение
 
 ПРАВИЛА АНАЛИЗА ИСТОРИИ:
@@ -301,8 +326,8 @@ const investmentAgent = new Agent({
 АНАЛИЗ БАНКОВСКИХ ВЫПИСОК:
 
 ОБЯЗАТЕЛЬНАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ:
-1. Собрать выписки за 12 месяцев
-2. Спросить про другие банки
+1. Собрать выписки за 12 месяцев 
+2. Спросить про другие банки за тот же период
 3. Повторять пункт 2 до получения "нет"
 4. Только после "нет" → переходить к контактным данным
 
@@ -311,7 +336,7 @@ const investmentAgent = new Agent({
 1. АНАЛИЗИРУЙ файл через Code Interpreter:
    - Извлеки период выписки (даты начала и конца)
    - Определи, какая дата начала (год и месяц)
-   - Проверь, достаточно ли данных (минимум 12 месяцев покрытия)
+   - Проверь, достаточно ли данных (12 месяцев покрытия +/- 1 месяц)
    - Проверь, это банковская выписка или нет
 
 2. ПРОВЕРКА ПЕРИОДА:
