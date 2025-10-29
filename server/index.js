@@ -3,6 +3,7 @@ const cors = require('cors')
 const multer = require('multer')
 const OpenAI = require('openai')
 const { Pool } = require('pg')
+const dns = require('dns')
 require('dotenv').config()
 
 // Настройка multer для загрузки файлов
@@ -26,7 +27,11 @@ const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 // Инициализация пула Postgres
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  // Force IPv4 to avoid ENETUNREACH when IPv6 is preferred on some hosts
+  lookup: (hostname, options, callback) => {
+    return dns.lookup(hostname, { ...options, family: 4, all: false }, callback)
+  }
 })
 
 const initDb = async () => {
