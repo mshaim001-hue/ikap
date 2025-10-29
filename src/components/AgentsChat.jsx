@@ -57,6 +57,18 @@ const AgentsChat = () => {
     return text.replace(/\b\d{4,}\b/g, (num) => num.replace(/\B(?=(\d{3})+(?!\d))/g, ' '))
   }
 
+  // Форматирование чисел для поля ввода (убираем пробелы перед отправкой)
+  const formatInputNumbers = (text) => {
+    if (!text || typeof text !== 'string') return text
+    return text.replace(/\b\d{4,}\b/g, (num) => num.replace(/\B(?=(\d{3})+(?!\d))/g, ' '))
+  }
+
+  // Убираем пробелы из чисел перед отправкой
+  const cleanNumbersForSending = (text) => {
+    if (!text || typeof text !== 'string') return text
+    return text.replace(/\b(\d{1,3}(?:\s\d{3})*)\b/g, (match) => match.replace(/\s/g, ''))
+  }
+
 
 
   // Функция для создания сообщения бота
@@ -163,12 +175,13 @@ const AgentsChat = () => {
   const handleSendMessage = async () => {
     if ((!inputMessage.trim() && !selectedFile) || isLoading) return
 
-
-    const userMessage = createUserMessage(inputMessage, selectedFile)
+    // Очищаем числа от пробелов перед отправкой
+    const cleanMessageText = cleanNumbersForSending(inputMessage.trim())
+    const userMessage = createUserMessage(cleanMessageText, selectedFile)
 
     setMessages(prev => [...prev, userMessage])
     
-    const messageText = inputMessage.trim()
+    const messageText = cleanMessageText
     
     // Обработка состояний диалога
     if (dialogState === 'greeting') {
@@ -366,8 +379,12 @@ const AgentsChat = () => {
               </div>
             )}
             <textarea
-              value={inputMessage}
-              onChange={(e) => setInputMessage(e.target.value)}
+              value={formatInputNumbers(inputMessage)}
+              onChange={(e) => {
+                // Убираем пробелы из введенного текста для хранения в состоянии
+                const cleanValue = cleanNumbersForSending(e.target.value)
+                setInputMessage(cleanValue)
+              }}
               onKeyPress={handleKeyPress}
               placeholder="Напишите сообщение..."
               className="message-input"
