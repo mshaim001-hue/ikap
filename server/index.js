@@ -2,7 +2,34 @@ const express = require('express')
 const cors = require('cors')
 const multer = require('multer')
 const OpenAI = require('openai')
-const Database = require('better-sqlite3')
+const { Pool } = require('pg')
+const dns = require('dns')
+const net = require('net')
+
+// Агрессивно форсим IPv4
+try { 
+  dns.setDefaultResultOrder('ipv4first') 
+  dns.setDefaultResultOrder('ipv4first')
+} catch (_) {}
+
+// Переопределяем net.connect для принудительного IPv4
+const originalConnect = net.connect
+net.connect = function(options, callback) {
+  if (typeof options === 'object' && options.host) {
+    // Принудительно используем IPv4
+    dns.lookup(options.host, { family: 4 }, (err, address) => {
+      if (err) {
+        console.warn(`[net] IPv4 lookup failed for ${options.host}, using original:`, err.message)
+        return originalConnect.call(this, options, callback)
+      }
+      console.log(`[net] Forcing IPv4 for ${options.host} -> ${address}`)
+      const newOptions = { ...options, host: address }
+      return originalConnect.call(this, newOptions, callback)
+    })
+  } else {
+    return originalConnect.call(this, options, callback)
+  }
+}
 require('dotenv').config()
 
 // Настройка multer для загрузки файлов
@@ -23,99 +50,134 @@ app.use(express.json({ limit: '10mb' }))
 // Глобальный OpenAI клиент для Assistants API
 const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// Инициализация SQLite базы данных
-const db = new Database('reports.db')
+// Инициализация пула Postgres через отдельные переменные (как в рабочем проекте)
+const buildPool = () => {
+  // Используем отдельные переменные как в рабочем проекте raw_desire
+  const host = process.env.SUPABASE_HOST || process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL).hostname : 'db.rjrkgghhphlkwwrleznu.supabase.co'
+  const port = process.env.SUPABASE_PORT || process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL).port : '5432'
+  const user = process.env.SUPABASE_USER || process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL).username : 'postgres'
+  const password = process.env.SUPABASE_PASSWORD || process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL).password : '2114343RrQwerty'
+  const database = process.env.SUPABASE_DATABASE || process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL).pathname.replace('/', '') : 'postgres'
+  const sslMode = process.env.SUPABASE_SSL_MODE || 'require'
+  
+  console.log('[db] Using separate Supabase environment variables (like working project)')
+  console.log(`[db] Host: ${host}, Port: ${port}, User: ${user}, Database: ${database}`)
+  
+  return new Pool({
+    host: host,
+    port: parseInt(port),
+    user: user,
+    password: password,
+    database: database,
+    ssl: { rejectUnauthorized: false },
+    keepAlive: true,
+    // IPv4 форсинг на уровне pg
+    lookup: (hostname, options, callback) => {
+      console.log(`[db] DNS lookup for ${hostname} with IPv4 forcing`)
+      return dns.lookup(hostname, { ...options, family: 4, all: false }, callback)
+    }
+  })
+}
 
-// Создание таблиц
-db.exec(`
-  -- Таблица для заявок
-  CREATE TABLE IF NOT EXISTS reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT UNIQUE NOT NULL,
-    company_bin TEXT,
-    amount TEXT,
-    term TEXT,
-    purpose TEXT,
-    name TEXT,
-    email TEXT,
-    phone TEXT,
-    report_text TEXT,
-    status TEXT DEFAULT 'generating',
-    files_count INTEGER DEFAULT 0,
-    files_data TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at DATETIME
-  );
+let pool
+// создаем пул сразу (больше не нужно ждать DNS)
+pool = buildPool()
 
-  -- Таблица для сообщений (переписка)
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    role TEXT NOT NULL, -- 'user' или 'assistant'
-    content TEXT NOT NULL,
-    content_type TEXT DEFAULT 'text', -- 'text', 'file', 'mixed'
-    message_order INTEGER NOT NULL, -- порядок сообщения в диалоге
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES reports(session_id)
-  );
+const initDb = async (retries = 5) => {
+  if (!pool) pool = buildPool()
+  
+  for (let i = 0; i < retries; i++) {
+    try {
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS reports (
+          id SERIAL PRIMARY KEY,
+          session_id TEXT UNIQUE NOT NULL,
+          company_bin TEXT,
+          amount TEXT,
+          term TEXT,
+          purpose TEXT,
+          name TEXT,
+          email TEXT,
+          phone TEXT,
+          report_text TEXT,
+          status TEXT DEFAULT 'generating',
+          files_count INTEGER DEFAULT 0,
+          files_data TEXT,
+          created_at TIMESTAMPTZ DEFAULT NOW(),
+          completed_at TIMESTAMPTZ
+        );
+        CREATE TABLE IF NOT EXISTS messages (
+          id SERIAL PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          role TEXT NOT NULL,
+          content TEXT NOT NULL,
+          content_type TEXT DEFAULT 'text',
+          message_order INTEGER NOT NULL,
+          created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE TABLE IF NOT EXISTS files (
+          id SERIAL PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          file_id TEXT NOT NULL,
+          original_name TEXT NOT NULL,
+          file_size INTEGER,
+          mime_type TEXT,
+          uploaded_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+        CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
+        CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
+      `)
+      console.log('✅ Postgres initialized with all tables')
+      return
+    } catch (error) {
+      console.error(`❌ Postgres init attempt ${i + 1}/${retries} failed:`, error.message)
+      console.error(`❌ Error code: ${error.code}, syscall: ${error.syscall}`)
+      
+      if (i === retries - 1) throw error
+      console.log(`⏳ Retrying in 3 seconds...`)
+      await new Promise(resolve => setTimeout(resolve, 3000))
+    }
+  }
+}
 
-  -- Таблица для файлов (метаданные)
-  CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    file_id TEXT NOT NULL, -- ID файла в OpenAI
-    original_name TEXT NOT NULL,
-    file_size INTEGER,
-    mime_type TEXT,
-    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES reports(session_id)
-  );
+initDb().catch((e) => {
+  console.error('❌ Failed to initialize Postgres after all retries', e)
+  process.exit(1)
+})
 
-  -- Индексы для быстрого поиска
-  CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-  CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
-  CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
-`)
-
-console.log('✅ Database initialized with all tables')
-
-// Вспомогательные функции для работы с БД
-const saveMessageToDB = (sessionId, role, content, messageOrder) => {
+// Вспомогательные функции для работы с БД (Postgres)
+const saveMessageToDB = async (sessionId, role, content, messageOrder) => {
   try {
-    const insertMessage = db.prepare(`
-      INSERT INTO messages (session_id, role, content, message_order)
-      VALUES (?, ?, ?, ?)
-    `)
-    insertMessage.run(sessionId, role, JSON.stringify(content), messageOrder)
+    await pool.query(
+      `INSERT INTO messages (session_id, role, content, message_order) VALUES ($1, $2, $3, $4)`,
+      [sessionId, role, JSON.stringify(content), messageOrder]
+    )
     console.log(`💾 Сообщение сохранено в БД: ${role} #${messageOrder}`)
   } catch (error) {
     console.error(`❌ Ошибка сохранения сообщения в БД:`, error)
   }
 }
 
-const saveFileToDB = (sessionId, fileId, originalName, fileSize, mimeType) => {
+const saveFileToDB = async (sessionId, fileId, originalName, fileSize, mimeType) => {
   try {
-    const insertFile = db.prepare(`
-      INSERT INTO files (session_id, file_id, original_name, file_size, mime_type)
-      VALUES (?, ?, ?, ?, ?)
-    `)
-    insertFile.run(sessionId, fileId, originalName, fileSize, mimeType)
+    await pool.query(
+      `INSERT INTO files (session_id, file_id, original_name, file_size, mime_type) VALUES ($1, $2, $3, $4, $5)`,
+      [sessionId, fileId, originalName, fileSize, mimeType]
+    )
     console.log(`📎 Файл сохранен в БД: ${originalName}`)
   } catch (error) {
     console.error(`❌ Ошибка сохранения файла в БД:`, error)
   }
 }
 
-const getMessagesFromDB = (sessionId) => {
+const getMessagesFromDB = async (sessionId) => {
   try {
-    const getMessages = db.prepare(`
-      SELECT role, content, message_order
-      FROM messages 
-      WHERE session_id = ? 
-      ORDER BY message_order ASC
-    `)
-    const messages = getMessages.all(sessionId)
-    return messages.map(msg => ({
+    const { rows } = await pool.query(
+      `SELECT role, content, message_order FROM messages WHERE session_id = $1 ORDER BY message_order ASC`,
+      [sessionId]
+    )
+    return rows.map(msg => ({
       role: msg.role,
       content: JSON.parse(msg.content)
     }))
@@ -189,13 +251,12 @@ const financialAnalystAgent = new Agent({
    Цель: Посмотреть динамику продаж во времени.
    
    Что нужно сделать:
-   - ПРОАНАЛИЗИРУЙ ВСЕ выписки: некоторые могут быть за разные периоды (например, одна за 2024 год, другая с 1.1.2025)
+   - ПРОАНАЛИЗИРУЙ ВСЕ выписки: они могут быть как от одного так и от нескольких казахстанских банков.
    - ОБЪЕДИНИ данные из всех выписок для создания непрерывного периода за последние 12 месяцев
-   - Если есть выписка за один период и выписка за предыдущий период - объедини их данные в хронологическом порядке
    - Сгруппировать чистые поступления (в пересчёте в тенге) по месяцам за последние 12 месяцев
    - Рассчитать итоговую сумму реализации за период
    - Создать таблицу динамики по месяцам
-   - ВАЖНО: Убедись, что ты используешь данные за полные 12 месяцев, даже если они из разных выписок
+   - ВАЖНО: Убедись, что ты используешь данные за 12 месяцев, даже если они из разных выписок
 
 5. 📈 **ФОРМИРОВАНИЕ СВОДНОГО АНАЛИЗА**
    Цель: Подготовить понятный итог для отчёта или проверки.
@@ -220,11 +281,10 @@ const financialAnalystAgent = new Agent({
 
 **АНАЛИЗ ПО БАНКАМ:**
 Для каждого банка:
-- Название банка и период(ы) выписки (может быть несколько выписок за разные периоды для одного банка)
+- Название банка и период(ы) выписки
 - Выявленные операции по реализации (сумма в тенге)
 - Исключённые операции (с обоснованием)
 - Чистая выручка по банку (с учётом всех выписок этого банка)
-- Если банк предоставил несколько выписок за разные периоды - укажи все периоды и объединённую сумму
 
 **СВОДНЫЙ АНАЛИЗ:**
 - Общая чистая выручка за 12 месяцев: [сумма] KZT
@@ -241,7 +301,6 @@ const financialAnalystAgent = new Agent({
 - Используй Code Interpreter для анализа всех файлов
 - Все суммы указывай в KZT с разделителями тысяч
 - Будь точным с датами и периодами
-- Если есть несколько выписок за разные периоды (например, одна за 2024 год, другая с 1.1.2025) - ОБЯЗАТЕЛЬНО объедини их данные
 - При объединении данных из разных выписок убедись, что нет дублирования операций
 - Проверь, что покрыты полные 12 месяцев (может потребоваться использовать данные из разных выписок)
 - Выдели ключевые моменты жирным шрифтом
@@ -262,13 +321,13 @@ const investmentAgent = new Agent({
 - Какой следующий вопрос нужно задать
 
 ЭТАПЫ СБОРА ДАННЫХ (после принятия условий):
-1. "Какую сумму Вы хотите получить?" - получи сумму (мин 10миллионов- макс 1 миллиярд)
-2. "На какой срок?" (в месяцах) - получи срок
+1. "Какую сумму Вы хотите получить?" - получи сумму и убедись  что сумма между мин 10 миллионов- макс 1 миллиярд тенге
+2. "На какой срок?" (в месяцах) - получи срок и убедись что срок между 4 и 36 месяцев
 3. "Для чего Вы привлекаете финансирование?" - получи цель
-4. "Пожалуйста, предоставьте Ваш БИН" - получи БИН
+4. "Пожалуйста, предоставьте Ваш БИН" - получи БИН и убедись что БИН состоит из 12 цифр
 5. "Пожалуйста, прикрепите выписку с банка от юр лица за 12 месяцев" - получи выписки
 6. После получения выписки - запроси выписки других банков за тот же период(повторяй до получения "нет")
-7. "Пожалуйста, оставьте Ваши контактные данные: имя, фамилию, email и телефон" - получи контакты
+7. "Пожалуйста, оставьте Ваши контактные данные: имя, фамилию, email и телефон" - получи контакты и убедись что номер принадлежит какому либо из Казахстана и состоит из 11 цифр
 8. После получения контактов - отправь финальное сообщение
 
 ПРАВИЛА АНАЛИЗА ИСТОРИИ:
@@ -281,8 +340,8 @@ const investmentAgent = new Agent({
 АНАЛИЗ БАНКОВСКИХ ВЫПИСОК:
 
 ОБЯЗАТЕЛЬНАЯ ПОСЛЕДОВАТЕЛЬНОСТЬ:
-1. Собрать выписки за 12 месяцев
-2. Спросить про другие банки
+1. Собрать выписки за 12 месяцев 
+2. Спросить про другие банки за тот же период
 3. Повторять пункт 2 до получения "нет"
 4. Только после "нет" → переходить к контактным данным
 
@@ -291,7 +350,7 @@ const investmentAgent = new Agent({
 1. АНАЛИЗИРУЙ файл через Code Interpreter:
    - Извлеки период выписки (даты начала и конца)
    - Определи, какая дата начала (год и месяц)
-   - Проверь, достаточно ли данных (минимум 12 месяцев покрытия)
+   - Проверь, достаточно ли данных (12 месяцев покрытия)
    - Проверь, это банковская выписка или нет
 
 2. ПРОВЕРКА ПЕРИОДА:
@@ -303,24 +362,22 @@ const investmentAgent = new Agent({
    1. Определи дату начала выписки (например, 1.1.2025) и дату конца выписки (например, 31.1.2025 или текущая дата)
    2. Вычисли разницу в месяцах между датой начала и датой конца выписки
    3. Если период выписки составляет МЕНЕЕ 12 месяцев:
-         ОБЯЗАТЕЛЬНО СПРОСИ: "Для полного анализа нам нужны данные за полные 12 месяцев. Ваша выписка охватывает период с [день.месяц.год] по [день.месяц.год] ([X] месяцев). Пожалуйста, прикрепите выписку за [предыдущий год] для этого же банка, чтобы мы могли получить недостающие данные."
-         ПРИМЕР: Если выписка с 1.1.2025 по 15.2.2025 (1.5 месяца), попроси выписку за 2024 год за период с 15.10.2024 по 31.12.2024
-         ПРИМЕР: Если выписка с 1.1.2025 по 31.1.2025 (1 месяц), попроси выписку за 2024 год за период с 1.2.2024 по 31.12.2024
-         ПРИМЕР: Если выписка с 1.1.2025 по текущую дату и составляет менее 12 месяцев, вычисли недостающие месяцы и попроси выписку за 2024 год за соответствующий период
-         НЕ ПЕРЕХОДИ к вопросам про другие банки, пока не получишь выписку за предыдущий период или не убедишься, что есть полные 12 месяцев данных!
+         ОБЯЗАТЕЛЬНО СПРОСИ: "Для полного анализа нам нужны данные за полные 12 месяцев. Ваша выписка охватывает период с [день.месяц.год] по [день.месяц.год] ([X] месяцев). Пожалуйста, прикрепите выписку за за 12 месяцев."
+
+         НЕ ПЕРЕХОДИ к вопросам про другие банки, пока не получишь выписку за полные 12 месяцев данных!
    
    Если получена выписка за полные 12 месяцев:
-      "Выписка принята. Есть ли у вас счета в других банках? Если да, прикрепите выписки за 12 месяцев. Если нет, напишите 'нет'."
+      "Выписка принята. Есть ли у вас счета в других банках? Если да, прикрепите выписки за тот же период, что первая выписка. Если нет, напишите 'нет'."
    
-   ПОСЛЕ получения второй выписки за предыдущий период:
-      Проверь через Code Interpreter, покрывают ли обе выписки (текущая + предыдущий период) вместе полные 12 месяцев
+   ПОСЛЕ получения второй выписки другого банка за тот же период, что первая выписка:
+      Проверь через Code Interpreter, покрывают ли выписка полные 12 месяцев
       - Если ДА: "Выписка принята. Есть ли у вас счета в других банках? Если да, прикрепите выписки за 12 месяцев. Если нет, напишите 'нет'."
-      - Если НЕТ: попроси дополнительную выписку за недостающий период
+      - Если НЕТ: попроси выписку за полные 12 месяцев, за тот период что первая выписка
    
    ПОСЛЕ каждой новой выписки от другого банка:
       Проверь период этой выписки через Code Interpreter (так же, как для первой выписки):
-      - Если выписка покрывает МЕНЕЕ 12 месяцев - попроси выписку за предыдущий период для этого банка
-      - Если выписка покрывает полные 12 месяцев (или получены обе выписки вместе на 12 месяцев) - спроси про другие банки
+      - Если выписка покрывает Не попадает в тот же период что первая выписка - попроси выписку за тот же период, что первая выписка, для этого банка
+      - Если выписка покрывает тот же период что первая выписка - спроси про другие банки
       ОБЯЗАТЕЛЬНО СПРОСИ: "Есть ли у вас еще счета в других банках? Если да, прикрепите выписки. Если нет, напишите 'нет'."
    
    ТОЛЬКО ПОСЛЕ "нет" про другие банки:
@@ -330,7 +387,7 @@ const investmentAgent = new Agent({
 
 КРИТИЧЕСКИЕ СЛУЧАИ:
 Если клиент отказывается предоставить выписку за 12 месяцев ("нет под рукой", "не могу предоставить" и т.п.):
-   Сказать: "Для рассмотрения заявки необходимы выписки за 12 месяцев. Пожалуйста, соберите все документы и подайте заявку заново. Диалог завершен."
+   Сказать: "Для рассмотрения заявки необходимы выписка за 12 месяцев. Пожалуйста, соберите все документы и подайте заявку заново. Диалог завершен."
    ЗАКРЫТЬ диалог.
 
 КОНТАКТНЫЕ ДАННЫЕ:
@@ -388,7 +445,7 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
     // Получаем или создаем историю для этой сессии
     if (!conversationHistory.has(session)) {
       // Пытаемся восстановить историю из БД
-      const dbMessages = getMessagesFromDB(session)
+      const dbMessages = await getMessagesFromDB(session)
       if (dbMessages.length > 0) {
         conversationHistory.set(session, dbMessages)
         console.log(`🔄 История восстановлена из БД: ${dbMessages.length} сообщений`)
@@ -439,7 +496,7 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
         console.log(`💾 Файл сохранен в сессии. Всего файлов: ${sessionFiles.get(session).length}`)
         
         // Сохраняем метаданные файла в БД
-        saveFileToDB(session, uploadedFileId, file.originalname, file.size, file.mimetype)
+        await saveFileToDB(session, uploadedFileId, file.originalname, file.size, file.mimetype)
         
         // Добавляем информацию о файле в текст
         // Code Interpreter автоматически получит доступ к файлу через file_id в контейнере
@@ -456,7 +513,7 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
     
     // Сохраняем сообщение пользователя в БД
     const messageOrder = history.length
-    saveMessageToDB(session, 'user', messageContent, messageOrder)
+    await saveMessageToDB(session, 'user', messageContent, messageOrder)
     
     const runner = new Runner({})
 
@@ -534,10 +591,11 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
       console.log(`💾 История обновлена: ${history.length} сообщений`)
       
       // Сохраняем новые сообщения агента в БД
-      newItems.forEach((item, index) => {
+      for (let index = 0; index < newItems.length; index++) {
+        const item = newItems[index]
         const messageOrder = history.length - newItems.length + index + 1
-        saveMessageToDB(session, item.role, item.content, messageOrder)
-      })
+        await saveMessageToDB(session, item.role, item.content, messageOrder)
+      }
       
       // Проверяем, это финальное сообщение (заявка завершена)
       const isFinalMessage = agentMessage.includes('Ваша заявка принята на рассмотрение') || 
@@ -553,13 +611,10 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
           
           try {
             // Получаем файлы из БД вместо памяти
-            const getSessionFiles = db.prepare(`
-              SELECT file_id, original_name, file_size, mime_type, uploaded_at
-              FROM files 
-              WHERE session_id = ? 
-              ORDER BY uploaded_at ASC
-            `)
-            const dbFiles = getSessionFiles.all(session)
+            const { rows: dbFiles } = await pool.query(
+              `SELECT file_id, original_name, file_size, mime_type, uploaded_at FROM files WHERE session_id = $1 ORDER BY uploaded_at ASC`,
+              [session]
+            )
             
             // Преобразуем в формат, совместимый со старым кодом
             allFiles = dbFiles.map(f => ({
@@ -700,11 +755,12 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             
             // Сохраняем заявку в БД со статусом "generating"
             const filesData = JSON.stringify(allFiles)
-            const insertReport = db.prepare(`
-              INSERT OR REPLACE INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generating')
-            `)
-            insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, allFiles.length, filesData)
+            await pool.query(
+              `INSERT INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'generating')
+               ON CONFLICT (session_id) DO UPDATE SET company_bin=EXCLUDED.company_bin, amount=EXCLUDED.amount, term=EXCLUDED.term, purpose=EXCLUDED.purpose, name=EXCLUDED.name, email=EXCLUDED.email, phone=EXCLUDED.phone, files_count=EXCLUDED.files_count, files_data=EXCLUDED.files_data, status='generating'`,
+              [session, bin, amount, termMonths, purpose, name, email, phone, allFiles.length, filesData]
+            )
             console.log(`💾 Заявка сохранена в БД: ${session}, файлов: ${allFiles.length}`)
             
             // Формируем компактный запрос
@@ -718,7 +774,7 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
 - Контакты: ${name}, ${email}, ${phone}
 
 ЗАДАЧА:
-Проанализируй все ${allFiles.length} банковские выписки (файлы уже прикреплены) и создай полный финансовый отчет по структуре из твоих инструкций.`
+Проанализируй все ${allFiles.length} банковские выписки (файлы уже прикреплены) и создай финансовый отчет по структуре из твоих инструкций.`
             
             console.log(`📝 Запрос к агенту:`)
             console.log(reportRequest)
@@ -904,17 +960,15 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             console.log(`💾 Сохраняем отчет в БД...`)
             console.log(`📝 Длина отчета: ${report ? report.length : 0} символов`)
             
-            const updateReport = db.prepare(`
-              UPDATE reports 
-              SET report_text = ?, status = 'completed', completed_at = CURRENT_TIMESTAMP
-              WHERE session_id = ?
-            `)
-            const updateResult = updateReport.run(report, session)
-            console.log(`💾 Отчет сохранен в БД для сессии: ${session}, изменено строк: ${updateResult.changes}`)
+            const updateResult = await pool.query(
+              `UPDATE reports SET report_text = $1, status = 'completed', completed_at = NOW() WHERE session_id = $2`,
+              [report, session]
+            )
+            console.log(`💾 Отчет сохранен в БД для сессии: ${session}, изменено строк: ${updateResult.rowCount}`)
             
             // Проверяем что действительно сохранилось
-            const checkReport = db.prepare('SELECT status, LENGTH(report_text) as report_length FROM reports WHERE session_id = ?')
-            const checkResult = checkReport.get(session)
+            const { rows: checkRows } = await pool.query('SELECT status, LENGTH(report_text) as report_length FROM reports WHERE session_id = $1',[session])
+            const checkResult = checkRows[0]
             console.log(`🔍 Проверка БД: статус=${checkResult?.status}, длина отчета=${checkResult?.report_length}`)
             
             console.log(`✅ Финансовый отчет сгенерирован и сохранен в БД для сессии ${session}`)
@@ -932,12 +986,10 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
               console.warn('⏳ Financial Analyst не успел за таймаут. Статус оставлен generating, отчет может появиться позже.')
             } else {
               // Сохраняем ошибку в БД
-              const updateError = db.prepare(`
-                UPDATE reports 
-                SET report_text = ?, status = 'error', completed_at = CURRENT_TIMESTAMP
-                WHERE session_id = ?
-              `)
-              updateError.run(`Ошибка генерации отчета: ${error.message}`, session)
+              await pool.query(
+                `UPDATE reports SET report_text = $1, status = 'error', completed_at = NOW() WHERE session_id = $2`,
+                [`Ошибка генерации отчета: ${error.message}`, session]
+              )
             }
           }
         })
@@ -957,13 +1009,14 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
 
 // Эндпоинт для получения финансового отчета
 // Эндпоинт для получения отчета по session_id
-app.get('/api/reports/:sessionId', (req, res) => {
+app.get('/api/reports/:sessionId', async (req, res) => {
   const { sessionId } = req.params
   
   console.log(`📊 Запрос отчета для сессии: ${sessionId}`)
   
   try {
-    const report = db.prepare('SELECT * FROM reports WHERE session_id = ?').get(sessionId)
+    const { rows } = await pool.query('SELECT * FROM reports WHERE session_id = $1', [sessionId])
+    const report = rows[0]
     
     if (!report) {
       console.log(`⚠️ Отчет не найден для сессии ${sessionId}`)
@@ -1002,13 +1055,13 @@ app.get('/api/reports/:sessionId', (req, res) => {
 })
 
 // Эндпоинт для восстановления истории сессии
-app.get('/api/sessions/:sessionId/history', (req, res) => {
+app.get('/api/sessions/:sessionId/history', async (req, res) => {
   const { sessionId } = req.params
   console.log(`📖 Запрос истории сессии: ${sessionId}`)
   
   try {
     // Получаем историю из БД
-    const history = getMessagesFromDB(sessionId)
+    const history = await getMessagesFromDB(sessionId)
     
     if (!history || history.length === 0) {
       console.log(`⚠️ История не найдена в БД для сессии: ${sessionId}`)
@@ -1079,18 +1132,15 @@ app.get('/api/sessions/:sessionId/history', (req, res) => {
 })
 
 // Эндпоинт для получения файлов сессии
-app.get('/api/sessions/:sessionId/files', (req, res) => {
+app.get('/api/sessions/:sessionId/files', async (req, res) => {
   const { sessionId } = req.params
   console.log(`📎 Запрос файлов для сессии: ${sessionId}`)
   
   try {
-    const getFiles = db.prepare(`
-      SELECT file_id, original_name, file_size, mime_type, uploaded_at
-      FROM files 
-      WHERE session_id = ? 
-      ORDER BY uploaded_at ASC
-    `)
-    const files = getFiles.all(sessionId)
+    const { rows: files } = await pool.query(
+      `SELECT file_id, original_name, file_size, mime_type, uploaded_at FROM files WHERE session_id = $1 ORDER BY uploaded_at ASC`,
+      [sessionId]
+    )
     
     console.log(`✅ Найдено файлов для сессии ${sessionId}: ${files.length}`)
     return res.json({
@@ -1113,14 +1163,11 @@ app.get('/api/sessions/:sessionId/files', (req, res) => {
 })
 
 // Эндпоинт для получения списка всех заявок (для менеджера)
-app.get('/api/reports', (req, res) => {
+app.get('/api/reports', async (req, res) => {
   try {
-    const reports = db.prepare(`
-      SELECT session_id, company_bin, amount, term, purpose, name, email, phone, 
-             status, files_count, created_at, completed_at
-      FROM reports 
-      ORDER BY created_at DESC
-    `).all()
+    const { rows: reports } = await pool.query(
+      `SELECT session_id, company_bin, amount, term, purpose, name, email, phone, status, files_count, created_at, completed_at FROM reports ORDER BY created_at DESC`
+    )
     
     console.log(`📋 Получен список заявок: ${reports.length} шт.`)
     return res.json({
@@ -1165,5 +1212,4 @@ process.on('SIGINT', () => {
   console.log('[server] SIGINT received, shutting down gracefully')
   process.exit(0)
 })
-
 
