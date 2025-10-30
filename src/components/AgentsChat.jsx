@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react'
-import { Send, User, Paperclip } from 'lucide-react'
+import { Send, User, Paperclip, RotateCcw } from 'lucide-react'
 import PrivacyPolicyModal from './PrivacyPolicyModal'
 import { getApiUrl } from '../utils/api'
 import './AgentsChat.css'
@@ -28,7 +28,7 @@ const AIIcon = ({ size = 24 }) => (
   </svg>
 )
 
-const AgentsChat = () => {
+const AgentsChat = ({ onProgressChange }) => {
   const [messages, setMessages] = useState([
     {
       id: 1,
@@ -123,8 +123,13 @@ const AgentsChat = () => {
         return false // Возвращаем false для индикации ошибки
       }
       
-      const botMessage = createBotMessage(result.message, { data: result.data })
+      const botMessage = createBotMessage(result.message)
       setMessages(prev => [...prev, botMessage])
+
+      // Обновляем прогресс по факту файлов из ответа сервера (если пришел)
+      if (result?.data?.progress) {
+        onProgressChange?.(prev => ({ ...prev, ...result.data.progress }))
+      }
       
       // Проверяем, завершена ли заявка  
       if (result.completed) {
@@ -264,6 +269,27 @@ const AgentsChat = () => {
     setMessages(prev => [...prev, botMessage])
   }
 
+  const handleHardReset = () => {
+    // Полная очистка локальной сессии и чата
+    try {
+      localStorage.removeItem('ikap_sessionId')
+    } catch {}
+    setSessionId(null)
+    setSelectedFile(null)
+    setIsCompleted(false)
+    setDialogState('greeting')
+    setUserName('')
+    setInputMessage('')
+    setMessages([
+      {
+        id: 1,
+        text: "Здравствуйте, как я могу к Вам обращаться?",
+        sender: 'bot',
+        timestamp: new Date()
+      }
+    ])
+  }
+
   const handleKeyPress = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
@@ -284,6 +310,22 @@ const AgentsChat = () => {
           <AIIcon size={28} />
           <span>iKapitalist AI</span>
         </div>
+        <button
+          onClick={handleHardReset}
+          className="restart-button"
+          title="Новая заявка"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            background: 'transparent',
+            border: 'none',
+            color: '#fff',
+            cursor: 'pointer',
+            padding: 0
+          }}
+        >
+          <RotateCcw size={20} />
+        </button>
       </div>
 
       <div className="agents-chat-messages">
@@ -302,11 +344,6 @@ const AgentsChat = () => {
                   >
                     Принять условия платформы
                   </button>
-                </div>
-              )}
-              {message.data && (
-                <div className="message-data">
-                  <pre>{JSON.stringify(message.data, null, 2)}</pre>
                 </div>
               )}
               <div className="message-time">
@@ -379,16 +416,16 @@ const AgentsChat = () => {
               </div>
             )}
             <textarea
-              value={formatInputNumbers(inputMessage)}
+              value={inputMessage}
               onChange={(e) => {
-                // Убираем пробелы из введенного текста для хранения в состоянии
-                const cleanValue = cleanNumbersForSending(e.target.value)
-                setInputMessage(cleanValue)
+                // Сохраняем как есть; очистим числа при отправке
+                setInputMessage(e.target.value)
               }}
               onKeyPress={handleKeyPress}
               placeholder="Напишите сообщение..."
               className="message-input"
               rows="1"
+              inputMode="numeric"
             />
             <button
               onClick={() => fileInputRef.current?.click()}
@@ -410,7 +447,7 @@ const AgentsChat = () => {
           ref={fileInputRef}
           type="file"
           onChange={handleFileSelect}
-          accept=".pdf,.xlsx,.xls,.csv,.doc,.docx"
+          accept=".pdf,.xlsx,.xls,.csv,.doc,.docx,.zip"
           style={{ display: 'none' }}
         />
       </div>

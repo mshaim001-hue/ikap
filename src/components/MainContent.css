@@ -54,6 +54,60 @@
   overflow: hidden;
 }
 
+.progress-steps {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  align-items: center;
+  margin: 12px 0 16px 0;
+}
+
+.step-badge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: #f3f4f6;
+  border: 1px solid #e5e7eb;
+  color: #374151;
+  border-radius: 999px;
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  width: 100%;
+}
+
+.step-badge.completed {
+  background: #ecfdf5;
+  border-color: #10b981;
+  color: #065f46;
+}
+
+.step-check {
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.step-hint {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 5;
+  background: #ffffff;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 10px 12px;
+  width: 260px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+  text-align: left;
+  color: #374151;
+}
+
 .form-group {
   margin-bottom: 24px;
 }
