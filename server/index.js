@@ -2,7 +2,8 @@ const express = require('express')
 const cors = require('cors')
 const multer = require('multer')
 const OpenAI = require('openai')
-const Database = require('better-sqlite3')
+const { createDb } = require('./db')
+try { require('dotenv').config({ path: '.env.local' }) } catch {}
 require('dotenv').config()
 
 // Настройка multer для загрузки файлов
@@ -24,74 +25,109 @@ app.use(express.json({ limit: '10mb' }))
 // Глобальный OpenAI клиент для Assistants API
 const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
-// Инициализация SQLite базы данных
-const db = new Database('reports.db')
+// Инициализация БД (Postgres/SQLite) и создание схемы
+const db = createDb()
 
-// Создание таблиц
-db.exec(`
-  -- Таблица для заявок
-  CREATE TABLE IF NOT EXISTS reports (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT UNIQUE NOT NULL,
-    company_bin TEXT,
-    amount TEXT,
-    term TEXT,
-    purpose TEXT,
-    name TEXT,
-    email TEXT,
-    phone TEXT,
-    report_text TEXT,
-    status TEXT DEFAULT 'generating',
-    files_count INTEGER DEFAULT 0,
-    files_data TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at DATETIME
-  );
+async function initSchema() {
+  if (db.type === 'pg') {
+    await db.exec(`
+      CREATE TABLE IF NOT EXISTS reports (
+        id SERIAL PRIMARY KEY,
+        session_id TEXT UNIQUE NOT NULL,
+        company_bin TEXT,
+        amount TEXT,
+        term TEXT,
+        purpose TEXT,
+        name TEXT,
+        email TEXT,
+        phone TEXT,
+        report_text TEXT,
+        status TEXT DEFAULT 'generating',
+        files_count INTEGER DEFAULT 0,
+        files_data TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        completed_at TIMESTAMP
+      );
 
-  -- Таблица для сообщений (переписка)
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    role TEXT NOT NULL, -- 'user' или 'assistant'
-    content TEXT NOT NULL,
-    content_type TEXT DEFAULT 'text', -- 'text', 'file', 'mixed'
-    message_order INTEGER NOT NULL, -- порядок сообщения в диалоге
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES reports(session_id)
-  );
+      CREATE TABLE IF NOT EXISTS messages (
+        id SERIAL PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        content_type TEXT DEFAULT 'text',
+        message_order INTEGER NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
 
-  -- Таблица для файлов (метаданные)
-  CREATE TABLE IF NOT EXISTS files (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id TEXT NOT NULL,
-    file_id TEXT NOT NULL, -- ID файла в OpenAI
-    original_name TEXT NOT NULL,
-    file_size INTEGER,
-    mime_type TEXT,
-    category TEXT, -- 'statements' | 'taxes' | 'financial'
-    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (session_id) REFERENCES reports(session_id)
-  );
+      CREATE TABLE IF NOT EXISTS files (
+        id SERIAL PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        file_id TEXT NOT NULL,
+        original_name TEXT NOT NULL,
+        file_size INTEGER,
+        mime_type TEXT,
+        category TEXT,
+        uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
 
-  -- Индексы для быстрого поиска
-  CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
-  CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
-  CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
-`)
+      CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+      CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
+      CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
+    `)
+  } else {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS reports (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT UNIQUE NOT NULL,
+        company_bin TEXT,
+        amount TEXT,
+        term TEXT,
+        purpose TEXT,
+        name TEXT,
+        email TEXT,
+        phone TEXT,
+        report_text TEXT,
+        status TEXT DEFAULT 'generating',
+        files_count INTEGER DEFAULT 0,
+        files_data TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        completed_at DATETIME
+      );
 
-console.log('✅ Database initialized with all tables')
+      CREATE TABLE IF NOT EXISTS messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        content_type TEXT DEFAULT 'text',
+        message_order INTEGER NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
 
-// Миграция: добавляем колонку category в files, если её нет
-try {
-  const columns = db.prepare(`PRAGMA table_info(files)`).all()
-  const hasCategory = columns.some(c => c.name === 'category')
-  if (!hasCategory) {
-    db.prepare(`ALTER TABLE files ADD COLUMN category TEXT`).run()
-    console.log('🛠️ files.category column added')
+      CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        file_id TEXT NOT NULL,
+        original_name TEXT NOT NULL,
+        file_size INTEGER,
+        mime_type TEXT,
+        category TEXT,
+        uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+      CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
+      CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
+    `)
   }
-} catch (e) {
-  console.warn('⚠️ Migration check failed (files.category):', e.message)
+  console.log('✅ Database initialized with all tables')
 }
+
+initSchema().catch(e => {
+  console.error('❌ DB init failed', e)
+})
+
+// SQLite миграции удалены: проект использует только PostgreSQL
 
 // Вспомогательные функции для работы с БД
 const saveMessageToDB = (sessionId, role, content, messageOrder) => {
@@ -117,6 +153,21 @@ const saveFileToDB = (sessionId, fileId, originalName, fileSize, mimeType, categ
     console.log(`📎 Файл сохранен в БД: ${originalName} [${category || 'uncategorized'}]`)
   } catch (error) {
     console.error(`❌ Ошибка сохранения файла в БД:`, error)
+  }
+}
+
+// Обновление категории уже сохраненного файла (по факту подтверждения от агента)
+const updateFileCategoryInDB = (fileId, category) => {
+  try {
+    const updateStmt = db.prepare(`
+      UPDATE files
+      SET category = ?
+      WHERE file_id = ?
+    `)
+    updateStmt.run(category, fileId)
+    console.log(`📎 Категория файла обновлена: ${fileId} -> ${category}`)
+  } catch (error) {
+    console.error(`❌ Ошибка обновления категории файла:`, error)
   }
 }
 
@@ -580,6 +631,18 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
       const newItems = inv.newItems.map(item => item.rawItem)
       history.push(...newItems)
       console.log(`💾 История обновлена: ${history.length} сообщений`)
+
+      // Если только что был загружен файл и агент подтвердил его тип, проставим категорию
+      if (uploadedFileId && typeof agentMessage === 'string') {
+        const msg = agentMessage.toLowerCase()
+        if (msg.includes('налог')) {
+          updateFileCategoryInDB(uploadedFileId, 'taxes')
+        } else if (msg.includes('финанс')) {
+          updateFileCategoryInDB(uploadedFileId, 'financial')
+        } else if (msg.includes('выписк')) {
+          updateFileCategoryInDB(uploadedFileId, 'statements')
+        }
+      }
       
       // Сохраняем новые сообщения агента в БД
       for (let index = 0; index < newItems.length; index++) {

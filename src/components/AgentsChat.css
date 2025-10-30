@@ -166,6 +166,16 @@
   color: #4c51bf;
   font-weight: 500;
   border: 1px solid #e0e7ff;
+  max-width: 60%;
+  overflow: hidden; /* prevent layout shift for long filenames */
+}
+
+.selected-file span {
+  display: block;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis; /* truncate long filenames */
 }
 
 .remove-file {

@@ -9,14 +9,14 @@
     "dev:vite": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "deploy": "npm run build && gh-pages -d dist",
-    "postinstall": "npm rebuild better-sqlite3"
+    "deploy": "npm run build && gh-pages -d dist"
   },
   "dependencies": {
     "@openai/agents": "^0.1.9",
     "@openai/chatkit": "^1.0.0",
     "@openai/chatkit-react": "^1.1.1",
-    "better-sqlite3": "^12.4.1",
+    
+    "pg": "^8.12.0",
     "concurrently": "^9.2.1",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
