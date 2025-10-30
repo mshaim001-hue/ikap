@@ -187,9 +187,13 @@ const categorizeUploadedFile = (originalName, mimeType) => {
 }
 
 // Получение прогресса по сессии
-const getSessionProgress = (sessionId) => {
-  const rows = db.prepare(`SELECT category, COUNT(*) as cnt FROM files WHERE session_id = ? GROUP BY category`).all(sessionId)
-  const map = Object.fromEntries(rows.map(r => [r.category || 'uncategorized', r.cnt]))
+const getSessionProgress = async (sessionId) => {
+  const rows = await db.prepare(`SELECT category, COUNT(*) as cnt FROM files WHERE session_id = ? GROUP BY category`).all(sessionId)
+  const safeRows = Array.isArray(rows) ? rows : []
+  if (!Array.isArray(rows)) {
+    console.warn('getSessionProgress: unexpected rows', rows)
+  }
+  const map = Object.fromEntries(safeRows.map(r => [r.category || 'uncategorized', r.cnt]))
   return {
     statements: (map['statements'] || 0) > 0,
     taxes: (map['taxes'] || 0) > 0,
@@ -197,7 +201,7 @@ const getSessionProgress = (sessionId) => {
   }
 }
 
-const getMessagesFromDB = (sessionId) => {
+const getMessagesFromDB = async (sessionId) => {
   try {
     const getMessages = db.prepare(`
       SELECT role, content, message_order
@@ -205,8 +209,12 @@ const getMessagesFromDB = (sessionId) => {
       WHERE session_id = ? 
       ORDER BY message_order ASC
     `)
-    const messages = getMessages.all(sessionId)
-    return messages.map(msg => ({
+    const messages = await getMessages.all(sessionId)
+    const safeMessages = Array.isArray(messages) ? messages : []
+    if (!Array.isArray(messages)) {
+      console.warn('getMessagesFromDB: unexpected messages', messages)
+    }
+    return safeMessages.map(msg => ({
       role: msg.role,
       content: JSON.parse(msg.content)
     }))
@@ -1061,7 +1069,7 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
       }
       
       // Возвращаем прогресс по факту загруженных файлов
-      const progress = getSessionProgress(session)
+      const progress = await getSessionProgress(session)
       return res.json({ 
         ok: true, 
         message: agentMessage,
