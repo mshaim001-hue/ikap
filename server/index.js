@@ -19,7 +19,38 @@ const { z } = require('zod')
 console.log('Agents SDK loaded successfully')
 
 const app = express()
-app.use(cors())
+
+// Настройка CORS для GitHub Pages
+const allowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:8787',
+  'https://*.github.io',
+  'https://*.githubpages.io',
+  process.env.FRONTEND_URL
+].filter(Boolean)
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Разрешаем запросы без origin (например, Postman, curl)
+    if (!origin) return callback(null, true)
+    
+    // Проверяем совпадение с разрешенными источниками
+    const isAllowed = allowedOrigins.some(allowed => {
+      if (allowed.includes('*')) {
+        const pattern = allowed.replace('*', '.*')
+        return new RegExp(`^${pattern}$`).test(origin)
+      }
+      return origin === allowed
+    })
+    
+    if (isAllowed || allowedOrigins.length === 0) {
+      callback(null, true)
+    } else {
+      callback(new Error('Not allowed by CORS'))
+    }
+  },
+  credentials: true
+}))
 app.use(express.json({ limit: '10mb' }))
 
 // В production отдаем статические файлы после сборки

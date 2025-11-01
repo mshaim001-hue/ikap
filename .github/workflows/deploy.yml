@@ -25,8 +25,8 @@ jobs:
       run: npm run build
       env:
         NODE_ENV: production
-        VITE_OPENAI_API_KEY: ${{ secrets.VITE_OPENAI_API_KEY }}
         VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
+        VITE_BASE_PATH: ${{ secrets.VITE_BASE_PATH || '/ikap/' }}
         
     - name: Deploy to GitHub Pages
       uses: peaceiris/actions-gh-pages@v3
