@@ -3,7 +3,8 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
-  base: '/ikap/',
+  // В development используем /ikap/, в production - корень
+  base: process.env.NODE_ENV === 'production' ? '/' : '/ikap/',
   server: {
     port: 3000,
     open: true,

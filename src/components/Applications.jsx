@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { 
   Calendar, 
   User, 
@@ -11,7 +11,10 @@ import {
   CheckCircle,
   AlertCircle,
   XCircle,
-  Trash2
+  Trash2,
+  MessageSquare,
+  Download,
+  Paperclip
 } from 'lucide-react'
 import { getApiUrl } from '../utils/api'
 import './Applications.css'
@@ -20,6 +23,14 @@ const Applications = () => {
   const [applications, setApplications] = useState([])
   const [loading, setLoading] = useState(true)
   const [selectedApplication, setSelectedApplication] = useState(null)
+  const [showDialog, setShowDialog] = useState(false)
+  const [dialogMessages, setDialogMessages] = useState([])
+  const [dialogLoading, setDialogLoading] = useState(false)
+  const [files, setFiles] = useState([])
+  const [filesLoading, setFilesLoading] = useState(false)
+  const [showReportModal, setShowReportModal] = useState(false)
+  const pollingIntervalRef = useRef(null)
+  const dialogEndRef = useRef(null)
 
   // Загружаем список заявок
   useEffect(() => {
@@ -82,28 +93,139 @@ const Applications = () => {
     })
   }
 
+  const formatFileSize = (bytes) => {
+    if (!bytes) return '0 B'
+    const k = 1024
+    const sizes = ['B', 'KB', 'MB', 'GB']
+    const i = Math.floor(Math.log(bytes) / Math.log(k))
+    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i]
+  }
+
+  const stopPollingReport = () => {
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current)
+      pollingIntervalRef.current = null
+    }
+  }
+
+  const refreshApplication = async (sessionId) => {
+    try {
+      const response = await fetch(getApiUrl(`/api/reports/${sessionId}`))
+      const data = await response.json()
+      
+      if (data.ok && data.report) {
+        setSelectedApplication(data.report)
+        
+        // Если статус изменился на completed, останавливаем polling
+        if (data.report.status === 'completed') {
+          stopPollingReport()
+        }
+      }
+    } catch (error) {
+      console.error('Ошибка загрузки отчета:', error)
+    }
+  }
+
+  const startPollingReport = (sessionId) => {
+    stopPollingReport() // Останавливаем предыдущий polling если есть
+    
+    pollingIntervalRef.current = setInterval(async () => {
+      await refreshApplication(sessionId)
+    }, 3000) // Обновляем каждые 3 секунды
+  }
+
+  const loadFiles = async (sessionId) => {
+    try {
+      setFilesLoading(true)
+      const response = await fetch(getApiUrl(`/api/sessions/${sessionId}/files`))
+      const data = await response.json()
+      
+      if (data.ok && data.files) {
+        setFiles(data.files)
+      }
+    } catch (error) {
+      console.error('Ошибка загрузки файлов:', error)
+    } finally {
+      setFilesLoading(false)
+    }
+  }
+
+  const loadDialog = async (sessionId) => {
+    try {
+      setDialogLoading(true)
+      const response = await fetch(getApiUrl(`/api/sessions/${sessionId}/history`))
+      const data = await response.json()
+      
+      if (data.ok && data.messages) {
+        setDialogMessages(data.messages)
+        setShowDialog(true)
+        // Прокручиваем вниз после загрузки
+        setTimeout(() => {
+          dialogEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+        }, 100)
+      } else {
+        console.error('Ошибка загрузки диалога:', data.message)
+        setDialogMessages([])
+      }
+    } catch (error) {
+      console.error('Ошибка загрузки диалога:', error)
+      setDialogMessages([])
+    } finally {
+      setDialogLoading(false)
+    }
+  }
+
+  const handleDownloadFile = async (fileId, fileName) => {
+    try {
+      const response = await fetch(getApiUrl(`/api/files/${fileId}/download`))
+      if (!response.ok) {
+        throw new Error('Ошибка скачивания файла')
+      }
+      
+      const blob = await response.blob()
+      const url = window.URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = fileName
+      document.body.appendChild(a)
+      a.click()
+      window.URL.revokeObjectURL(url)
+      document.body.removeChild(a)
+    } catch (error) {
+      console.error('Ошибка скачивания файла:', error)
+      alert('Не удалось скачать файл')
+    }
+  }
+
   const handleApplicationClick = async (application) => {
     console.log('🔍 Выбрана заявка:', application)
     console.log('📊 Статус:', application.status)
     console.log('📄 Отчет:', application.reportText ? 'Есть' : 'Нет')
     
     setSelectedApplication(application)
+    setShowDialog(false)
+    setDialogMessages([])
+    setFiles([])
     
-    // Если отчет еще генерируется, загружаем его
+    // Загружаем файлы для этой заявки
+    loadFiles(application.sessionId)
+    
+    // Если отчет еще генерируется, запускаем polling
     if (application.status === 'generating') {
-      try {
-        const response = await fetch(getApiUrl(`/api/reports/${application.sessionId}`))
-        const data = await response.json()
-        
-        if (data.ok && data.report) {
-          console.log('📊 Загружен отчет:', data.report.reportText ? 'Есть' : 'Нет')
-          setSelectedApplication(data.report)
-        }
-      } catch (error) {
-        console.error('Ошибка загрузки отчета:', error)
-      }
+      startPollingReport(application.sessionId)
+    } else {
+      stopPollingReport()
     }
+    
+    // Загружаем актуальные данные заявки
+    await refreshApplication(application.sessionId)
   }
+
+  useEffect(() => {
+    return () => {
+      stopPollingReport()
+    }
+  }, [])
 
   const handleDeleteApplication = async (applicationId, event) => {
     event.stopPropagation() // Предотвращаем открытие деталей заявки
@@ -249,7 +371,11 @@ const Applications = () => {
             <div className="details-header">
               <h3>Детали заявки</h3>
               <button 
-                onClick={() => setSelectedApplication(null)}
+                onClick={() => {
+                  setSelectedApplication(null)
+                  setShowDialog(false)
+                  stopPollingReport()
+                }}
                 className="close-button"
               >
                 ×
@@ -257,6 +383,17 @@ const Applications = () => {
             </div>
             
             <div className="details-content">
+              <div className="detail-section">
+                <div className="detail-actions">
+                  <button
+                    onClick={() => loadDialog(selectedApplication.sessionId)}
+                    className="dialog-button"
+                  >
+                    <MessageSquare size={16} />
+                    Диалог
+                  </button>
+                </div>
+              </div>
               <div className="detail-section">
                 <h4>Основная информация</h4>
                 <div className="detail-grid">
@@ -297,16 +434,50 @@ const Applications = () => {
                 </div>
               </div>
 
-              {selectedApplication.reportText ? (
+              {files.length > 0 && (
                 <div className="detail-section">
-                  <h4>Финансовый отчет</h4>
-                  <div className="report-content">
-                    <pre>{selectedApplication.reportText}</pre>
+                  <h4>Файлы ({files.length})</h4>
+                  <div className="files-list">
+                    {files.map((file, index) => (
+                      <div key={index} className="file-item">
+                        <Paperclip size={14} />
+                        <span className="file-name" title={file.originalName}>
+                          {file.originalName}
+                        </span>
+                        <span className="file-size">
+                          {formatFileSize(file.fileSize)}
+                        </span>
+                        <button
+                          onClick={() => handleDownloadFile(file.fileId, file.originalName)}
+                          className="download-file-button"
+                          title="Скачать файл"
+                        >
+                          <Download size={14} />
+                        </button>
+                      </div>
+                    ))}
                   </div>
                 </div>
-              ) : (
-                <div className="detail-section">
-                  <h4>Финансовый отчет</h4>
+              )}
+
+              <div className="detail-section">
+                <h4>Финансовый отчет</h4>
+                {selectedApplication.reportText ? (
+                  <>
+                    <button
+                      onClick={() => setShowReportModal(true)}
+                      className="view-report-button"
+                    >
+                      <FileText size={16} />
+                      Просмотреть отчет
+                    </button>
+                    <div className="report-preview">
+                      <p style={{ color: '#6b7280', fontSize: '12px' }}>
+                        Отчет готов. Нажмите кнопку выше для просмотра.
+                      </p>
+                    </div>
+                  </>
+                ) : (
                   <div className="report-content">
                     <p style={{ color: '#6b7280', fontStyle: 'italic' }}>
                       {selectedApplication.status === 'generating' 
@@ -315,9 +486,68 @@ const Applications = () => {
                       }
                     </p>
                   </div>
+                )}
+              </div>
+
+              {/* Модальное окно для просмотра отчета */}
+              {showReportModal && selectedApplication.reportText && (
+                <div className="report-modal-overlay" onClick={() => setShowReportModal(false)}>
+                  <div className="report-modal-content" onClick={(e) => e.stopPropagation()}>
+                    <div className="report-modal-header">
+                      <h3>Финансовый отчет</h3>
+                      <button
+                        onClick={() => setShowReportModal(false)}
+                        className="report-modal-close"
+                      >
+                        ×
+                      </button>
+                    </div>
+                    <div className="report-modal-body">
+                      <pre className="report-text">{selectedApplication.reportText}</pre>
+                    </div>
+                  </div>
                 </div>
               )}
             </div>
+
+            {showDialog && (
+              <div className="dialog-panel">
+                <div className="dialog-header">
+                  <h4>Диалог с пользователем</h4>
+                  <button
+                    onClick={() => setShowDialog(false)}
+                    className="close-dialog-button"
+                  >
+                    ×
+                  </button>
+                </div>
+                <div className="dialog-messages">
+                  {dialogLoading ? (
+                    <div className="dialog-loading">
+                      <Clock size={20} className="animate-spin" />
+                      <span>Загрузка диалога...</span>
+                    </div>
+                  ) : dialogMessages.length > 0 ? (
+                    dialogMessages.map((msg) => (
+                      <div key={msg.id} className={`dialog-message ${msg.sender === 'user' ? 'user-message' : 'bot-message'}`}>
+                        <div className="message-sender">
+                          {msg.sender === 'user' ? '👤 Пользователь' : '🤖 Бот'}
+                        </div>
+                        <div className="message-text">{msg.text}</div>
+                        <div className="message-time">
+                          {new Date(msg.timestamp).toLocaleString('ru-RU')}
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="dialog-empty">
+                      <p>Диалог не найден</p>
+                    </div>
+                  )}
+                  <div ref={dialogEndRef} />
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>

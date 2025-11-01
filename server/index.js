@@ -22,6 +22,12 @@ const app = express()
 app.use(cors())
 app.use(express.json({ limit: '10mb' }))
 
+// В production отдаем статические файлы после сборки
+if (process.env.NODE_ENV === 'production') {
+  const path = require('path')
+  app.use(express.static(path.join(__dirname, '../dist')))
+}
+
 // Глобальный OpenAI клиент для Assistants API
 const openaiClient = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
 
@@ -130,26 +136,26 @@ initSchema().catch(e => {
 // SQLite миграции удалены: проект использует только PostgreSQL
 
 // Вспомогательные функции для работы с БД
-const saveMessageToDB = (sessionId, role, content, messageOrder) => {
+const saveMessageToDB = async (sessionId, role, content, messageOrder) => {
   try {
     const insertMessage = db.prepare(`
       INSERT INTO messages (session_id, role, content, message_order)
       VALUES (?, ?, ?, ?)
     `)
-    insertMessage.run(sessionId, role, JSON.stringify(content), messageOrder)
+    await insertMessage.run(sessionId, role, JSON.stringify(content), messageOrder)
     console.log(`💾 Сообщение сохранено в БД: ${role} #${messageOrder}`)
   } catch (error) {
     console.error(`❌ Ошибка сохранения сообщения в БД:`, error)
   }
 }
 
-const saveFileToDB = (sessionId, fileId, originalName, fileSize, mimeType, category) => {
+const saveFileToDB = async (sessionId, fileId, originalName, fileSize, mimeType, category) => {
   try {
     const insertFile = db.prepare(`
       INSERT INTO files (session_id, file_id, original_name, file_size, mime_type, category)
       VALUES (?, ?, ?, ?, ?, ?)
     `)
-    insertFile.run(sessionId, fileId, originalName, fileSize, mimeType, category || null)
+    await insertFile.run(sessionId, fileId, originalName, fileSize, mimeType, category || null)
     console.log(`📎 Файл сохранен в БД: ${originalName} [${category || 'uncategorized'}]`)
   } catch (error) {
     console.error(`❌ Ошибка сохранения файла в БД:`, error)
@@ -157,14 +163,14 @@ const saveFileToDB = (sessionId, fileId, originalName, fileSize, mimeType, categ
 }
 
 // Обновление категории уже сохраненного файла (по факту подтверждения от агента)
-const updateFileCategoryInDB = (fileId, category) => {
+const updateFileCategoryInDB = async (fileId, category) => {
   try {
     const updateStmt = db.prepare(`
       UPDATE files
       SET category = ?
       WHERE file_id = ?
     `)
-    updateStmt.run(category, fileId)
+    await updateStmt.run(category, fileId)
     console.log(`📎 Категория файла обновлена: ${fileId} -> ${category}`)
   } catch (error) {
     console.error(`❌ Ошибка обновления категории файла:`, error)
@@ -350,7 +356,7 @@ const financialAnalystAgent = new Agent({
 
 const investmentAgent = new Agent({
   name: 'Investment Agent',
-  instructions: `Ты помощник регистрации инвестиций для iKapitalist. Собирай данные пошагово, задавай один вопрос за раз.
+  instructions: `Ты помощник регистрации заявок для инвестиций для iKapitalist. Собирай данные пошагово, задавай один вопрос за раз.
 
 ВАЖНО: ПЕРЕД каждым ответом анализируй историю диалога, чтобы понять:
 - На каком этапе находится диалог
@@ -363,11 +369,11 @@ const investmentAgent = new Agent({
 3. "Для чего Вы привлекаете финансирование?" - получи цель
 4. "Пожалуйста, предоставьте Ваш БИН" - получи БИН и убедись что БИН состоит из 12 цифр
 5. "Пожалуйста, прикрепите выписку с банка от юр лица за 12 месяцев" - получи выписки
-6. После получения выписки - спроси про выписки других банков за тот же период (повторяй до получения явного "нет")
+6. После получения выписки - спроси есть ли еще выписки с этого или другихбанков за тот же период (повторяй до получения явного "нет")
 7. ТОЛЬКО ПОСЛЕ ответа пользователя "нет" по другим банкам:
    7.1. Попроси загрузить НАЛОГОВУЮ отчетность за текущий и предыдущий год в формате ZIP одним архивом. Четко укажи: формат ZIP.
    7.2. После получения налоговой отчетности — Попроси загрузить ФИНАНСОВУЮ отчетность (баланс, ОПУ) за текущий и предыдущий год в формате PDF.
-   7.3. После получения отчетов  — "Пожалуйста, оставьте Ваши контактные данные: имя, фамилию, email и телефон" - получи контакты и убедись что номер принадлежит какому либо из Казахстана и состоит из 11 цифр
+   7.3. После получения отчетов  — "Пожалуйста, оставьте Ваши контактные данные: имя, фамилию, email и телефон" - получи контакты (убедись что номер начинается с +7 или 8 или 77 и состоит из 11 цифр но это пользователю не пиши)
 8. После получения контактов - отправь финальное сообщение
 
 ПРАВИЛА АНАЛИЗА ИСТОРИИ:
@@ -385,7 +391,7 @@ const investmentAgent = new Agent({
 3. Повторять пункт 2 до получения "нет"
 4. Только после "нет" → запросить налоговую отчетность (ZIP), затем финансовую отчетность (ZIP), и лишь после их получения — переходить к контактным данным
 
-Когда пользователь прикрепляет файл:
+Когда пользователь прикрепляет выписку с банка:
 
 1. АНАЛИЗИРУЙ файл через Code Interpreter:
    - Извлеки период выписки (даты начала и конца)
@@ -407,7 +413,7 @@ const investmentAgent = new Agent({
          НЕ ПЕРЕХОДИ к вопросам про другие банки, пока не получишь выписку за полные 12 месяцев данных!
    
    Если получена выписка за полные 12 месяцев:
-      "Выписка принята. Есть ли у вас счета в других банках? Если да, прикрепите выписки за тот же период, что первая выписка. Если нет, напишите 'нет'."
+      "Выписка принята. Есть ли у вас еще счета в этом или других банках? Если да, прикрепите выписки за тот же период, что первая выписка. Если нет, напишите 'нет'."
    
    ПОСЛЕ получения второй выписки другого банка за тот же период, что первая выписка:
       Проверь через Code Interpreter, покрывают ли выписка полные 12 месяцев
@@ -422,24 +428,24 @@ const investmentAgent = new Agent({
    
    ТОЛЬКО ПОСЛЕ "нет" про другие банки:
       Сначала попроси: "Пожалуйста, предоставьте налоговую отчетность за текущий и предыдущий год в формате ZIP"
-      После загрузки налоговой отчетности — попроси: "Пожалуйста, предоставьте финансовую отчетность (баланс и отчет о прибылях и убытках) за текущий и предыдущий год в формате pdf."
+      После загрузки налоговой отчетности — попроси: "Пожалуйста, предоставьте финансовую отчетность (баланс и отчет о прибылях и убытках) за текущий и предыдущий год в формате ZIP."
       После получения обеих ZIP-архивов — попроси контактные данные: имя, фамилия, email, телефон.
       
    ВАЖНО: НЕ ПЕРЕХОДИ к контактам БЕЗ явного "нет"!
 И НЕ ПЕРЕХОДИ к контактам БЕЗ получения обеих ZIP-отчетностей: налоговой и финансовой.
 
 РАБОТА С ZIP-ФАЙЛАМИ:
-- Прикрепление архивов ZIP допустимо (mimetype application/zip). Если пользователь прикрепил ZIP, подтверди прием: "ZIP принят" и зафиксируй какую отчетность это: налоговая или финансовая (уточни у пользователя, если непонятно из текста/имени файла).
+- Прикрепление архивов ZIP допустимо (mimetype application/zip). Если пользователь прикрепил ZIP, подтверди прием: "ZIP принят".
 - Если прикреплен не ZIP — вежливо попроси прислать именно ZIP архив.
 
 КРИТИЧЕСКИЕ СЛУЧАИ:
-Если клиент отказывается предоставить выписку за 12 месяцев ("нет под рукой", "не могу предоставить" и т.п.):
-   Сказать: "Для рассмотрения заявки необходимы выписка за 12 месяцев. Пожалуйста, соберите все документы и подайте заявку заново. Диалог завершен."
+Если клиент отказывается предоставить выписку за 12 месяцев, налоговую отчетность или финансовую отчетность ("нет под рукой", "не могу предоставить" и т.п.):
+   Сказать: "Для рассмотрения заявки необходимы выписка за 12 месяцев, налоговую отчетность или финансовую отчетность. Пожалуйста, соберите все документы и подайте заявку заново. Диалог завершен."
    ЗАКРЫТЬ диалог.
 
 КОНТАКТНЫЕ ДАННЫЕ:
-Когда пользователь ответил "нет" про другие банки:
-   "Спасибо за предоставленные банковские выписки! Пожалуйста, оставьте ваши контактные данные: имя, фамилию, email и телефон."
+Когда пользователь загрузил все необходимые документы:
+   "Спасибо за предоставленные документы! Пожалуйста, оставьте ваши контактные данные: имя, фамилию, email и телефон."
 
 ФИНАЛЬНОЕ СООБЩЕНИЕ:
 Когда пользователь предоставил все контактные данные:
@@ -450,8 +456,6 @@ const investmentAgent = new Agent({
 ВАЖНО: 
 - Задавай один вопрос за раз, не повторяй предыдущие.
 - Отвечай простыми вопросами, без технических данных.
-- Клиенту говори только "Выписка принята" + следующий запрос.
-- Детальный анализ делай внутренне для отчета менеджеру.
 
 АЛГОРИТМ РАБОТЫ:
 1. Проанализируй всю историю диалога
@@ -684,7 +688,7 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
               WHERE session_id = ? 
               ORDER BY uploaded_at ASC
             `)
-            const dbFiles = getSessionFiles.all(session)
+            const dbFiles = await getSessionFiles.all(session)
             
             // Преобразуем в формат, совместимый со старым кодом
             allFiles = dbFiles.map(f => ({
@@ -826,10 +830,21 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
             // Сохраняем заявку в БД со статусом "generating"
             const filesData = JSON.stringify(allFiles)
             const insertReport = db.prepare(`
-              INSERT OR REPLACE INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
+              INSERT INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generating')
+              ON CONFLICT (session_id) DO UPDATE SET
+                company_bin = EXCLUDED.company_bin,
+                amount = EXCLUDED.amount,
+                term = EXCLUDED.term,
+                purpose = EXCLUDED.purpose,
+                name = EXCLUDED.name,
+                email = EXCLUDED.email,
+                phone = EXCLUDED.phone,
+                files_count = EXCLUDED.files_count,
+                files_data = EXCLUDED.files_data,
+                status = EXCLUDED.status
             `)
-            insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, allFiles.length, filesData)
+            await insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, allFiles.length, filesData)
             console.log(`💾 Заявка сохранена в БД: ${session}, файлов: ${allFiles.length}`)
             
             // Формируем компактный запрос
@@ -966,14 +981,15 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
                 if (Array.isArray(item.rawItem.content)) {
                   // content - массив объектов
                   for (const contentItem of item.rawItem.content) {
-                    if (contentItem?.type === 'text' && contentItem?.text) {
+                    // Проверяем как 'text', так и 'output_text' типы
+                    if ((contentItem?.type === 'text' || contentItem?.type === 'output_text') && contentItem?.text) {
                       if (typeof contentItem.text === 'string') {
                         report = contentItem.text
-                        console.log(`✅ Найден отчет (text type) в элементе ${i}, длина: ${report.length} символов`)
+                        console.log(`✅ Найден отчет (${contentItem.type} type) в элементе ${i}, длина: ${report.length} символов`)
                         break
                       } else if (typeof contentItem.text === 'object' && contentItem.text.value) {
                         report = contentItem.text.value
-                        console.log(`✅ Найден отчет (text.value) в элементе ${i}, длина: ${report.length} символов`)
+                        console.log(`✅ Найден отчет (${contentItem.type}.text.value) в элементе ${i}, длина: ${report.length} символов`)
                         break
                       } else {
                         console.log(`⚠️ contentItem.text не является строкой: ${typeof contentItem.text}`)
@@ -990,16 +1006,16 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
               }
             }
             
-            // Вариант 2: если не нашли, пробуем через content.value
+            // Вариант 2: если не нашли, пробуем через content.text.value для output_text
             if (!report) {
-              console.log(`⚠️ Вариант 1 не сработал, пробуем альтернативные пути (content.text.value)...`)
+              console.log(`⚠️ Вариант 1 не сработал, пробуем альтернативные пути (output_text/text.value)...`)
               for (let i = reportResult.newItems.length - 1; i >= 0; i--) {
                 const item = reportResult.newItems[i]
                 if (item.rawItem?.role === 'assistant' && item.rawItem.content) {
                   for (const content of item.rawItem.content) {
-                    if (content.type === 'text' && content.text?.value) {
+                    if ((content.type === 'text' || content.type === 'output_text') && content.text?.value) {
                       report = content.text.value
-                      console.log(`✅ Найден отчет через text.value в элементе ${i}`)
+                      console.log(`✅ Найден отчет через ${content.type}.text.value в элементе ${i}`)
                       break
                     }
                   }
@@ -1034,12 +1050,12 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
               SET report_text = ?, status = 'completed', completed_at = CURRENT_TIMESTAMP
               WHERE session_id = ?
             `)
-            const updateResult = updateReport.run(report, session)
-            console.log(`💾 Отчет сохранен в БД для сессии: ${session}, изменено строк: ${updateResult.changes}`)
+            await updateReport.run(report, session)
+            console.log(`💾 Отчет сохранен в БД для сессии: ${session}`)
             
             // Проверяем что действительно сохранилось
             const checkReport = db.prepare('SELECT status, LENGTH(report_text) as report_length FROM reports WHERE session_id = ?')
-            const checkResult = checkReport.get(session)
+            const checkResult = await checkReport.get(session)
             console.log(`🔍 Проверка БД: статус=${checkResult?.status}, длина отчета=${checkResult?.report_length}`)
             
             console.log(`✅ Финансовый отчет сгенерирован и сохранен в БД для сессии ${session}`)
@@ -1062,7 +1078,7 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
                 SET report_text = ?, status = 'error', completed_at = CURRENT_TIMESTAMP
                 WHERE session_id = ?
               `)
-              updateError.run(`Ошибка генерации отчета: ${error.message}`, session)
+              await updateError.run(`Ошибка генерации отчета: ${error.message}`, session)
             }
           }
         })
@@ -1085,13 +1101,13 @@ app.post('/api/agents/run', upload.single('file'), async (req, res) => {
 
 // Эндпоинт для получения финансового отчета
 // Эндпоинт для получения отчета по session_id
-app.get('/api/reports/:sessionId', (req, res) => {
+app.get('/api/reports/:sessionId', async (req, res) => {
   const { sessionId } = req.params
   
   console.log(`📊 Запрос отчета для сессии: ${sessionId}`)
   
   try {
-    const report = db.prepare('SELECT * FROM reports WHERE session_id = ?').get(sessionId)
+    const report = await db.prepare('SELECT * FROM reports WHERE session_id = ?').get(sessionId)
     
     if (!report) {
       console.log(`⚠️ Отчет не найден для сессии ${sessionId}`)
@@ -1130,13 +1146,13 @@ app.get('/api/reports/:sessionId', (req, res) => {
 })
 
 // Эндпоинт для восстановления истории сессии
-app.get('/api/sessions/:sessionId/history', (req, res) => {
+app.get('/api/sessions/:sessionId/history', async (req, res) => {
   const { sessionId } = req.params
   console.log(`📖 Запрос истории сессии: ${sessionId}`)
   
   try {
     // Получаем историю из БД
-    const history = getMessagesFromDB(sessionId)
+    const history = await getMessagesFromDB(sessionId)
     
     if (!history || history.length === 0) {
       console.log(`⚠️ История не найдена в БД для сессии: ${sessionId}`)
@@ -1207,7 +1223,7 @@ app.get('/api/sessions/:sessionId/history', (req, res) => {
 })
 
 // Эндпоинт для получения файлов сессии
-app.get('/api/sessions/:sessionId/files', (req, res) => {
+app.get('/api/sessions/:sessionId/files', async (req, res) => {
   const { sessionId } = req.params
   console.log(`📎 Запрос файлов для сессии: ${sessionId}`)
   
@@ -1218,7 +1234,7 @@ app.get('/api/sessions/:sessionId/files', (req, res) => {
       WHERE session_id = ? 
       ORDER BY uploaded_at ASC
     `)
-    const files = getFiles.all(sessionId)
+    const files = await getFiles.all(sessionId)
     
     console.log(`✅ Найдено файлов для сессии ${sessionId}: ${files.length}`)
     return res.json({
@@ -1240,10 +1256,52 @@ app.get('/api/sessions/:sessionId/files', (req, res) => {
   }
 })
 
-// Эндпоинт для получения списка всех заявок (для менеджера)
-app.get('/api/reports', (req, res) => {
+// Эндпоинт для скачивания файла из OpenAI
+app.get('/api/files/:fileId/download', async (req, res) => {
+  const { fileId } = req.params
+  console.log(`📥 Запрос скачивания файла: ${fileId}`)
+  
   try {
-    const reports = db.prepare(`
+    // Получаем информацию о файле из БД
+    const getFile = db.prepare(`
+      SELECT file_id, original_name, mime_type
+      FROM files 
+      WHERE file_id = ?
+    `)
+    const file = await getFile.get(fileId)
+    
+    if (!file) {
+      console.log(`⚠️ Файл не найден в БД: ${fileId}`)
+      return res.status(404).json({
+        ok: false,
+        message: 'Файл не найден'
+      })
+    }
+    
+    // Загружаем файл из OpenAI
+    const fileContent = await openaiClient.files.content(fileId)
+    const buffer = Buffer.from(await fileContent.arrayBuffer())
+    
+    // Устанавливаем заголовки для скачивания
+    res.setHeader('Content-Type', file.mime_type || 'application/octet-stream')
+    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(file.original_name)}"`)
+    res.setHeader('Content-Length', buffer.length)
+    
+    console.log(`✅ Файл ${fileId} отправлен клиенту`)
+    res.send(buffer)
+  } catch (error) {
+    console.error('❌ Ошибка скачивания файла:', error)
+    return res.status(500).json({
+      ok: false,
+      message: 'Ошибка сервера при скачивании файла'
+    })
+  }
+})
+
+// Эндпоинт для получения списка всех заявок (для менеджера)
+app.get('/api/reports', async (req, res) => {
+  try {
+    const reports = await db.prepare(`
       SELECT session_id, company_bin, amount, term, purpose, name, email, phone, 
              status, files_count, created_at, completed_at
       FROM reports 
@@ -1277,10 +1335,25 @@ app.get('/api/reports', (req, res) => {
   }
 })
 
+// В production отдаем index.html для всех не-API запросов (SPA routing)
+if (process.env.NODE_ENV === 'production') {
+  const path = require('path')
+  app.get('*', (req, res) => {
+    // Пропускаем API запросы
+    if (req.path.startsWith('/api/')) {
+      return res.status(404).json({ ok: false, message: 'Not found' })
+    }
+    // Отдаем index.html для всех остальных запросов
+    res.sendFile(path.join(__dirname, '../dist/index.html'))
+  })
+}
+
 const PORT = process.env.PORT || 8787
 app.listen(PORT, () => {
-  console.log(`[server] agents listening on ${PORT}`)
+  console.log(`[server] listening on ${PORT}`)
+  console.log(`[server] NODE_ENV: ${process.env.NODE_ENV || 'development'}`)
   console.log(`[server] API key present: ${!!process.env.OPENAI_API_KEY}`)
+  console.log(`[server] Database: ${process.env.DATABASE_URL ? 'configured' : 'missing'}`)
 })
 
 // Keep server alive
