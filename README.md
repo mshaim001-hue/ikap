@@ -62,10 +62,15 @@
 - **Express 5** сервер на Node.js
 - **OpenAI Agents SDK** - для работы с AI-агентами
 - **Multer** - загрузка файлов (PDF до 50MB)
-- **SQLite/PostgreSQL** - база данных
+- **PostgreSQL** - база данных (обязательно)
 - **CORS** - поддержка разных доменов
 
 ### База данных
+
+**Требования:**
+- Используется **только PostgreSQL**
+- SQLite не поддерживается
+- Необходима настройка `DATABASE_URL` в `.env`
 
 **Таблицы:**
 - `reports` - заявки и их статусы
@@ -149,7 +154,7 @@ ikap/
 - OpenAI SDK 6.3
 - @openai/agents 0.1.9
 - Multer
-- pg (PostgreSQL) / better-sqlite3
+- pg (PostgreSQL) - обязательна
 - CORS
 - dotenv
 
@@ -162,7 +167,7 @@ OPENAI_API_KEY=sk-...
 PORT=8787
 NODE_ENV=development
 
-# PostgreSQL (опционально, по умолчанию SQLite)
+# PostgreSQL (ОБЯЗАТЕЛЬНО)
 DATABASE_URL=postgresql://user:pass@host:5432/dbname
 
 # Frontend URL для CORS
@@ -201,7 +206,7 @@ npm start
 Конфигурация в `render.yaml`. Сервис автоматически:
 - Собирает frontend
 - Запускает Express сервер
-- Настраивает PostgreSQL БД
+- Требуется отдельно создать PostgreSQL базу данных на Render.com и добавить `DATABASE_URL` в переменные окружения
 
 ### GitHub Pages
 ```bash
