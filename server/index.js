@@ -899,8 +899,98 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             }).join(' ')
             
             // Извлечение данных из истории сообщений
-            const amountMatch = historyText.match(/(\d+)\s*мил/i)
-            if (amountMatch) amount = `${amountMatch[1]} млн KZT`
+            // Ищем сумму - сначала в последовательности вопрос-ответ
+            for (let i = 0; i < history.length; i++) {
+              const msg = history[i]
+              if (msg.role === 'assistant') {
+                const assistantText = typeof msg.content === 'string' 
+                  ? msg.content 
+                  : (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join(' ') : '')
+                
+                // Если агент спрашивает о сумме
+                if (assistantText.match(/какую сумму|сумму.*получить/i)) {
+                  // Берем следующее сообщение пользователя
+                  if (i + 1 < history.length && history[i + 1].role === 'user') {
+                    const userResponse = typeof history[i + 1].content === 'string'
+                      ? history[i + 1].content
+                      : (Array.isArray(history[i + 1].content) ? history[i + 1].content.map(c => c.text || '').join(' ') : '')
+                    
+                    // Ищем сумму в ответе пользователя
+                    let amountMatch = userResponse.match(/(\d+)\s*(мил|млн|миллион)/i)
+                    if (amountMatch) {
+                      amount = `${amountMatch[1]} млн KZT`
+                      break
+                    }
+                    
+                    // Ищем большие суммы в виде цифр
+                    amountMatch = userResponse.match(/(\d{7,})/g)
+                    if (amountMatch) {
+                      // Берем первое число >= 10 млн (7+ цифр)
+                      const num = parseInt(amountMatch[0])
+                      if (num >= 10000000) {
+                        amount = `${num} KZT`
+                        break
+                      }
+                    }
+                    
+                    // Ищем суммы с разделителями тысяч
+                    amountMatch = userResponse.match(/(\d+)\s+(\d{3})\s+(\d{3})/)
+                    if (amountMatch) {
+                      const num = parseInt(amountMatch[1] + amountMatch[2] + amountMatch[3])
+                      if (num >= 10000000) {
+                        amount = `${num} KZT`
+                        break
+                      }
+                    }
+                    
+                    // Ищем суммы с "тыс"
+                    amountMatch = userResponse.match(/(\d+)\s*тыс/i)
+                    if (amountMatch) {
+                      const num = parseInt(amountMatch[1]) * 1000
+                      if (num >= 10000000) {
+                        amount = `${num} KZT`
+                        break
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            
+            // Если не нашли в последовательности, пробуем по ключевым словам
+            if (amount === 'не указана') {
+              let amountMatch = historyText.match(/(\d+)\s*(мил|млн|миллион)/i)
+              if (amountMatch) {
+                amount = `${amountMatch[1]} млн KZT`
+              } else {
+                // Ищем большие суммы в виде цифр
+                amountMatch = historyText.match(/(\d{7,})/g)
+                if (amountMatch) {
+                  const num = parseInt(amountMatch[0])
+                  if (num >= 10000000) {
+                    amount = `${num} KZT`
+                  }
+                } else {
+                  // Ищем суммы с разделителями тысяч
+                  amountMatch = historyText.match(/(\d+)\s+(\d{3})\s+(\d{3})/)
+                  if (amountMatch) {
+                    const num = parseInt(amountMatch[1] + amountMatch[2] + amountMatch[3])
+                    if (num >= 10000000) {
+                      amount = `${num} KZT`
+                    }
+                  } else {
+                    // Ищем суммы с "тыс"
+                    amountMatch = historyText.match(/(\d+)\s*тыс/i)
+                    if (amountMatch) {
+                      const num = parseInt(amountMatch[1]) * 1000
+                      if (num >= 10000000) {
+                        amount = `${num} KZT`
+                      }
+                    }
+                  }
+                }
+              }
+            }
             
             // Ищем срок - сначала в последовательности вопрос-ответ
             for (let i = 0; i < history.length; i++) {
