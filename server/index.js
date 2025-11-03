@@ -241,12 +241,20 @@ const categorizeUploadedFile = (originalName, mimeType) => {
   const name = String(originalName || '').toLowerCase()
   const type = String(mimeType || '').toLowerCase()
   
-  // Финансовая отчетность должна быть Excel (только XLSX)
+  // Финансовая отчетность: Excel файлы, изображения, PDF с финансовыми маркерами, ZIP
   const isExcel = type.includes('excel') || type.includes('spreadsheet') || 
-                  name.endsWith('.xlsx')
+                  name.endsWith('.xlsx') || name.endsWith('.xls')
+  const isImage = type.includes('image') || name.match(/\.(jpg|jpeg|png|gif|bmp|webp)$/)
+  const isZip = type.includes('zip') || name.endsWith('.zip')
+  const isFinancialPdf = type.includes('pdf') && 
+                         (name.includes('balance') || name.includes('balans') || name.includes('баланс') ||
+                          name.includes('profit') || name.includes('pribyl') || name.includes('прибыль') ||
+                          name.includes('loss') || name.includes('ubyitok') || name.includes('убыток') ||
+                          name.includes('financial') || name.includes('finance') || name.includes('финанс') ||
+                          name.includes('oopu') || name.includes('pnl') || name.includes('опу'))
   
-  if (isExcel) {
-    // Финансовая отчетность - только XLSX
+  if (isExcel || isImage || isZip || isFinancialPdf) {
+    // Финансовая отчетность: принимаем все форматы (но анализируем только XLSX)
     return 'financial'
   }
   
@@ -497,7 +505,7 @@ const investmentAgent = new Agent({
 - Повторяй этот вопрос до получения явного "нет"
 - ТОЛЬКО ПОСЛЕ получения "нет" про налоговую отчетность переходи к запросу финансовой отчетности
 
-- После получения "нет" про налоговую отчетность попроси: "Пожалуйста, предоставьте финансовую отчетность (баланс и отчет о прибылях и убытках) за текущий и предыдущий год в формате Excel (только XLSX)."
+- После получения "нет" про налоговую отчетность попроси: "Пожалуйста, предоставьте финансовую отчетность (баланс и отчет о прибылях и убытках) за текущий и предыдущий год. Рекомендуемый формат: Excel (XLSX). Также принимаем другие форматы."
 
 ФИНАНСОВАЯ ОТЧЕТНОСТЬ:
 Когда пользователь прикрепляет финансовую отчетность:
@@ -516,8 +524,8 @@ const investmentAgent = new Agent({
 РАБОТА С ФАЙЛАМИ:
 - Банковские выписки: ТОЛЬКО PDF файлы (mimetype application/pdf)
 - Налоговая отчетность: ТОЛЬКО PDF файлы
-- Финансовая отчетность: ТОЛЬКО Excel файлы формата XLSX
-- Если прикреплен файл неправильного формата — вежливо попроси прислать файл в нужном формате.
+- Финансовая отчетность: принимаем любые форматы (PDF, XLSX, XLS, изображения, ZIP), но автоматический анализ проводится только для XLSX
+- Все файлы принимаются без проверки формата
 
 КРИТИЧЕСКИЕ СЛУЧАИ:
 Если клиент отказывается предоставить выписку за 12 месяцев, налоговую отчетность или финансовую отчетность ("нет под рукой", "не могу предоставить" и т.п.):
@@ -633,16 +641,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
       for (const file of files) {
         try {
           console.log(`📎 Обрабатываем файл: ${file.originalname}, размер: ${file.size} байт`)
-          
-          // Проверяем формат файла
-          const nameLower = file.originalname.toLowerCase()
-          
-          // Если это .xls файл - отклоняем с ошибкой
-          if (nameLower.endsWith('.xls') && !nameLower.endsWith('.xlsx')) {
-            console.error(`❌ Неподдерживаемый формат: ${file.originalname} (требуется XLSX)`)
-            fileNames.push(`${file.originalname} (ошибка: требуется XLSX формат)`)
-            continue // Пропускаем этот файл
-          }
           
           // Создаем File объект для Node.js
           const fileToUpload = new File([file.buffer], file.originalname, {
@@ -1354,7 +1352,16 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             await db.prepare(`UPDATE reports SET fs_status = 'generating', fs_missing_periods = ? WHERE session_id = ?`).run(
               fsYearsMissing.length ? fsYearsMissing.join(',') : null, session
             )
-            if (fsFileIds.length > 0) {
+            
+            // Фильтруем только XLSX файлы для анализа (остальные форматы не анализируем)
+            const xlsxFileIds = fsFileIds.filter((fileId, idx) => {
+              const fileName = (fsFilesRows[idx]?.original_name || '').toLowerCase()
+              return fileName.endsWith('.xlsx')
+            })
+            
+            console.log(`📊 Финансовые файлы: всего ${fsFileIds.length}, XLSX для анализа: ${xlsxFileIds.length}`)
+            
+            if (xlsxFileIds.length > 0) {
               const fsAgent = new Agent({
                 name: 'Financial Statements Analyst',
                 instructions: `Ты аналитик финансовой отчетности. Проанализируй Баланс и ОПУ (P&L) в прикрепленных файлах.
@@ -1364,7 +1371,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 - Дай ключевые метрики: выручка, валовая прибыль/маржа, операционная прибыль, чистая прибыль, активы/обязательства
                 - Выведи краткий вывод о динамике и рисках.`,
                 model: 'gpt-5',
-                tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: fsFileIds } })],
+                tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: xlsxFileIds } })],
                 modelSettings: { store: true }
               })
               const fsRunner = new Runner({})
@@ -1389,10 +1396,25 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                   }
                 }
                 if (!fsText) fsText = 'Анализ финансовой отчетности не удалось извлечь из ответа агента.'
+                
+                // Добавляем информацию о некорректных форматах
+                const nonXlsxFiles = fsFilesRows.filter(f => !f.original_name.toLowerCase().endsWith('.xlsx'))
+                if (nonXlsxFiles.length > 0) {
+                  const nonXlsxNames = nonXlsxFiles.map(f => f.original_name).join(', ')
+                  fsText += `\n\n⚠️ Файлы некорректного формата (не проанализированы): ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX.`
+                }
+                
                 await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'completed' WHERE session_id = ?`).run(fsText, session)
               } catch (err) {
                 await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'error' WHERE session_id = ?`).run(`Ошибка анализа фин. отчетности: ${err.message}`, session)
               }
+            } else if (fsFileIds.length > 0 && xlsxFileIds.length === 0) {
+              // Есть файлы, но все некорректного формата
+              const nonXlsxNames = fsFilesRows.map(f => f.original_name).join(', ')
+              await db.prepare(`UPDATE reports SET fs_status = 'error', fs_report_text = ? WHERE session_id = ?`).run(
+                `Файлы некорректного формата: ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX (Excel).`,
+                session
+              )
             } else {
               await db.prepare(`UPDATE reports SET fs_status = 'error', fs_report_text = 'Файлы финансовой отчетности не найдены' WHERE session_id = ?`).run(session)
             }
