@@ -427,7 +427,7 @@ const financialAnalystAgent = new Agent({
 - Выдели ключевые моменты жирным шрифтом
 - Используй эмодзи для визуальной структуры
 - ФОКУСИРУЙСЯ на чистой выручке от реализации, а не на общих оборотах`,
-  model: 'gpt-5',
+  model: 'gpt-4o',
   tools: [codeInterpreter],
   modelSettings: { store: true }
 })
@@ -545,7 +545,7 @@ const investmentAgent = new Agent({
 3. Найди первый недостающий этап
 4. Задай только один вопрос по этому этапу
 5. НЕ повторяй уже собранные данные`,
-  model: 'gpt-5-mini',
+  model: 'gpt-4o-mini',
   tools: [], // Убрали Code Interpreter - файлы не анализируются при загрузке
   modelSettings: { store: true }
 })
@@ -553,7 +553,7 @@ const investmentAgent = new Agent({
 const informationAgent = new Agent({
   name: 'Information Agent',
   instructions: 'Отвечай на вопросы о процессе привлечения инвестиций.',
-  model: 'gpt-5',
+  model: 'gpt-4o',
   modelSettings: { store: true }
 })
 
@@ -1032,34 +1032,40 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             
             // Функция для запуска Financial Analyst Agent через Agents SDK
             const runWithAgentSDK = async () => {
-              console.log(`🚀 Запускаем Financial Analyst Agent через Agents SDK...`)
-              
-              // Создаем агента с доступом только к банковским выпискам
-              const analystWithFiles = new Agent({
-                ...financialAnalystAgent,
-                tools: [codeInterpreterTool({ 
-                  container: { 
-                    type: 'auto', 
-                    file_ids: fileIds 
-                  } 
-                })]
-              })
-              console.log(`✅ Financial Analyst Agent создан с файлами (model: ${financialAnalystAgent.model})`)
-              
-              // Создаем Runner
-              const reportRunner = new Runner({})
-              
-              console.log(`⚙️ Запускаем агента с запросом: "${reportRequest.substring(0, 100)}..."`)
-              
-              // Запускаем агента с одним сообщением пользователя
-              const result = await reportRunner.run(analystWithFiles, [{
-                role: 'user',
-                content: [{ type: 'input_text', text: reportRequest }]
-              }])
-              
-              console.log(`✅ Agent completed! Получено ${result.newItems.length} новых элементов`)
-              
-              return result
+              try {
+                console.log(`🚀 Запускаем Financial Analyst Agent через Agents SDK...`)
+                
+                // Создаем агента с доступом только к банковским выпискам
+                const analystWithFiles = new Agent({
+                  ...financialAnalystAgent,
+                  tools: [codeInterpreterTool({ 
+                    container: { 
+                      type: 'auto', 
+                      file_ids: fileIds 
+                    } 
+                  })]
+                })
+                console.log(`✅ Financial Analyst Agent создан с файлами (model: ${financialAnalystAgent.model})`)
+                
+                // Создаем Runner
+                const reportRunner = new Runner({})
+                
+                console.log(`⚙️ Запускаем агента с запросом: "${reportRequest.substring(0, 100)}..."`)
+                
+                // Запускаем агента с одним сообщением пользователя
+                const result = await reportRunner.run(analystWithFiles, [{
+                  role: 'user',
+                  content: [{ type: 'input_text', text: reportRequest }]
+                }])
+                
+                console.log(`✅ Agent completed! Получено ${result.newItems.length} новых элементов`)
+                
+                return result
+              } catch (runError) {
+                console.error(`❌ Ошибка внутри runWithAgentSDK:`, runError.message)
+                console.error(`❌ Стек внутри runWithAgentSDK:`, runError.stack)
+                throw runError
+              }
             }
             
             console.log(`⏳ Ожидание ответа от Financial Analyst Agent...`)
@@ -1262,7 +1268,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 - Если какого-то года нет, упомяни, что данные неполные, но сделай анализ по имеющимся
                 - Сделай краткий вывод по налоговым обязательствам, начислениям, задолженностям, штрафам
                 - Используй четкую структуру, перечисления, суммы с тысячными разделителями.`,
-                model: 'gpt-5',
+                model: 'gpt-4o',
                 tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: taxFileIds } })],
                 modelSettings: { store: true }
               })
@@ -1336,7 +1342,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 - Если какого-то года нет, явно укажи об этом и сделай анализ по имеющимся данным
                 - Дай ключевые метрики: выручка, валовая прибыль/маржа, операционная прибыль, чистая прибыль, активы/обязательства
                 - Выведи краткий вывод о динамике и рисках.`,
-                model: 'gpt-5',
+                model: 'gpt-4o',
                 tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: fsFileIds } })],
                 modelSettings: { store: true }
               })
