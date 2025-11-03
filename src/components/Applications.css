@@ -369,10 +369,28 @@
 }
 
 /* Files list */
+.files-category {
+  margin-bottom: 20px;
+}
+
+.files-category:last-child {
+  margin-bottom: 0;
+}
+
+.files-category-title {
+  margin: 0 0 8px 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #374151;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #e5e7eb;
+}
+
 .files-list {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  margin-top: 8px;
 }
 
 .file-item {

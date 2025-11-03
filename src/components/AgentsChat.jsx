@@ -40,7 +40,7 @@ const AgentsChat = ({ onProgressChange }) => {
   const [inputMessage, setInputMessage] = useState('')
   const [isLoading, setIsLoading] = useState(false)
   const [sessionId, setSessionId] = useState(null)
-  const [selectedFile, setSelectedFile] = useState(null)
+  const [selectedFiles, setSelectedFiles] = useState([])
   const [showPrivacyModal, setShowPrivacyModal] = useState(false)
   const [dialogState, setDialogState] = useState('greeting') // greeting, name_collected, terms_accepted, data_collection
   const [userName, setUserName] = useState('')
@@ -81,29 +81,55 @@ const AgentsChat = ({ onProgressChange }) => {
   })
 
   // Функция для создания сообщения пользователя  
-  const createUserMessage = (text, file = null) => ({
-    id: Date.now(),
-    text: text + (file ? ` (файл: ${file.name})` : ''),
-    sender: 'user',
-    timestamp: new Date()
-  })
+  const createUserMessage = (text, files = []) => {
+    const filesText = files.length > 0 
+      ? (files.length === 1 ? ` (файл: ${files[0].name})` : ` (файлов: ${files.length})`)
+      : ''
+    return {
+      id: Date.now(),
+      text: text + filesText,
+      sender: 'user',
+      timestamp: new Date()
+    }
+  }
 
   // Общая функция для отправки сообщений к агенту
-  const sendToAgent = async (messageText, selectedFile) => {
+  const sendToAgent = async (messageText, files = []) => {
     setIsLoading(true)
 
     try {
-      // Подготавливаем FormData для отправки файла
+      // Подготавливаем FormData для отправки файлов
       const formData = new FormData()
       formData.append('text', messageText)
       if (sessionId) formData.append('sessionId', sessionId)
-      if (selectedFile) formData.append('file', selectedFile)
+      if (files && files.length > 0) {
+        // Отправляем массив файлов
+        files.forEach(file => {
+          formData.append('files', file)
+        })
+      }
 
       // call backend server
       const resp = await fetch(getApiUrl('/api/agents/run'), {
         method: 'POST',
         body: formData
       })
+      
+      // Проверяем статус ответа перед парсингом JSON
+      if (!resp.ok) {
+        let errorText = "Произошла ошибка. Попробуйте еще раз."
+        try {
+          const errorResult = await resp.json()
+          errorText = errorResult.error || errorResult.message || errorText
+          console.error('⚠️ Сервер вернул ошибку:', errorResult)
+        } catch (parseError) {
+          console.error('⚠️ Ошибка парсинга ответа сервера:', parseError)
+          errorText = `Ошибка сервера (${resp.status})`
+        }
+        const errorMessage = createBotMessage(errorText)
+        setMessages(prev => [...prev, errorMessage])
+        return false // Возвращаем false для индикации ошибки
+      }
       
       const result = await resp.json()
       
@@ -115,9 +141,9 @@ const AgentsChat = ({ onProgressChange }) => {
       
       // Проверяем, был ли запрос успешным
       if (result.ok === false) {
-        console.error('⚠️ Сервер вернул ошибку:', result.message)
+        console.error('⚠️ Сервер вернул ошибку:', result.message || result.error)
         const errorMessage = createBotMessage(
-          result.message || "Произошла ошибка. Попробуйте еще раз."
+          result.message || result.error || "Произошла ошибка. Попробуйте еще раз."
         )
         setMessages(prev => [...prev, errorMessage])
         return false // Возвращаем false для индикации ошибки
@@ -170,23 +196,35 @@ const AgentsChat = ({ onProgressChange }) => {
   
 
   const handleFileSelect = (event) => {
-    const file = event.target.files[0]
-    if (file) {
-      setSelectedFile(file)
-      setInputMessage(`Прикрепляю файл: ${file.name}`)
+    const files = Array.from(event.target.files || [])
+    if (files.length > 0) {
+      setSelectedFiles(files)
+      // НЕ добавляем текст в поле ввода - файлы отображаются отдельно снизу
+      setInputMessage('')
+    }
+    // Сбрасываем input, чтобы можно было выбрать те же файлы снова
+    if (event.target) {
+      event.target.value = ''
     }
   }
 
   const handleSendMessage = async () => {
-    if ((!inputMessage.trim() && !selectedFile) || isLoading) return
+    if ((!inputMessage.trim() && selectedFiles.length === 0) || isLoading) return
 
     // Очищаем числа от пробелов перед отправкой
     const cleanMessageText = cleanNumbersForSending(inputMessage.trim())
-    const userMessage = createUserMessage(cleanMessageText, selectedFile)
-
-    setMessages(prev => [...prev, userMessage])
+    const userMessage = createUserMessage(cleanMessageText, selectedFiles)
     
+    // Сохраняем данные перед очисткой полей
     const messageText = cleanMessageText
+    const filesToSend = [...selectedFiles]
+    
+    // СРАЗУ очищаем поля ввода перед добавлением сообщения в чат
+    setInputMessage('')
+    setSelectedFiles([])
+    
+    // Добавляем сообщение в чат после очистки полей
+    setMessages(prev => [...prev, userMessage])
     
     // Обработка состояний диалога
     if (dialogState === 'greeting') {
@@ -194,8 +232,6 @@ const AgentsChat = ({ onProgressChange }) => {
       setDialogState('name_collected')
       
       // Показываем спинер на 3 секунды
-      setInputMessage('')
-      setSelectedFile(null)
       setIsLoading(true)
       
       setTimeout(() => {
@@ -220,26 +256,17 @@ const AgentsChat = ({ onProgressChange }) => {
       setDialogState('data_collection')
       
       // Сразу отправляем в агента после изменения состояния
-      await sendToAgent(messageText, selectedFile)
-      
-      // Очищаем поля после отправки
-      setInputMessage('')
-      setSelectedFile(null)
+      // Поля уже очищены выше
+      await sendToAgent(messageText, filesToSend)
       return
     }
     
     // Если мы в режиме сбора данных, отправляем в агента
     if (dialogState === 'data_collection') {
-      await sendToAgent(messageText, selectedFile)
-      
-      // Очищаем поля после отправки
-      setInputMessage('')
-      setSelectedFile(null)
-    } else {
-      // Если не в режиме сбора данных, просто очищаем поле
-      setInputMessage('')
-      setSelectedFile(null)
+      // Поля уже очищены выше
+      await sendToAgent(messageText, filesToSend)
     }
+    // Если не в режиме сбора данных, поля уже очищены выше
   }
 
   const handleShowTerms = () => {
@@ -275,7 +302,7 @@ const AgentsChat = ({ onProgressChange }) => {
       localStorage.removeItem('ikap_sessionId')
     } catch {}
     setSessionId(null)
-    setSelectedFile(null)
+    setSelectedFiles([])
     setIsCompleted(false)
     setDialogState('greeting')
     setUserName('')
@@ -404,50 +431,62 @@ const AgentsChat = ({ onProgressChange }) => {
           </div>
         ) : (
           <div className="input-container">
-            {selectedFile && (
-              <div className="selected-file">
-                <span>📎 {selectedFile.name}</span>
-                <button 
-                  onClick={() => setSelectedFile(null)}
-                  className="remove-file"
-                >
-                  ×
-                </button>
+            <div className="input-row">
+              <textarea
+                value={inputMessage}
+                onChange={(e) => {
+                  // Сохраняем как есть; очистим числа при отправке
+                  setInputMessage(e.target.value)
+                }}
+                onKeyPress={handleKeyPress}
+                placeholder="Напишите сообщение..."
+                className="message-input"
+                rows="1"
+                inputMode="numeric"
+              />
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="attach-button"
+                title="Прикрепить файлы"
+              >
+                <Paperclip size={20} />
+              </button>
+              <button
+                onClick={handleSendMessage}
+                disabled={(!inputMessage.trim() && selectedFiles.length === 0) || isLoading}
+                className="send-button"
+              >
+                <Send size={20} />
+              </button>
+            </div>
+            {selectedFiles.length > 0 && (
+              <div className="selected-files">
+                {selectedFiles.map((file, index) => (
+                  <div key={index} className="selected-file">
+                    <span>📎 {file.name}</span>
+                    <button 
+                      onClick={() => {
+                        const newFiles = [...selectedFiles]
+                        newFiles.splice(index, 1)
+                        setSelectedFiles(newFiles)
+                        // Поле ввода остается пустым - файлы отображаются отдельно
+                      }}
+                      className="remove-file"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
               </div>
             )}
-            <textarea
-              value={inputMessage}
-              onChange={(e) => {
-                // Сохраняем как есть; очистим числа при отправке
-                setInputMessage(e.target.value)
-              }}
-              onKeyPress={handleKeyPress}
-              placeholder="Напишите сообщение..."
-              className="message-input"
-              rows="1"
-              inputMode="numeric"
-            />
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="attach-button"
-              title="Прикрепить файл"
-            >
-              <Paperclip size={20} />
-            </button>
-            <button
-              onClick={handleSendMessage}
-              disabled={(!inputMessage.trim() && !selectedFile) || isLoading}
-              className="send-button"
-            >
-              <Send size={20} />
-            </button>
           </div>
         )}
         <input
           ref={fileInputRef}
           type="file"
           onChange={handleFileSelect}
-          accept=".pdf,.xlsx,.xls,.csv,.doc,.docx,.zip"
+          accept=".pdf,application/pdf"
+          multiple
           style={{ display: 'none' }}
         />
       </div>

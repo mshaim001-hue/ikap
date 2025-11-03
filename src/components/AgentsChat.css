@@ -149,9 +149,21 @@
 
 .input-container {
   display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.input-row {
+  display: flex;
   gap: 12px;
   align-items: flex-end;
-  flex-wrap: wrap;
+}
+
+.selected-files {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .selected-file {
@@ -162,11 +174,9 @@
   padding: 8px 14px;
   border-radius: 10px;
   font-size: 13px;
-  margin-bottom: 6px;
   color: #4c51bf;
   font-weight: 500;
   border: 1px solid #e0e7ff;
-  max-width: 60%;
   overflow: hidden; /* prevent layout shift for long filenames */
 }
 

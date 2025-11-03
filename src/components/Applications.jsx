@@ -434,31 +434,99 @@ const Applications = () => {
                 </div>
               </div>
 
-              {files.length > 0 && (
-                <div className="detail-section">
-                  <h4>Файлы ({files.length})</h4>
-                  <div className="files-list">
-                    {files.map((file, index) => (
-                      <div key={index} className="file-item">
-                        <Paperclip size={14} />
-                        <span className="file-name" title={file.originalName}>
-                          {file.originalName}
-                        </span>
-                        <span className="file-size">
-                          {formatFileSize(file.fileSize)}
-                        </span>
-                        <button
-                          onClick={() => handleDownloadFile(file.fileId, file.originalName)}
-                          className="download-file-button"
-                          title="Скачать файл"
-                        >
-                          <Download size={14} />
-                        </button>
+              {files.length > 0 && (() => {
+                // Группируем файлы по категориям
+                const statements = files.filter(f => f.category === 'statements' || !f.category)
+                const taxes = files.filter(f => f.category === 'taxes')
+                const financial = files.filter(f => f.category === 'financial')
+                
+                return (
+                  <div className="detail-section">
+                    <h4>Файлы ({files.length})</h4>
+                    
+                    {/* Выписки */}
+                    {statements.length > 0 && (
+                      <div className="files-category">
+                        <h5 className="files-category-title">Выписки</h5>
+                        <div className="files-list">
+                          {statements.map((file, index) => (
+                            <div key={index} className="file-item">
+                              <Paperclip size={14} />
+                              <span className="file-name" title={file.originalName}>
+                                {file.originalName}
+                              </span>
+                              <span className="file-size">
+                                {formatFileSize(file.fileSize)}
+                              </span>
+                              <button
+                                onClick={() => handleDownloadFile(file.fileId, file.originalName)}
+                                className="download-file-button"
+                                title="Скачать файл"
+                              >
+                                <Download size={14} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
                       </div>
-                    ))}
+                    )}
+                    
+                    {/* Налоги */}
+                    {taxes.length > 0 && (
+                      <div className="files-category">
+                        <h5 className="files-category-title">Налоги</h5>
+                        <div className="files-list">
+                          {taxes.map((file, index) => (
+                            <div key={index} className="file-item">
+                              <Paperclip size={14} />
+                              <span className="file-name" title={file.originalName}>
+                                {file.originalName}
+                              </span>
+                              <span className="file-size">
+                                {formatFileSize(file.fileSize)}
+                              </span>
+                              <button
+                                onClick={() => handleDownloadFile(file.fileId, file.originalName)}
+                                className="download-file-button"
+                                title="Скачать файл"
+                              >
+                                <Download size={14} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    
+                    {/* Финансовый отчет */}
+                    {financial.length > 0 && (
+                      <div className="files-category">
+                        <h5 className="files-category-title">Фин отчет</h5>
+                        <div className="files-list">
+                          {financial.map((file, index) => (
+                            <div key={index} className="file-item">
+                              <Paperclip size={14} />
+                              <span className="file-name" title={file.originalName}>
+                                {file.originalName}
+                              </span>
+                              <span className="file-size">
+                                {formatFileSize(file.fileSize)}
+                              </span>
+                              <button
+                                onClick={() => handleDownloadFile(file.fileId, file.originalName)}
+                                className="download-file-button"
+                                title="Скачать файл"
+                              >
+                                <Download size={14} />
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
                   </div>
-                </div>
-              )}
+                )
+              })()}
 
               <div className="detail-section">
                 <h4>Финансовый отчет</h4>
