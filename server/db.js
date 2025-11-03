@@ -63,7 +63,8 @@ function createPostgresAdapter(connectionString) {
       const converted = convertQuestionToDollar(sql)
       return {
         async run(...params) {
-          await query(converted, params)
+          const result = await query(converted, params)
+          return { changes: result.rowCount || 0 }
         },
         all(...params) {
           return query(converted, params).then(r => r.rows)

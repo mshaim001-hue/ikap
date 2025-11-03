@@ -1362,6 +1362,20 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               runningTaxSessions.delete(session)
               return
             }
+            
+            // Устанавливаем статус generating АТОМАРНО (только если был pending/null)
+            const updateStatus = await db.prepare(`
+              UPDATE reports 
+              SET tax_status = 'generating' 
+              WHERE session_id = ? AND (tax_status IS NULL OR tax_status = 'pending')
+            `).run(session)
+            
+            if (updateStatus.changes === 0) {
+              console.log(`⏭️ tax_status уже установлен другим процессом для ${session}, пропускаем`)
+              runningTaxSessions.delete(session)
+              return
+            }
+            
             // Собираем файлы налоговой отчетности
             const taxFilesRows = await db.prepare(`
               SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'taxes' ORDER BY uploaded_at ASC
@@ -1374,7 +1388,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             if (!names.some(n => n.includes(String(yearNow)))) taxYearsMissing.push(String(yearNow))
             if (!names.some(n => n.includes(String(yearNow - 1)))) taxYearsMissing.push(String(yearNow - 1))
             
-            await db.prepare(`UPDATE reports SET tax_status = 'generating', tax_missing_periods = ? WHERE session_id = ?`).run(
+            await db.prepare(`UPDATE reports SET tax_missing_periods = ? WHERE session_id = ?`).run(
               taxYearsMissing.length ? taxYearsMissing.join(',') : null, session
             )
             
@@ -1440,6 +1454,20 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               runningFsSessions.delete(session)
               return
             }
+            
+            // Устанавливаем статус generating АТОМАРНО (только если был pending/null)
+            const updateStatus = await db.prepare(`
+              UPDATE reports 
+              SET fs_status = 'generating' 
+              WHERE session_id = ? AND (fs_status IS NULL OR fs_status = 'pending')
+            `).run(session)
+            
+            if (updateStatus.changes === 0) {
+              console.log(`⏭️ fs_status уже установлен другим процессом для ${session}, пропускаем`)
+              runningFsSessions.delete(session)
+              return
+            }
+            
             // Собираем файлы финансовой отчетности
             const fsFilesRows = await db.prepare(`
               SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'financial' ORDER BY uploaded_at ASC
@@ -1450,7 +1478,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             const names = (fsFilesRows || []).map(r => (r.original_name || '').toLowerCase())
             if (!names.some(n => n.includes(String(yearNow)))) fsYearsMissing.push(String(yearNow))
             if (!names.some(n => n.includes(String(yearNow - 1)))) fsYearsMissing.push(String(yearNow - 1))
-            await db.prepare(`UPDATE reports SET fs_status = 'generating', fs_missing_periods = ? WHERE session_id = ?`).run(
+            await db.prepare(`UPDATE reports SET fs_missing_periods = ? WHERE session_id = ?`).run(
               fsYearsMissing.length ? fsYearsMissing.join(',') : null, session
             )
             
