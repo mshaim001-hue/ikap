@@ -900,6 +900,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             
             // Извлечение данных из истории сообщений
             // Ищем сумму - сначала в последовательности вопрос-ответ
+            console.log(`🔍 Поиск суммы в истории из ${history.length} сообщений...`)
             for (let i = 0; i < history.length; i++) {
               const msg = history[i]
               if (msg.role === 'assistant') {
@@ -909,12 +910,14 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 
                 // Если агент спрашивает о сумме
                 if (assistantText.match(/какую сумму|сумму.*получить/i)) {
+                  console.log(`✅ Найден вопрос о сумме в элементе ${i}: "${assistantText.substring(0, 100)}"`)
                   // Берем следующее сообщение пользователя
                   if (i + 1 < history.length && history[i + 1].role === 'user') {
                     const userResponse = typeof history[i + 1].content === 'string'
                       ? history[i + 1].content
                       : (Array.isArray(history[i + 1].content) ? history[i + 1].content.map(c => c.text || '').join(' ') : '')
                     
+                    console.log(`📝 Ответ пользователя: "${userResponse}"`)
                     // Ищем сумму в ответе пользователя
                     let amountMatch = userResponse.match(/(\d+)\s*(мил|млн|миллион)/i)
                     if (amountMatch) {
@@ -927,9 +930,13 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                     if (amountMatch) {
                       // Берем первое число >= 10 млн (7+ цифр)
                       const num = parseInt(amountMatch[0])
+                      console.log(`💰 Найдено число: ${num}`)
                       if (num >= 10000000) {
                         amount = `${num} KZT`
+                        console.log(`✅ Сумма установлена: ${amount}`)
                         break
+                      } else {
+                        console.log(`⚠️ Число ${num} меньше 10 млн, пропускаем`)
                       }
                     }
                     
@@ -967,8 +974,12 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 amountMatch = historyText.match(/(\d{7,})/g)
                 if (amountMatch) {
                   const num = parseInt(amountMatch[0])
+                  console.log(`💰 Fallback: найдено число: ${num}`)
                   if (num >= 10000000) {
                     amount = `${num} KZT`
+                    console.log(`✅ Fallback: сумма установлена: ${amount}`)
+                  } else {
+                    console.log(`⚠️ Fallback: число ${num} меньше 10 млн, пропускаем`)
                   }
                 } else {
                   // Ищем суммы с разделителями тысяч
