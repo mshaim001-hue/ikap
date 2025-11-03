@@ -520,7 +520,7 @@ const AgentsChat = ({ onProgressChange }) => {
           ref={fileInputRef}
           type="file"
           onChange={handleFileSelect}
-          accept=".pdf,application/pdf,.xlsx,.xls,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel"
+          accept=".pdf,application/pdf,.xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
           multiple
           style={{ display: 'none' }}
         />
