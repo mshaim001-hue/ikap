@@ -29,6 +29,9 @@ const Applications = () => {
   const [files, setFiles] = useState([])
   const [filesLoading, setFilesLoading] = useState(false)
   const [showReportModal, setShowReportModal] = useState(false)
+  const [showStatementsModal, setShowStatementsModal] = useState(false)
+  const [showTaxModal, setShowTaxModal] = useState(false)
+  const [showFsModal, setShowFsModal] = useState(false)
   const pollingIntervalRef = useRef(null)
   const dialogEndRef = useRef(null)
 
@@ -548,43 +551,77 @@ const Applications = () => {
                 )
               })()}
 
-              <div className="detail-section">
-                <h4>Финансовый отчет</h4>
-                {selectedApplication.reportText ? (
-                  <>
+            <div className="detail-section">
+              <h4>Анализы по документам</h4>
+              <div className="detail-actions" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                {/* Аналитика выписок */}
+                {(() => {
+                  const enabled = selectedApplication.status === 'completed' && !!selectedApplication.reportText
+                  return (
                     <button
-                      onClick={() => setShowReportModal(true)}
-                      className="view-report-button"
+                      onClick={() => enabled && setShowStatementsModal(true)}
+                      className={`analysis-button ${enabled ? 'enabled' : 'disabled'}`}
+                      disabled={!enabled}
+                      title={enabled ? 'Открыть аналитику выписок' : 'Аналитика выписок еще не готова'}
                     >
-                      <FileText size={16} />
-                      Просмотреть отчет
+                      <FileText size={16} /> Аналитика выписок
                     </button>
-                    <div className="report-preview">
-                      <p style={{ color: '#6b7280', fontSize: '12px' }}>
-                        Отчет готов. Нажмите кнопку выше для просмотра.
-                      </p>
-                    </div>
-                  </>
-                ) : (
-                  <div className="report-content">
-                    <p style={{ color: '#6b7280', fontStyle: 'italic' }}>
-                      {selectedApplication.status === 'generating' 
-                        ? 'Отчет генерируется...' 
-                        : 'Финансовый отчет не готов'
-                      }
-                    </p>
-                  </div>
-                )}
+                  )
+                })()}
+
+                {/* Налоговая отчетность */}
+                {(() => {
+                  const enabled = selectedApplication.taxStatus === 'completed'
+                  return (
+                    <button
+                      onClick={() => enabled && setShowTaxModal(true)}
+                      className={`analysis-button ${enabled ? 'enabled' : 'disabled'}`}
+                      disabled={!enabled}
+                      title={enabled ? 'Открыть анализ налоговой отчетности' : 'Анализ налоговой отчетности еще не готов'}
+                    >
+                      <FileText size={16} /> Аналитика по налогам
+                    </button>
+                  )
+                })()}
+
+                {/* Финансовая отчетность */}
+                {(() => {
+                  const enabled = selectedApplication.fsStatus === 'completed'
+                  return (
+                    <button
+                      onClick={() => enabled && setShowFsModal(true)}
+                      className={`analysis-button ${enabled ? 'enabled' : 'disabled'}`}
+                      disabled={!enabled}
+                      title={enabled ? 'Открыть анализ финансовой отчетности' : 'Анализ фин. отчетности еще не готов'}
+                    >
+                      <FileText size={16} /> Аналитика по фин. отчетам
+                    </button>
+                  )
+                })()}
               </div>
+              {(selectedApplication.taxMissing || selectedApplication.fsMissing) && (
+                <div className="report-preview" style={{ marginTop: 8 }}>
+                  {selectedApplication.taxMissing && (
+                    <p style={{ color: '#b45309', fontSize: '12px' }}>⚠️ По налоговой отчетности отсутствуют данные за: {selectedApplication.taxMissing}.</p>
+                  )}
+                  {selectedApplication.fsMissing && (
+                    <p style={{ color: '#b45309', fontSize: '12px' }}>⚠️ По финансовой отчетности отсутствуют данные за: {selectedApplication.fsMissing}.</p>
+                  )}
+                  <p style={{ color: '#6b7280', fontSize: '12px' }}>Анализ выполнен по имеющимся данным.</p>
+                </div>
+              )}
+            </div>
+
+            
 
               {/* Модальное окно для просмотра отчета */}
-              {showReportModal && selectedApplication.reportText && (
-                <div className="report-modal-overlay" onClick={() => setShowReportModal(false)}>
+              {showStatementsModal && selectedApplication.reportText && (
+                <div className="report-modal-overlay" onClick={() => setShowStatementsModal(false)}>
                   <div className="report-modal-content" onClick={(e) => e.stopPropagation()}>
                     <div className="report-modal-header">
-                      <h3>Финансовый отчет</h3>
+                      <h3>Аналитика выписок</h3>
                       <button
-                        onClick={() => setShowReportModal(false)}
+                        onClick={() => setShowStatementsModal(false)}
                         className="report-modal-close"
                       >
                         ×
@@ -592,6 +629,34 @@ const Applications = () => {
                     </div>
                     <div className="report-modal-body">
                       <pre className="report-text">{selectedApplication.reportText}</pre>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {showTaxModal && (
+                <div className="report-modal-overlay" onClick={() => setShowTaxModal(false)}>
+                  <div className="report-modal-content" onClick={(e) => e.stopPropagation()}>
+                    <div className="report-modal-header">
+                      <h3>Анализ налоговой отчетности</h3>
+                      <button onClick={() => setShowTaxModal(false)} className="report-modal-close">×</button>
+                    </div>
+                    <div className="report-modal-body">
+                      <pre className="report-text">{selectedApplication.taxReportText || 'Анализ не готов'}</pre>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {showFsModal && (
+                <div className="report-modal-overlay" onClick={() => setShowFsModal(false)}>
+                  <div className="report-modal-content" onClick={(e) => e.stopPropagation()}>
+                    <div className="report-modal-header">
+                      <h3>Анализ финансовой отчетности</h3>
+                      <button onClick={() => setShowFsModal(false)} className="report-modal-close">×</button>
+                    </div>
+                    <div className="report-modal-body">
+                      <pre className="report-text">{selectedApplication.fsReportText || 'Анализ не готов'}</pre>
                     </div>
                   </div>
                 </div>

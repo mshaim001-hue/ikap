@@ -110,6 +110,15 @@ async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
       CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
       CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
+      
+      -- Дополнительные поля для отдельных анализов (налоги и фин. отчетность)
+      ALTER TABLE reports ADD COLUMN IF NOT EXISTS tax_report_text TEXT;
+      ALTER TABLE reports ADD COLUMN IF NOT EXISTS tax_status TEXT DEFAULT 'pending';
+      ALTER TABLE reports ADD COLUMN IF NOT EXISTS tax_missing_periods TEXT;
+      
+      ALTER TABLE reports ADD COLUMN IF NOT EXISTS fs_report_text TEXT;
+      ALTER TABLE reports ADD COLUMN IF NOT EXISTS fs_status TEXT DEFAULT 'pending';
+      ALTER TABLE reports ADD COLUMN IF NOT EXISTS fs_missing_periods TEXT;
     `)
   } else {
     db.exec(`
@@ -295,6 +304,10 @@ const conversationHistory = new Map()
 // Хранилище для файлов по сессиям
 // Формат: session -> [{fileId: string, originalName: string, size: number}]
 const sessionFiles = new Map()
+
+// Гварды, чтобы не запускать повторно анализы для одной и той же сессии
+const runningTaxSessions = new Set()
+const runningFsSessions = new Set()
 
 // Code Interpreter без предустановленных файлов
 // Файлы будут добавляться динамически
@@ -696,10 +709,11 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
       // Файлы уже загружены в OpenAI и сохранены, но агент их не анализирует при загрузке
       const agentToRun = investmentAgent
       
-      // Запускаем агента с обычным таймаутом (файлы не анализируются)
+      // Запускаем агента с таймаутом 30 минут (единый SLA)
       // Передаем всю историю - не можем обрезать из-за reasoning items в gpt-5
+      const timeoutMs = 30 * 60 * 1000
       const timeoutPromise = new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Agent timeout (60s)')), 60000)
+        setTimeout(() => reject(new Error(`Agent timeout (${timeoutMs/1000}s)`)), timeoutMs)
       )
       
       let inv
@@ -1205,6 +1219,161 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             }
           }
         })
+
+        // Параллельно запускаем анализ налоговой и фин. отчетности
+        setImmediate(async () => {
+          try {
+            // Проверка гвардов, чтобы исключить двойной запуск
+            if (runningTaxSessions.has(session)) {
+              console.log(`⏭️ Налоговый анализ уже запущен для ${session}, пропускаем`)
+              return
+            }
+            runningTaxSessions.add(session)
+            
+            // Если уже есть статус generating/completed, не запускаем
+            const existing = await db.prepare('SELECT tax_status FROM reports WHERE session_id = ?').get(session)
+            if (existing && (existing.tax_status === 'generating' || existing.tax_status === 'completed')) {
+              console.log(`⏭️ tax_status=${existing.tax_status} для ${session}, повторный запуск не требуется`)
+              return
+            }
+            // Собираем файлы налоговой отчетности
+            const taxFilesRows = await db.prepare(`
+              SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'taxes' ORDER BY uploaded_at ASC
+            `).all(session)
+            const taxFileIds = (taxFilesRows || []).map(r => r.file_id)
+            const taxYearsMissing = []
+            // Простая проверка покрытия двух лет по именам файлов
+            const yearNow = new Date().getFullYear()
+            const names = (taxFilesRows || []).map(r => (r.original_name || '').toLowerCase())
+            if (!names.some(n => n.includes(String(yearNow)))) taxYearsMissing.push(String(yearNow))
+            if (!names.some(n => n.includes(String(yearNow - 1)))) taxYearsMissing.push(String(yearNow - 1))
+            
+            await db.prepare(`UPDATE reports SET tax_status = 'generating', tax_missing_periods = ? WHERE session_id = ?`).run(
+              taxYearsMissing.length ? taxYearsMissing.join(',') : null, session
+            )
+            
+            if (taxFileIds.length > 0) {
+              const taxAgent = new Agent({
+                name: 'Tax Analyst',
+                instructions: `Ты налоговый аналитик. Проанализируй прикрепленные PDF-файлы налоговой отчетности.
+                Требования:
+                - Сфокусируйся на текущем и предыдущем годах
+                - Если какого-то года нет, упомяни, что данные неполные, но сделай анализ по имеющимся
+                - Сделай краткий вывод по налоговым обязательствам, начислениям, задолженностям, штрафам
+                - Используй четкую структуру, перечисления, суммы с тысячными разделителями.`,
+                model: 'gpt-5',
+                tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: taxFileIds } })],
+                modelSettings: { store: true }
+              })
+              const taxRunner = new Runner({})
+              try {
+                const TAX_TIMEOUT_MS = 30 * 60 * 1000
+                const taxResult = await Promise.race([
+                  taxRunner.run(taxAgent, [{ role: 'user', content: [{ type: 'input_text', text: 'Сделай анализ налоговой отчетности за текущий и предыдущий год.' }] }]),
+                  new Promise((_, reject) => setTimeout(() => reject(new Error(`Tax Analyst timeout (${TAX_TIMEOUT_MS/1000}s)`)), TAX_TIMEOUT_MS))
+                ])
+                let taxText = ''
+                for (let i = taxResult.newItems.length - 1; i >= 0; i--) {
+                  const it = taxResult.newItems[i]
+                  if (it.rawItem?.role === 'assistant') {
+                    const c = it.rawItem.content
+                    if (Array.isArray(c)) {
+                      const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
+                      taxText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
+                    } else if (typeof it.rawItem.content === 'string') {
+                      taxText = it.rawItem.content
+                    }
+                    if (taxText) break
+                  }
+                }
+                if (!taxText) taxText = 'Анализ налоговой отчетности не удалось извлечь из ответа агента.'
+                await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(taxText, session)
+              } catch (err) {
+                await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'error' WHERE session_id = ?`).run(`Ошибка анализа налогов: ${err.message}`, session)
+              }
+            } else {
+              await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = 'Файлы налоговой отчетности не найдены' WHERE session_id = ?`).run(session)
+            }
+          } catch (e) {
+            console.error('❌ Ошибка запуска налогового анализа:', e)
+          } finally {
+            runningTaxSessions.delete(session)
+          }
+        })
+
+        setImmediate(async () => {
+          try {
+            if (runningFsSessions.has(session)) {
+              console.log(`⏭️ Фин. анализ уже запущен для ${session}, пропускаем`)
+              return
+            }
+            runningFsSessions.add(session)
+            const existing = await db.prepare('SELECT fs_status FROM reports WHERE session_id = ?').get(session)
+            if (existing && (existing.fs_status === 'generating' || existing.fs_status === 'completed')) {
+              console.log(`⏭️ fs_status=${existing.fs_status} для ${session}, повторный запуск не требуется`)
+              return
+            }
+            // Собираем файлы финансовой отчетности
+            const fsFilesRows = await db.prepare(`
+              SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'financial' ORDER BY uploaded_at ASC
+            `).all(session)
+            const fsFileIds = (fsFilesRows || []).map(r => r.file_id)
+            const fsYearsMissing = []
+            const yearNow = new Date().getFullYear()
+            const names = (fsFilesRows || []).map(r => (r.original_name || '').toLowerCase())
+            if (!names.some(n => n.includes(String(yearNow)))) fsYearsMissing.push(String(yearNow))
+            if (!names.some(n => n.includes(String(yearNow - 1)))) fsYearsMissing.push(String(yearNow - 1))
+            await db.prepare(`UPDATE reports SET fs_status = 'generating', fs_missing_periods = ? WHERE session_id = ?`).run(
+              fsYearsMissing.length ? fsYearsMissing.join(',') : null, session
+            )
+            if (fsFileIds.length > 0) {
+              const fsAgent = new Agent({
+                name: 'Financial Statements Analyst',
+                instructions: `Ты аналитик финансовой отчетности. Проанализируй Баланс и ОПУ (P&L) в прикрепленных PDF.
+                Требования:
+                - Сфокусируйся на текущем и предыдущем годах
+                - Если какого-то года нет, явно укажи об этом и сделай анализ по имеющимся данным
+                - Дай ключевые метрики: выручка, валовая прибыль/маржа, операционная прибыль, чистая прибыль, активы/обязательства
+                - Выведи краткий вывод о динамике и рисках.`,
+                model: 'gpt-5',
+                tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: fsFileIds } })],
+                modelSettings: { store: true }
+              })
+              const fsRunner = new Runner({})
+              try {
+                const FS_TIMEOUT_MS = 30 * 60 * 1000
+                const fsResult = await Promise.race([
+                  fsRunner.run(fsAgent, [{ role: 'user', content: [{ type: 'input_text', text: 'Сделай анализ финансовой отчетности (Баланс и ОПУ) за текущий и предыдущий годы.' }] }]),
+                  new Promise((_, reject) => setTimeout(() => reject(new Error(`Financial Statements Analyst timeout (${FS_TIMEOUT_MS/1000}s)`)), FS_TIMEOUT_MS))
+                ])
+                let fsText = ''
+                for (let i = fsResult.newItems.length - 1; i >= 0; i--) {
+                  const it = fsResult.newItems[i]
+                  if (it.rawItem?.role === 'assistant') {
+                    const c = it.rawItem.content
+                    if (Array.isArray(c)) {
+                      const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
+                      fsText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
+                    } else if (typeof it.rawItem.content === 'string') {
+                      fsText = it.rawItem.content
+                    }
+                    if (fsText) break
+                  }
+                }
+                if (!fsText) fsText = 'Анализ финансовой отчетности не удалось извлечь из ответа агента.'
+                await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'completed' WHERE session_id = ?`).run(fsText, session)
+              } catch (err) {
+                await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'error' WHERE session_id = ?`).run(`Ошибка анализа фин. отчетности: ${err.message}`, session)
+              }
+            } else {
+              await db.prepare(`UPDATE reports SET fs_status = 'error', fs_report_text = 'Файлы финансовой отчетности не найдены' WHERE session_id = ?`).run(session)
+            }
+          } catch (e) {
+            console.error('❌ Ошибка запуска анализа фин. отчетности:', e)
+          } finally {
+            runningFsSessions.delete(session)
+          }
+        })
       }
       
       // Возвращаем прогресс по факту загруженных файлов
@@ -1281,7 +1450,14 @@ app.get('/api/reports/:sessionId', async (req, res) => {
         status: report.status,
         reportText: report.report_text,
         createdAt: report.created_at,
-        completedAt: report.completed_at
+        completedAt: report.completed_at,
+        // Новые поля аналитов
+        taxStatus: report.tax_status,
+        taxReportText: report.tax_report_text,
+        taxMissing: report.tax_missing_periods,
+        fsStatus: report.fs_status,
+        fsReportText: report.fs_report_text,
+        fsMissing: report.fs_missing_periods
       }
     })
   } catch (error) {
@@ -1517,7 +1693,8 @@ app.get('/api/reports', async (req, res) => {
   try {
     const reports = await db.prepare(`
       SELECT session_id, company_bin, amount, term, purpose, name, email, phone, 
-             status, files_count, created_at, completed_at
+             status, files_count, created_at, completed_at,
+             tax_status, fs_status
       FROM reports 
       ORDER BY created_at DESC
     `).all()
@@ -1536,6 +1713,8 @@ app.get('/api/reports', async (req, res) => {
         phone: r.phone,
         filesCount: r.files_count,
         status: r.status,
+        taxStatus: r.tax_status,
+        fsStatus: r.fs_status,
         createdAt: r.created_at,
         completedAt: r.completed_at
       }))

@@ -368,6 +368,35 @@
   background: #2563eb;
 }
 
+/* Analysis buttons (enabled/disabled) */
+.analysis-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: none;
+  padding: 10px 16px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  transition: background-color 0.2s, color 0.2s;
+}
+
+.analysis-button.enabled {
+  background: #3b82f6;
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.analysis-button.enabled:hover {
+  background: #2563eb;
+}
+
+.analysis-button.disabled {
+  background: #e5e7eb;
+  color: #9ca3af;
+  cursor: not-allowed;
+}
+
 /* Files list */
 .files-category {
   margin-bottom: 20px;
