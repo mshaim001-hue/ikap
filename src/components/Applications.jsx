@@ -32,7 +32,6 @@ const Applications = () => {
   const [showStatementsModal, setShowStatementsModal] = useState(false)
   const [showTaxModal, setShowTaxModal] = useState(false)
   const [showFsModal, setShowFsModal] = useState(false)
-  const pollingIntervalRef = useRef(null)
   const dialogEndRef = useRef(null)
 
   // Загружаем список заявок
@@ -104,13 +103,6 @@ const Applications = () => {
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i]
   }
 
-  const stopPollingReport = () => {
-    if (pollingIntervalRef.current) {
-      clearInterval(pollingIntervalRef.current)
-      pollingIntervalRef.current = null
-    }
-  }
-
   const refreshApplication = async (sessionId) => {
     try {
       const response = await fetch(getApiUrl(`/api/reports/${sessionId}`))
@@ -118,23 +110,10 @@ const Applications = () => {
       
       if (data.ok && data.report) {
         setSelectedApplication(data.report)
-        
-        // Если статус изменился на completed, останавливаем polling
-        if (data.report.status === 'completed') {
-          stopPollingReport()
-        }
       }
     } catch (error) {
       console.error('Ошибка загрузки отчета:', error)
     }
-  }
-
-  const startPollingReport = (sessionId) => {
-    stopPollingReport() // Останавливаем предыдущий polling если есть
-    
-    pollingIntervalRef.current = setInterval(async () => {
-      await refreshApplication(sessionId)
-    }, 3000) // Обновляем каждые 3 секунды
   }
 
   const loadFiles = async (sessionId) => {
@@ -213,20 +192,13 @@ const Applications = () => {
     // Загружаем файлы для этой заявки
     loadFiles(application.sessionId)
     
-    // Если отчет еще генерируется, запускаем polling
-    if (application.status === 'generating') {
-      startPollingReport(application.sessionId)
-    } else {
-      stopPollingReport()
-    }
-    
-    // Загружаем актуальные данные заявки
+    // Загружаем актуальные данные заявки один раз
     await refreshApplication(application.sessionId)
   }
 
   useEffect(() => {
     return () => {
-      stopPollingReport()
+      // Cleanup если нужно
     }
   }, [])
 
@@ -252,7 +224,6 @@ const Applications = () => {
               setShowDialog(false)
               setDialogMessages([])
               setFiles([])
-              stopPollingReport()
             }
             
             console.log('✅ Заявка удалена успешно')
@@ -397,7 +368,6 @@ const Applications = () => {
                 onClick={() => {
                   setSelectedApplication(null)
                   setShowDialog(false)
-                  stopPollingReport()
                 }}
                 className="close-button"
               >
