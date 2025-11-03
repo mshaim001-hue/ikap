@@ -241,12 +241,12 @@ const categorizeUploadedFile = (originalName, mimeType) => {
   const name = String(originalName || '').toLowerCase()
   const type = String(mimeType || '').toLowerCase()
   
-  // Финансовая отчетность должна быть Excel
+  // Финансовая отчетность должна быть Excel (XLSX или XLS)
   const isExcel = type.includes('excel') || type.includes('spreadsheet') || 
-                  name.endsWith('.xlsx') || name.endsWith('.xls') || name.endsWith('.xlsm')
+                  name.endsWith('.xlsx') || name.endsWith('.xls')
   
   if (isExcel) {
-    // Финансовая отчетность - только Excel
+    // Финансовая отчетность - XLSX или XLS (будет автоматически конвертировано в XLSX)
     return 'financial'
   }
   
@@ -496,7 +496,7 @@ const investmentAgent = new Agent({
 - Повторяй этот вопрос до получения явного "нет"
 - ТОЛЬКО ПОСЛЕ получения "нет" про налоговую отчетность переходи к запросу финансовой отчетности
 
-- После получения "нет" про налоговую отчетность попроси: "Пожалуйста, предоставьте финансовую отчетность (баланс и отчет о прибылях и убытках) за текущий и предыдущий год в формате Excel (XLSX, XLS)."
+- После получения "нет" про налоговую отчетность попроси: "Пожалуйста, предоставьте финансовую отчетность (баланс и отчет о прибылях и убытках) за текущий и предыдущий год в формате Excel (XLSX или XLS)."
 
 ФИНАНСОВАЯ ОТЧЕТНОСТЬ:
 Когда пользователь прикрепляет финансовую отчетность:
@@ -515,7 +515,7 @@ const investmentAgent = new Agent({
 РАБОТА С ФАЙЛАМИ:
 - Банковские выписки: ТОЛЬКО PDF файлы (mimetype application/pdf)
 - Налоговая отчетность: ТОЛЬКО PDF файлы
-- Финансовая отчетность: ТОЛЬКО Excel файлы (XLSX, XLS, XLSM)
+- Финансовая отчетность: Excel файлы (XLSX или XLS - автоматически конвертируется в XLSX)
 - Если прикреплен файл неправильного формата — вежливо попроси прислать файл в нужном формате.
 
 КРИТИЧЕСКИЕ СЛУЧАИ:
@@ -633,9 +633,21 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
         try {
           console.log(`📎 Обрабатываем файл: ${file.originalname}, размер: ${file.size} байт`)
           
+          // Автоматическое переименование .xls в .xlsx для OpenAI
+          let fileNameForOpenAI = file.originalname
+          let mimeTypeForOpenAI = file.mimetype
+          
+          const nameLower = file.originalname.toLowerCase()
+          if (nameLower.endsWith('.xls') && !nameLower.endsWith('.xlsx')) {
+            // Меняем расширение на .xlsx
+            fileNameForOpenAI = file.originalname.replace(/\.xls$/i, '.xlsx')
+            mimeTypeForOpenAI = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            console.log(`🔄 Автоматическая конвертация: ${file.originalname} → ${fileNameForOpenAI}`)
+          }
+          
           // Создаем File объект для Node.js
-          const fileToUpload = new File([file.buffer], file.originalname, {
-            type: file.mimetype
+          const fileToUpload = new File([file.buffer], fileNameForOpenAI, {
+            type: mimeTypeForOpenAI
           })
           
           const uploadedFile = await openai.files.create({
@@ -644,8 +656,8 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
           })
           
           uploadedFileIds.push(uploadedFile.id)
-          fileNames.push(file.originalname)
-          console.log(`✅ Файл загружен в OpenAI: ${uploadedFile.id} (${file.originalname})`)
+          fileNames.push(file.originalname) // В БД сохраняем оригинальное имя
+          console.log(`✅ Файл загружен в OpenAI: ${uploadedFile.id} (${file.originalname} → ${fileNameForOpenAI})`)
           
           // Сохраняем файл в sessionFiles (в памяти)
           if (!sessionFiles.has(session)) {
