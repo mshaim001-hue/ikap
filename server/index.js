@@ -312,6 +312,7 @@ const conversationHistory = new Map()
 const sessionFiles = new Map()
 
 // Гварды, чтобы не запускать повторно анализы для одной и той же сессии
+const runningStatementsSessions = new Set()
 const runningTaxSessions = new Set()
 const runningFsSessions = new Set()
 
@@ -835,6 +836,21 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
           let allFiles = []
           
           try {
+            // Проверка гвардов, чтобы исключить двойной запуск
+            if (runningStatementsSessions.has(session)) {
+              console.log(`⏭️ Анализ банковских выписок уже запущен для ${session}, пропускаем`)
+              return
+            }
+            runningStatementsSessions.add(session)
+            
+            // Если уже есть статус generating/completed, не запускаем
+            const existing = await db.prepare('SELECT status FROM reports WHERE session_id = ?').get(session)
+            if (existing && (existing.status === 'generating' || existing.status === 'completed')) {
+              console.log(`⏭️ status=${existing.status} для ${session}, повторный запуск не требуется`)
+              runningStatementsSessions.delete(session)
+              return
+            }
+            
             // Получаем файлы из БД вместо памяти
             const getSessionFiles = db.prepare(`
               SELECT file_id, original_name, file_size, mime_type, category, uploaded_at
@@ -858,6 +874,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             
             if (statementFiles.length === 0) {
               console.log(`⚠️ Нет банковских выписок для анализа в БД`)
+              runningStatementsSessions.delete(session)
               return
             }
             
@@ -999,8 +1016,8 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 email = EXCLUDED.email,
                 phone = EXCLUDED.phone,
                 files_count = EXCLUDED.files_count,
-                files_data = EXCLUDED.files_data,
-                status = EXCLUDED.status
+                files_data = EXCLUDED.files_data
+                -- НЕ обновляем status если он уже completed
             `)
             await insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, statementFiles.length, filesData)
             console.log(`💾 Заявка сохранена в БД: ${session}, выписок: ${statementFiles.length}`)
@@ -1224,6 +1241,8 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               `)
               await updateError.run(`Ошибка генерации отчета: ${error.message}`, session)
             }
+          } finally {
+            runningStatementsSessions.delete(session)
           }
         })
 
@@ -1241,6 +1260,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             const existing = await db.prepare('SELECT tax_status FROM reports WHERE session_id = ?').get(session)
             if (existing && (existing.tax_status === 'generating' || existing.tax_status === 'completed')) {
               console.log(`⏭️ tax_status=${existing.tax_status} для ${session}, повторный запуск не требуется`)
+              runningTaxSessions.delete(session)
               return
             }
             // Собираем файлы налоговой отчетности
@@ -1318,6 +1338,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             const existing = await db.prepare('SELECT fs_status FROM reports WHERE session_id = ?').get(session)
             if (existing && (existing.fs_status === 'generating' || existing.fs_status === 'completed')) {
               console.log(`⏭️ fs_status=${existing.fs_status} для ${session}, повторный запуск не требуется`)
+              runningFsSessions.delete(session)
               return
             }
             // Собираем файлы финансовой отчетности
