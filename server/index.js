@@ -820,7 +820,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
           try {
             // Получаем файлы из БД вместо памяти
             const getSessionFiles = db.prepare(`
-              SELECT file_id, original_name, file_size, mime_type, uploaded_at
+              SELECT file_id, original_name, file_size, mime_type, category, uploaded_at
               FROM files 
               WHERE session_id = ? 
               ORDER BY uploaded_at ASC
@@ -832,19 +832,23 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               fileId: f.file_id,
               originalName: f.original_name,
               size: f.file_size,
-              uploadedAt: f.uploaded_at
+              uploadedAt: f.uploaded_at,
+              category: f.category
             }))
             
-            if (allFiles.length === 0) {
-              console.log(`⚠️ Нет файлов для анализа в БД`)
+            // Фильтруем только банковские выписки для финансового аналитика
+            const statementFiles = allFiles.filter(f => f.category === 'statements')
+            
+            if (statementFiles.length === 0) {
+              console.log(`⚠️ Нет банковских выписок для анализа в БД`)
               return
             }
             
-            console.log(`📊 Генерация отчета с ${allFiles.length} файлами...`)
-            console.log(`📎 Файлы для анализа:`, allFiles)
+            console.log(`📊 Генерация отчета с ${statementFiles.length} банковскими выписками (из ${allFiles.length} файлов)...`)
+            console.log(`📎 Выписки для анализа:`, statementFiles)
             
             // Извлекаем только fileId для передачи в агента
-            const fileIds = allFiles.map(f => f.fileId)
+            const fileIds = statementFiles.map(f => f.fileId)
             
             // Извлекаем ключевую информацию из истории (без передачи всех сообщений)
             let amount = 'не указана'
@@ -965,7 +969,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             }
             
             // Сохраняем заявку в БД со статусом "generating"
-            const filesData = JSON.stringify(allFiles)
+            const filesData = JSON.stringify(statementFiles)
             const insertReport = db.prepare(`
               INSERT INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generating')
@@ -981,8 +985,8 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 files_data = EXCLUDED.files_data,
                 status = EXCLUDED.status
             `)
-            await insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, allFiles.length, filesData)
-            console.log(`💾 Заявка сохранена в БД: ${session}, файлов: ${allFiles.length}`)
+            await insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, statementFiles.length, filesData)
+            console.log(`💾 Заявка сохранена в БД: ${session}, выписок: ${statementFiles.length}`)
             
             // Формируем компактный запрос
             const reportRequest = `Создай подробный финансовый отчет на основе предоставленных банковских выписок.
@@ -995,7 +999,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
 - Контакты: ${name}, ${email}, ${phone}
 
 ЗАДАЧА:
-Проанализируй все ${allFiles.length} банковские выписки (файлы уже прикреплены) и создай финансовый отчет по структуре из твоих инструкций.`
+Проанализируй все ${statementFiles.length} банковские выписки (файлы уже прикреплены) и создай финансовый отчет по структуре из твоих инструкций.`
             
             console.log(`📝 Запрос к агенту:`)
             console.log(reportRequest)
@@ -1003,7 +1007,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             
             const startAnalysis = Date.now()
             
-            // Добавляем таймаут на 30 минут для анализа всех файлов (PDF анализ может быть долгим)
+            // Добавляем таймаут на 30 минут для анализа банковских выписок (PDF анализ может быть долгим)
             const TIMEOUT_MS = 30 * 60 * 1000 // 30 минут
             const analysisTimeout = new Promise((_, reject) =>
               setTimeout(() => reject(new Error(`Financial Analyst timeout (${TIMEOUT_MS/1000}s)`)), TIMEOUT_MS)
@@ -1024,7 +1028,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             const runWithAgentSDK = async () => {
               console.log(`🚀 Запускаем Financial Analyst Agent через Agents SDK...`)
               
-              // Создаем агента с доступом ко всем файлам
+              // Создаем агента с доступом только к банковским выпискам
               const analystWithFiles = new Agent({
                 ...financialAnalystAgent,
                 tools: [codeInterpreterTool({ 
