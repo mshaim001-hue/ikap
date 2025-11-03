@@ -18,14 +18,31 @@ function createPostgresAdapter(connectionString) {
     connectionString,
     ssl: { require: true, rejectUnauthorized: false },
     keepAlive: true,
-    connectionTimeoutMillis: 15000,
-    idleTimeoutMillis: 30000,
-    max: 5
+    keepAliveInitialDelayMillis: 10000, // Начальная задержка для keep-alive (10 секунд)
+    connectionTimeoutMillis: 30000, // Увеличено до 30 секунд (для Supabase pooler)
+    idleTimeoutMillis: 60000, // Увеличено до 60 секунд (Supabase pooler может разрывать неактивные соединения)
+    max: 5, // Максимум 5 соединений в пуле
+    // Дополнительные настройки
+    allowExitOnIdle: false // Не завершать процесс при отсутствии активных соединений
+  })
+
+  // Обработка ошибок пула - предотвращает краш сервера
+  pool.on('error', (err, client) => {
+    console.error('⚠️ Неожиданная ошибка пула PostgreSQL:', err.message)
+    // Не пробрасываем ошибку - пул попытается переподключиться автоматически
   })
 
   const query = async (text, params = []) => {
-    const res = await pool.query(text, params)
-    return res
+    try {
+      const res = await pool.query(text, params)
+      return res
+    } catch (error) {
+      // Логируем ошибку для отладки, но пробрасываем дальше для обработки вызывающим кодом
+      if (error.code === 'XX000' || error.message?.includes('db_termination') || error.message?.includes('shutdown')) {
+        console.error('⚠️ Ошибка запроса к БД (разрыв соединения):', error.message)
+      }
+      throw error // Пробрасываем ошибку для обработки в вызывающем коде
+    }
   }
 
   return {

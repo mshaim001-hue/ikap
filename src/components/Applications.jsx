@@ -230,27 +230,47 @@ const Applications = () => {
   const handleDeleteApplication = async (applicationId, event) => {
     event.stopPropagation() // Предотвращаем открытие деталей заявки
     
-    if (window.confirm('Вы уверены, что хотите удалить эту заявку?')) {
+    if (window.confirm('Вы уверены, что хотите удалить эту заявку? Все данные (сообщения, файлы) будут удалены безвозвратно.')) {
       try {
         const response = await fetch(getApiUrl(`/api/reports/${applicationId}`), {
           method: 'DELETE'
         })
         
         if (response.ok) {
-          // Удаляем заявку из списка
-          setApplications(prev => prev.filter(app => app.sessionId !== applicationId))
+          const data = await response.json()
           
-          // Если удаляемая заявка была выбрана, очищаем выбор
-          if (selectedApplication?.sessionId === applicationId) {
-            setSelectedApplication(null)
+          if (data.ok) {
+            // Удаляем заявку из списка
+            setApplications(prev => prev.filter(app => app.sessionId !== applicationId))
+            
+            // Если удаляемая заявка была выбрана, очищаем выбор
+            if (selectedApplication?.sessionId === applicationId) {
+              setSelectedApplication(null)
+              setShowDialog(false)
+              setDialogMessages([])
+              setFiles([])
+              stopPollingReport()
+            }
+            
+            console.log('✅ Заявка удалена успешно')
+          } else {
+            console.error('❌ Ошибка удаления заявки:', data.message)
+            alert(`Не удалось удалить заявку: ${data.message || 'Неизвестная ошибка'}`)
           }
-          
-          console.log('Заявка удалена успешно')
         } else {
-          console.error('Ошибка удаления заявки')
+          let errorMessage = 'Не удалось удалить заявку'
+          try {
+            const errorData = await response.json()
+            errorMessage = errorData.message || errorMessage
+          } catch (e) {
+            // Игнорируем ошибку парсинга
+          }
+          console.error('❌ Ошибка удаления заявки:', response.status, errorMessage)
+          alert(errorMessage)
         }
       } catch (error) {
-        console.error('Ошибка удаления заявки:', error)
+        console.error('❌ Ошибка удаления заявки:', error)
+        alert('Не удалось удалить заявку. Проверьте соединение с сервером.')
       }
     }
   }

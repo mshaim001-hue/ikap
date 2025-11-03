@@ -121,6 +121,17 @@ const AgentsChat = ({ onProgressChange }) => {
         try {
           const errorResult = await resp.json()
           errorText = errorResult.error || errorResult.message || errorText
+          
+          // Специальная обработка ошибки размера файла
+          if (errorResult.code === 'FILE_TOO_LARGE') {
+            errorText = errorResult.error || 'Размер файла превышает 50 МБ. Пожалуйста, выберите файл меньшего размера.'
+          }
+          
+          // Обработка ошибки длины текста
+          if (errorResult.code === 'TEXT_TOO_LONG') {
+            errorText = errorResult.error || 'Сообщение слишком длинное. Максимальная длина: 200 символов.'
+          }
+          
           console.error('⚠️ Сервер вернул ошибку:', errorResult)
         } catch (parseError) {
           console.error('⚠️ Ошибка парсинга ответа сервера:', parseError)
@@ -198,6 +209,26 @@ const AgentsChat = ({ onProgressChange }) => {
   const handleFileSelect = (event) => {
     const files = Array.from(event.target.files || [])
     if (files.length > 0) {
+      // Проверяем размер каждого файла (максимум 50 МБ)
+      const maxSize = 50 * 1024 * 1024 // 50 МБ в байтах
+      const oversizedFiles = files.filter(f => f.size > maxSize)
+      
+      if (oversizedFiles.length > 0) {
+        // Показываем ошибку только если файл превышает лимит
+        const errorMessage = oversizedFiles.length === 1
+          ? `Файл "${oversizedFiles[0].name}" превышает допустимый размер (50 МБ). Пожалуйста, выберите файл меньшего размера.`
+          : `Некоторые файлы превышают допустимый размер (50 МБ). Пожалуйста, выберите файлы меньшего размера.`
+        
+        const errorBotMessage = createBotMessage(errorMessage)
+        setMessages(prev => [...prev, errorBotMessage])
+        
+        // Очищаем input
+        if (event.target) {
+          event.target.value = ''
+        }
+        return
+      }
+      
       setSelectedFiles(files)
       // НЕ добавляем текст в поле ввода - файлы отображаются отдельно снизу
       setInputMessage('')
@@ -432,18 +463,22 @@ const AgentsChat = ({ onProgressChange }) => {
         ) : (
           <div className="input-container">
             <div className="input-row">
-              <textarea
-                value={inputMessage}
-                onChange={(e) => {
-                  // Сохраняем как есть; очистим числа при отправке
-                  setInputMessage(e.target.value)
-                }}
-                onKeyPress={handleKeyPress}
-                placeholder="Напишите сообщение..."
-                className="message-input"
-                rows="1"
-                inputMode="numeric"
-              />
+            <textarea
+              value={inputMessage}
+              onChange={(e) => {
+                // Ограничиваем длину до 200 символов
+                const text = e.target.value
+                if (text.length <= 200) {
+                  setInputMessage(text)
+                }
+              }}
+              onKeyPress={handleKeyPress}
+              placeholder="Напишите сообщение..."
+              className="message-input"
+              rows="1"
+              maxLength={200}
+              inputMode="numeric"
+            />
               <button
                 onClick={() => fileInputRef.current?.click()}
                 className="attach-button"

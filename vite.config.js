@@ -13,7 +13,14 @@ export default defineConfig({
     proxy: {
       '/api': {
         target: 'http://localhost:8787',
-        changeOrigin: true
+        changeOrigin: true,
+        secure: false,
+        // Убеждаемся, что все методы (включая DELETE) проксируются
+        configure: (proxy, _options) => {
+          proxy.on('error', (err, _req, res) => {
+            console.log('Proxy error:', err)
+          })
+        }
       }
     }
   },
