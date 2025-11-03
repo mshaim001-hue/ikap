@@ -1732,12 +1732,8 @@ app.get('/api/reports', async (req, res) => {
 // ВАЖНО: этот маршрут должен быть ПОСЛЕДНИМ, чтобы не перехватывать API запросы
 if (process.env.NODE_ENV === 'production') {
   const path = require('path')
-  app.get('*', (req, res) => {
-    // Пропускаем API запросы (все методы)
-    if (req.path.startsWith('/api/')) {
-      return res.status(404).json({ ok: false, message: 'API endpoint not found' })
-    }
-    // Отдаем index.html для всех остальных GET запросов
+  // Обрабатываем только не-API GET запросы. Избегаем '*' (Express 5 path-to-regexp v6).
+  app.get(/^(?!\/api\/).*/, (req, res) => {
     res.sendFile(path.join(__dirname, '../dist/index.html'))
   })
 }

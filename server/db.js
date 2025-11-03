@@ -5,8 +5,10 @@ function convertQuestionToDollar(sql) {
 }
 
 function createPostgresAdapter(connectionString) {
-  // Allow self-signed certs (Supabase pooler) during development
-  process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+  // Разрешаем self-signed сертификаты ТОЛЬКО в dev
+  if (process.env.NODE_ENV !== 'production') {
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0'
+  }
   const { Pool } = require('pg')
   try {
     const masked = connectionString.replace(/:(.*?)@/, ':***@')
