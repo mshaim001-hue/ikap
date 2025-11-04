@@ -664,9 +664,11 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             uploadedAt: new Date().toISOString()
           })
           
+          // Сохраняем файл БЕЗ категории - категоризация будет происходить при ответе "нет"
           // Категоризируем и сохраняем метаданные файла в БД (с обработкой ошибок)
           try {
-            const category = categorizeUploadedFile(file.originalname, file.mimetype)
+            // Не категоризируем при загрузке - категория будет установлена позже при ответе "нет"
+            const category = null
             await saveFileToDB(session, uploadedFile.id, file.originalname, file.size, file.mimetype, category)
           } catch (dbError) {
             // Проверяем, это ошибка разрыва соединения с БД
@@ -780,35 +782,75 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
       history.push(...newItems)
       console.log(`💾 История обновлена: ${history.length} сообщений`)
 
-      // Если только что были загружены файлы и агент подтвердил их тип, проставим категорию
-      // (теперь это опционально, так как файлы не анализируются при загрузке)
-      if (uploadedFileIds && uploadedFileIds.length > 0 && typeof agentMessage === 'string') {
-        const msg = agentMessage.toLowerCase()
-        // Обновляем категорию для всех загруженных файлов, если агент упомянул тип
-        // ВАЖНО: не перезаписываем категорию 'statements' на другие категории
-        for (const fileId of uploadedFileIds) {
-          // Проверяем текущую категорию файла перед обновлением
-          try {
-            const currentFile = await db.prepare('SELECT category FROM files WHERE file_id = ?').get(fileId)
-            const currentCategory = currentFile?.category
-            
-            // Если файл уже категоризирован как 'statements', не перезаписываем его
-            if (currentCategory === 'statements') {
-              console.log(`📎 Файл ${fileId} уже имеет категорию 'statements', не перезаписываем`)
-              continue
+      // Категоризация файлов при ответе "нет" на вопросы агента
+      if (typeof agentMessage === 'string' && typeof text === 'string') {
+        const userText = text.toLowerCase().trim()
+        const agentMsg = agentMessage.toLowerCase()
+        
+        // Если пользователь ответил "нет" на вопрос про выписки
+        if (userText === 'нет' && agentMsg.includes('есть ли у вас еще счета в других банках')) {
+          console.log(`📎 Категоризируем файлы как выписки после ответа "нет"`)
+          // Находим последний вопрос агента про выписки
+          let lastStatementsQuestionTime = null
+          for (let i = history.length - 1; i >= 0; i--) {
+            const msg = history[i]
+            if (msg.role === 'assistant') {
+              const msgText = typeof msg.content === 'string' 
+                ? msg.content 
+                : (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join(' ') : '')
+              if (msgText.toLowerCase().includes('прикрепите выписку') || 
+                  msgText.toLowerCase().includes('выписка') && msgText.toLowerCase().includes('банк')) {
+                // Берем время последнего сообщения пользователя перед этим вопросом
+                if (i > 0 && history[i - 1].role === 'user') {
+                  lastStatementsQuestionTime = new Date().toISOString() // Примерно, берем текущее время
+                }
+                break
+              }
             }
-            
-            // Обновляем категорию только если она не была установлена или была другой
-            if (msg.includes('налог')) {
-              updateFileCategoryInDB(fileId, 'taxes')
-            } else if (msg.includes('финанс')) {
-              updateFileCategoryInDB(fileId, 'financial')
-            } else if (msg.includes('выписк') && currentCategory !== 'statements') {
-              updateFileCategoryInDB(fileId, 'statements')
-            }
-          } catch (error) {
-            console.error(`⚠️ Ошибка проверки категории файла ${fileId}:`, error.message)
-            // Продолжаем работу даже если не удалось проверить категорию
+          }
+          
+          // Категоризируем все файлы без категории как выписки
+          const uncategorizedFiles = await db.prepare(`
+            SELECT file_id FROM files 
+            WHERE session_id = ? AND category IS NULL
+            ORDER BY uploaded_at ASC
+          `).all(session)
+          
+          for (const file of uncategorizedFiles) {
+            await updateFileCategoryInDB(file.file_id, 'statements')
+            console.log(`📎 Файл ${file.file_id} категоризирован как statements`)
+          }
+        }
+        
+        // Если пользователь ответил "нет" на вопрос про налоговую отчетность
+        if (userText === 'нет' && agentMsg.includes('есть ли у вас еще файлы налоговой отчетности')) {
+          console.log(`📎 Категоризируем файлы как налоговая отчетность после ответа "нет"`)
+          // Категоризируем все файлы без категории как налоговая отчетность
+          const uncategorizedFiles = await db.prepare(`
+            SELECT file_id FROM files 
+            WHERE session_id = ? AND category IS NULL
+            ORDER BY uploaded_at ASC
+          `).all(session)
+          
+          for (const file of uncategorizedFiles) {
+            await updateFileCategoryInDB(file.file_id, 'taxes')
+            console.log(`📎 Файл ${file.file_id} категоризирован как taxes`)
+          }
+        }
+        
+        // Если пользователь ответил "нет" на вопрос про финансовую отчетность
+        if (userText === 'нет' && agentMsg.includes('есть ли у вас еще файлы финансовой отчетности')) {
+          console.log(`📎 Категоризируем файлы как финансовая отчетность после ответа "нет"`)
+          // Категоризируем все файлы без категории как финансовая отчетность
+          const uncategorizedFiles = await db.prepare(`
+            SELECT file_id FROM files 
+            WHERE session_id = ? AND category IS NULL
+            ORDER BY uploaded_at ASC
+          `).all(session)
+          
+          for (const file of uncategorizedFiles) {
+            await updateFileCategoryInDB(file.file_id, 'financial')
+            console.log(`📎 Файл ${file.file_id} категоризирован как financial`)
           }
         }
       }
