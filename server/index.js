@@ -319,7 +319,10 @@ const conversationHistory = new Map()
 // Формат: session -> [{fileId: string, originalName: string, size: number}]
 const sessionFiles = new Map()
 
-// Гварды удалены - теперь используем атомарные проверки статуса в БД
+// Гварды, чтобы не запускать повторно анализы для одной и той же сессии
+const runningStatementsSessions = new Set()
+const runningTaxSessions = new Set()
+const runningFsSessions = new Set()
 
 // Code Interpreter без предустановленных файлов
 // Файлы будут добавляться динамически
@@ -664,11 +667,9 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             uploadedAt: new Date().toISOString()
           })
           
-          // Сохраняем файл БЕЗ категории - категоризация будет происходить при ответе "нет"
           // Категоризируем и сохраняем метаданные файла в БД (с обработкой ошибок)
           try {
-            // Не категоризируем при загрузке - категория будет установлена позже при ответе "нет"
-            const category = null
+            const category = categorizeUploadedFile(file.originalname, file.mimetype)
             await saveFileToDB(session, uploadedFile.id, file.originalname, file.size, file.mimetype, category)
           } catch (dbError) {
             // Проверяем, это ошибка разрыва соединения с БД
@@ -782,75 +783,18 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
       history.push(...newItems)
       console.log(`💾 История обновлена: ${history.length} сообщений`)
 
-      // Категоризация файлов при ответе "нет" на вопросы агента
-      if (typeof agentMessage === 'string' && typeof text === 'string') {
-        const userText = text.toLowerCase().trim()
-        const agentMsg = agentMessage.toLowerCase()
-        
-        // Если пользователь ответил "нет" на вопрос про выписки
-        if (userText === 'нет' && agentMsg.includes('есть ли у вас еще счета в других банках')) {
-          console.log(`📎 Категоризируем файлы как выписки после ответа "нет"`)
-          // Находим последний вопрос агента про выписки
-          let lastStatementsQuestionTime = null
-          for (let i = history.length - 1; i >= 0; i--) {
-            const msg = history[i]
-            if (msg.role === 'assistant') {
-              const msgText = typeof msg.content === 'string' 
-                ? msg.content 
-                : (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join(' ') : '')
-              if (msgText.toLowerCase().includes('прикрепите выписку') || 
-                  msgText.toLowerCase().includes('выписка') && msgText.toLowerCase().includes('банк')) {
-                // Берем время последнего сообщения пользователя перед этим вопросом
-                if (i > 0 && history[i - 1].role === 'user') {
-                  lastStatementsQuestionTime = new Date().toISOString() // Примерно, берем текущее время
-                }
-                break
-              }
-            }
-          }
-          
-          // Категоризируем все файлы без категории как выписки
-          const uncategorizedFiles = await db.prepare(`
-            SELECT file_id FROM files 
-            WHERE session_id = ? AND category IS NULL
-            ORDER BY uploaded_at ASC
-          `).all(session)
-          
-          for (const file of uncategorizedFiles) {
-            await updateFileCategoryInDB(file.file_id, 'statements')
-            console.log(`📎 Файл ${file.file_id} категоризирован как statements`)
-          }
-        }
-        
-        // Если пользователь ответил "нет" на вопрос про налоговую отчетность
-        if (userText === 'нет' && agentMsg.includes('есть ли у вас еще файлы налоговой отчетности')) {
-          console.log(`📎 Категоризируем файлы как налоговая отчетность после ответа "нет"`)
-          // Категоризируем все файлы без категории как налоговая отчетность
-          const uncategorizedFiles = await db.prepare(`
-            SELECT file_id FROM files 
-            WHERE session_id = ? AND category IS NULL
-            ORDER BY uploaded_at ASC
-          `).all(session)
-          
-          for (const file of uncategorizedFiles) {
-            await updateFileCategoryInDB(file.file_id, 'taxes')
-            console.log(`📎 Файл ${file.file_id} категоризирован как taxes`)
-          }
-        }
-        
-        // Если пользователь ответил "нет" на вопрос про финансовую отчетность
-        if (userText === 'нет' && agentMsg.includes('есть ли у вас еще файлы финансовой отчетности')) {
-          console.log(`📎 Категоризируем файлы как финансовая отчетность после ответа "нет"`)
-          // Категоризируем все файлы без категории как финансовая отчетность
-          const uncategorizedFiles = await db.prepare(`
-            SELECT file_id FROM files 
-            WHERE session_id = ? AND category IS NULL
-            ORDER BY uploaded_at ASC
-          `).all(session)
-          
-          for (const file of uncategorizedFiles) {
-            await updateFileCategoryInDB(file.file_id, 'financial')
-            console.log(`📎 Файл ${file.file_id} категоризирован как financial`)
+      // Если только что были загружены файлы и агент подтвердил их тип, проставим категорию
+      // (теперь это опционально, так как файлы не анализируются при загрузке)
+      if (uploadedFileIds && uploadedFileIds.length > 0 && typeof agentMessage === 'string') {
+        const msg = agentMessage.toLowerCase()
+        // Обновляем категорию для всех загруженных файлов, если агент упомянул тип
+        for (const fileId of uploadedFileIds) {
+          if (msg.includes('налог')) {
+            updateFileCategoryInDB(fileId, 'taxes')
+          } else if (msg.includes('финанс')) {
+            updateFileCategoryInDB(fileId, 'financial')
+          } else if (msg.includes('выписк')) {
+            updateFileCategoryInDB(fileId, 'statements')
           }
         }
       }
@@ -890,7 +834,22 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
           let allFiles = []
           
           try {
-            // Сначала проверяем наличие файлов выписок ПЕРЕД установкой статуса
+            // Проверка гвардов, чтобы исключить двойной запуск
+            if (runningStatementsSessions.has(session)) {
+              console.log(`⏭️ Анализ банковских выписок уже запущен для ${session}, пропускаем`)
+              return
+            }
+            runningStatementsSessions.add(session)
+            
+            // Если уже есть статус generating/completed, не запускаем
+            const existing = await db.prepare('SELECT status FROM reports WHERE session_id = ?').get(session)
+            if (existing && (existing.status === 'generating' || existing.status === 'completed')) {
+              console.log(`⏭️ status=${existing.status} для ${session}, повторный запуск не требуется`)
+              runningStatementsSessions.delete(session)
+              return
+            }
+            
+            // Получаем файлы из БД вместо памяти
             const getSessionFiles = db.prepare(`
               SELECT file_id, original_name, file_size, mime_type, category, uploaded_at
               FROM files 
@@ -911,49 +870,11 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             // Фильтруем только банковские выписки для финансового аналитика
             const statementFiles = allFiles.filter(f => f.category === 'statements')
             
-            console.log(`📊 Проверка выписок для ${session}: всего файлов ${allFiles.length}, выписок ${statementFiles.length}`)
-            
             if (statementFiles.length === 0) {
-              console.log(`⚠️ Нет банковских выписок для анализа в БД для ${session}`)
-              // Создаем запись, если её нет
-              await db.prepare(`
-                INSERT INTO reports (session_id, status, report_text)
-                VALUES (?, 'error', ?)
-                ON CONFLICT (session_id) DO NOTHING
-              `).run(session, 'Нет банковских выписок для анализа')
-              // Обновляем только если статус был NULL или pending
-              await db.prepare(`
-                UPDATE reports 
-                SET status = 'error', 
-                    report_text = ?
-                WHERE session_id = ? AND (status IS NULL OR status = 'pending')
-              `).run('Нет банковских выписок для анализа', session)
+              console.log(`⚠️ Нет банковских выписок для анализа в БД`)
+              runningStatementsSessions.delete(session)
               return
             }
-            
-            // Сначала создаем запись в БД, если её нет
-            await db.prepare(`
-              INSERT INTO reports (session_id, status)
-              VALUES (?, 'pending')
-              ON CONFLICT (session_id) DO NOTHING
-            `).run(session)
-            
-            // АТОМАРНАЯ проверка и установка статуса в БД (чтобы избежать повторного запуска)
-            // Проверяем и устанавливаем статус generating в одной транзакции
-            const updateStatus = await db.prepare(`
-              UPDATE reports 
-              SET status = 'generating' 
-              WHERE session_id = ? AND (status IS NULL OR status = 'pending')
-            `).run(session)
-            
-            if (updateStatus.changes === 0) {
-              // Статус уже generating или completed - значит анализ уже запущен или завершен
-              const existing = await db.prepare('SELECT status FROM reports WHERE session_id = ?').get(session)
-              console.log(`⏭️ status=${existing?.status || 'unknown'} для ${session}, повторный запуск не требуется`)
-              return
-            }
-            
-            console.log(`🚀 Запускаем анализ банковских выписок для ${session}`)
             
             console.log(`📊 Генерация отчета с ${statementFiles.length} банковскими выписками (из ${allFiles.length} файлов)...`)
             console.log(`📎 Выписки для анализа:`, statementFiles)
@@ -1180,7 +1101,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               if (nameMatch) name = nameMatch[1]
             }
             
-            // Сохраняем/обновляем заявку в БД (статус уже установлен в generating выше)
+            // Сохраняем заявку в БД со статусом "generating"
             const filesData = JSON.stringify(statementFiles)
             const insertReport = db.prepare(`
               INSERT INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
@@ -1195,7 +1116,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 phone = EXCLUDED.phone,
                 files_count = EXCLUDED.files_count,
                 files_data = EXCLUDED.files_data
-                -- status уже установлен выше, не трогаем его
+                -- НЕ обновляем status если он уже completed
             `)
             await insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, statementFiles.length, filesData)
             console.log(`💾 Заявка сохранена в БД: ${session}, выписок: ${statementFiles.length}`)
@@ -1419,61 +1340,33 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               `)
               await updateError.run(`Ошибка генерации отчета: ${error.message}`, session)
             }
+          } finally {
+            runningStatementsSessions.delete(session)
           }
         })
 
         // Параллельно запускаем анализ налоговой и фин. отчетности
         setImmediate(async () => {
           try {
-            // Сначала проверяем наличие файлов налоговой отчетности ПЕРЕД установкой статуса
+            // Проверка гвардов, чтобы исключить двойной запуск
+            if (runningTaxSessions.has(session)) {
+              console.log(`⏭️ Налоговый анализ уже запущен для ${session}, пропускаем`)
+              return
+            }
+            runningTaxSessions.add(session)
+            
+            // Если уже есть статус generating/completed, не запускаем
+            const existing = await db.prepare('SELECT tax_status FROM reports WHERE session_id = ?').get(session)
+            if (existing && (existing.tax_status === 'generating' || existing.tax_status === 'completed')) {
+              console.log(`⏭️ tax_status=${existing.tax_status} для ${session}, повторный запуск не требуется`)
+              runningTaxSessions.delete(session)
+              return
+            }
+            // Собираем файлы налоговой отчетности
             const taxFilesRows = await db.prepare(`
               SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'taxes' ORDER BY uploaded_at ASC
             `).all(session)
             const taxFileIds = (taxFilesRows || []).map(r => r.file_id)
-            
-            console.log(`📊 Проверка налоговых файлов для ${session}: найдено ${taxFileIds.length} файлов`)
-            
-            // Если нет файлов налоговой отчетности, сразу завершаем без установки статуса generating
-            if (taxFileIds.length === 0) {
-              // Создаем запись, если её нет
-              await db.prepare(`
-                INSERT INTO reports (session_id, tax_status, tax_report_text)
-                VALUES (?, 'error', ?)
-                ON CONFLICT (session_id) DO NOTHING
-              `).run(session, 'Файлы налоговой отчетности не найдены')
-              // Обновляем только если статус был NULL или pending
-              await db.prepare(`
-                UPDATE reports 
-                SET tax_status = 'error', 
-                    tax_report_text = ?
-                WHERE session_id = ? AND (tax_status IS NULL OR tax_status = 'pending')
-              `).run('Файлы налоговой отчетности не найдены', session)
-              console.log(`⏭️ Нет файлов налоговой отчетности, установлен статус error`)
-              return
-            }
-            
-            // Сначала создаем запись в БД, если её нет
-            await db.prepare(`
-              INSERT INTO reports (session_id, tax_status)
-              VALUES (?, 'pending')
-              ON CONFLICT (session_id) DO NOTHING
-            `).run(session)
-            
-            // АТОМАРНАЯ проверка и установка статуса в БД (чтобы избежать повторного запуска)
-            const updateStatus = await db.prepare(`
-              UPDATE reports 
-              SET tax_status = 'generating' 
-              WHERE session_id = ? AND (tax_status IS NULL OR tax_status = 'pending')
-            `).run(session)
-            
-            if (updateStatus.changes === 0) {
-              // Статус уже generating или completed - значит анализ уже запущен или завершен
-              const existing = await db.prepare('SELECT tax_status FROM reports WHERE session_id = ?').get(session)
-              console.log(`⏭️ tax_status=${existing?.tax_status || 'unknown'} для ${session}, повторный запуск не требуется`)
-              return
-            }
-            
-            console.log(`🚀 Запускаем налоговый анализ для ${session}`)
             const taxYearsMissing = []
             // Простая проверка покрытия двух лет по именам файлов
             const yearNow = new Date().getFullYear()
@@ -1481,7 +1374,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             if (!names.some(n => n.includes(String(yearNow)))) taxYearsMissing.push(String(yearNow))
             if (!names.some(n => n.includes(String(yearNow - 1)))) taxYearsMissing.push(String(yearNow - 1))
             
-            await db.prepare(`UPDATE reports SET tax_missing_periods = ? WHERE session_id = ?`).run(
+            await db.prepare(`UPDATE reports SET tax_status = 'generating', tax_missing_periods = ? WHERE session_id = ?`).run(
               taxYearsMissing.length ? taxYearsMissing.join(',') : null, session
             )
             
@@ -1524,19 +1417,42 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               } catch (err) {
                 await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'error' WHERE session_id = ?`).run(`Ошибка анализа налогов: ${err.message}`, session)
               }
+            } else {
+              await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = 'Файлы налоговой отчетности не найдены' WHERE session_id = ?`).run(session)
             }
           } catch (e) {
             console.error('❌ Ошибка запуска налогового анализа:', e)
+          } finally {
+            runningTaxSessions.delete(session)
           }
         })
 
         setImmediate(async () => {
           try {
-            // Сначала проверяем наличие XLSX файлов ПЕРЕД установкой статуса
+            if (runningFsSessions.has(session)) {
+              console.log(`⏭️ Фин. анализ уже запущен для ${session}, пропускаем`)
+              return
+            }
+            runningFsSessions.add(session)
+            const existing = await db.prepare('SELECT fs_status FROM reports WHERE session_id = ?').get(session)
+            if (existing && (existing.fs_status === 'generating' || existing.fs_status === 'completed')) {
+              console.log(`⏭️ fs_status=${existing.fs_status} для ${session}, повторный запуск не требуется`)
+              runningFsSessions.delete(session)
+              return
+            }
+            // Собираем файлы финансовой отчетности
             const fsFilesRows = await db.prepare(`
               SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'financial' ORDER BY uploaded_at ASC
             `).all(session)
             const fsFileIds = (fsFilesRows || []).map(r => r.file_id)
+            const fsYearsMissing = []
+            const yearNow = new Date().getFullYear()
+            const names = (fsFilesRows || []).map(r => (r.original_name || '').toLowerCase())
+            if (!names.some(n => n.includes(String(yearNow)))) fsYearsMissing.push(String(yearNow))
+            if (!names.some(n => n.includes(String(yearNow - 1)))) fsYearsMissing.push(String(yearNow - 1))
+            await db.prepare(`UPDATE reports SET fs_status = 'generating', fs_missing_periods = ? WHERE session_id = ?`).run(
+              fsYearsMissing.length ? fsYearsMissing.join(',') : null, session
+            )
             
             // Фильтруем только XLSX файлы для анализа (остальные форматы не анализируем)
             const xlsxFileIds = fsFileIds.filter((fileId, idx) => {
@@ -1545,77 +1461,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             })
             
             console.log(`📊 Финансовые файлы: всего ${fsFileIds.length}, XLSX для анализа: ${xlsxFileIds.length}`)
-            
-            // Если нет XLSX файлов, сразу завершаем без установки статуса generating
-            if (xlsxFileIds.length === 0) {
-              if (fsFileIds.length > 0) {
-                // Есть файлы, но все некорректного формата
-                const nonXlsxNames = fsFilesRows.map(f => f.original_name).join(', ')
-                // Создаем запись, если её нет
-                await db.prepare(`
-                  INSERT INTO reports (session_id, fs_status, fs_report_text)
-                  VALUES (?, 'error', ?)
-                  ON CONFLICT (session_id) DO NOTHING
-                `).run(session, `Файлы некорректного формата: ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX (Excel).`)
-                // Обновляем только если статус был NULL или pending
-                await db.prepare(`
-                  UPDATE reports 
-                  SET fs_status = 'error', 
-                      fs_report_text = ?
-                  WHERE session_id = ? AND (fs_status IS NULL OR fs_status = 'pending')
-                `).run(`Файлы некорректного формата: ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX (Excel).`, session)
-                console.log(`⏭️ Нет XLSX файлов для анализа финансовой отчетности, установлен статус error`)
-              } else {
-                // Нет файлов вообще
-                // Создаем запись, если её нет
-                await db.prepare(`
-                  INSERT INTO reports (session_id, fs_status, fs_report_text)
-                  VALUES (?, 'error', ?)
-                  ON CONFLICT (session_id) DO NOTHING
-                `).run(session, 'Файлы финансовой отчетности не найдены')
-                // Обновляем только если статус был NULL или pending
-                await db.prepare(`
-                  UPDATE reports 
-                  SET fs_status = 'error', 
-                      fs_report_text = ?
-                  WHERE session_id = ? AND (fs_status IS NULL OR fs_status = 'pending')
-                `).run('Файлы финансовой отчетности не найдены', session)
-                console.log(`⏭️ Нет файлов финансовой отчетности, установлен статус error`)
-              }
-              return
-            }
-            
-            // Сначала создаем запись в БД, если её нет
-            await db.prepare(`
-              INSERT INTO reports (session_id, fs_status)
-              VALUES (?, 'pending')
-              ON CONFLICT (session_id) DO NOTHING
-            `).run(session)
-            
-            // АТОМАРНАЯ проверка и установка статуса в БД (чтобы избежать повторного запуска)
-            const updateStatus = await db.prepare(`
-              UPDATE reports 
-              SET fs_status = 'generating' 
-              WHERE session_id = ? AND (fs_status IS NULL OR fs_status = 'pending')
-            `).run(session)
-            
-            if (updateStatus.changes === 0) {
-              // Статус уже generating или completed - значит анализ уже запущен или завершен
-              const existing = await db.prepare('SELECT fs_status FROM reports WHERE session_id = ?').get(session)
-              console.log(`⏭️ fs_status=${existing?.fs_status || 'unknown'} для ${session}, повторный запуск не требуется`)
-              return
-            }
-            
-            console.log(`🚀 Запускаем анализ финансовой отчетности для ${session}`)
-            
-            const fsYearsMissing = []
-            const yearNow = new Date().getFullYear()
-            const names = (fsFilesRows || []).map(r => (r.original_name || '').toLowerCase())
-            if (!names.some(n => n.includes(String(yearNow)))) fsYearsMissing.push(String(yearNow))
-            if (!names.some(n => n.includes(String(yearNow - 1)))) fsYearsMissing.push(String(yearNow - 1))
-            await db.prepare(`UPDATE reports SET fs_missing_periods = ? WHERE session_id = ?`).run(
-              fsYearsMissing.length ? fsYearsMissing.join(',') : null, session
-            )
             
             if (xlsxFileIds.length > 0) {
               const fsAgent = new Agent({
@@ -1664,9 +1509,20 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               } catch (err) {
                 await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'error' WHERE session_id = ?`).run(`Ошибка анализа фин. отчетности: ${err.message}`, session)
               }
+            } else if (fsFileIds.length > 0 && xlsxFileIds.length === 0) {
+              // Есть файлы, но все некорректного формата
+              const nonXlsxNames = fsFilesRows.map(f => f.original_name).join(', ')
+              await db.prepare(`UPDATE reports SET fs_status = 'error', fs_report_text = ? WHERE session_id = ?`).run(
+                `Файлы некорректного формата: ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX (Excel).`,
+                session
+              )
+            } else {
+              await db.prepare(`UPDATE reports SET fs_status = 'error', fs_report_text = 'Файлы финансовой отчетности не найдены' WHERE session_id = ?`).run(session)
             }
           } catch (e) {
             console.error('❌ Ошибка запуска анализа фин. отчетности:', e)
+          } finally {
+            runningFsSessions.delete(session)
           }
         })
       }
