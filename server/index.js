@@ -873,15 +873,19 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             
             if (statementFiles.length === 0) {
               console.log(`⚠️ Нет банковских выписок для анализа в БД для ${session}`)
-              // Устанавливаем статус error, если нет файлов
+              // Создаем запись, если её нет
               await db.prepare(`
                 INSERT INTO reports (session_id, status, report_text)
                 VALUES (?, 'error', ?)
-                ON CONFLICT (session_id) DO UPDATE SET
-                  status = 'error',
-                  report_text = EXCLUDED.report_text
-                WHERE status IS NULL OR status = 'pending'
+                ON CONFLICT (session_id) DO NOTHING
               `).run(session, 'Нет банковских выписок для анализа')
+              // Обновляем только если статус был NULL или pending
+              await db.prepare(`
+                UPDATE reports 
+                SET status = 'error', 
+                    report_text = ?
+                WHERE session_id = ? AND (status IS NULL OR status = 'pending')
+              `).run('Нет банковских выписок для анализа', session)
               return
             }
             
@@ -1379,6 +1383,33 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
         // Параллельно запускаем анализ налоговой и фин. отчетности
         setImmediate(async () => {
           try {
+            // Сначала проверяем наличие файлов налоговой отчетности ПЕРЕД установкой статуса
+            const taxFilesRows = await db.prepare(`
+              SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'taxes' ORDER BY uploaded_at ASC
+            `).all(session)
+            const taxFileIds = (taxFilesRows || []).map(r => r.file_id)
+            
+            console.log(`📊 Проверка налоговых файлов для ${session}: найдено ${taxFileIds.length} файлов`)
+            
+            // Если нет файлов налоговой отчетности, сразу завершаем без установки статуса generating
+            if (taxFileIds.length === 0) {
+              // Создаем запись, если её нет
+              await db.prepare(`
+                INSERT INTO reports (session_id, tax_status, tax_report_text)
+                VALUES (?, 'error', ?)
+                ON CONFLICT (session_id) DO NOTHING
+              `).run(session, 'Файлы налоговой отчетности не найдены')
+              // Обновляем только если статус был NULL или pending
+              await db.prepare(`
+                UPDATE reports 
+                SET tax_status = 'error', 
+                    tax_report_text = ?
+                WHERE session_id = ? AND (tax_status IS NULL OR tax_status = 'pending')
+              `).run('Файлы налоговой отчетности не найдены', session)
+              console.log(`⏭️ Нет файлов налоговой отчетности, установлен статус error`)
+              return
+            }
+            
             // Сначала создаем запись в БД, если её нет
             await db.prepare(`
               INSERT INTO reports (session_id, tax_status)
@@ -1401,12 +1432,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             }
             
             console.log(`🚀 Запускаем налоговый анализ для ${session}`)
-            
-            // Собираем файлы налоговой отчетности
-            const taxFilesRows = await db.prepare(`
-              SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'taxes' ORDER BY uploaded_at ASC
-            `).all(session)
-            const taxFileIds = (taxFilesRows || []).map(r => r.file_id)
             const taxYearsMissing = []
             // Простая проверка покрытия двух лет по именам файлов
             const yearNow = new Date().getFullYear()
@@ -1457,8 +1482,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               } catch (err) {
                 await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'error' WHERE session_id = ?`).run(`Ошибка анализа налогов: ${err.message}`, session)
               }
-            } else {
-              await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = 'Файлы налоговой отчетности не найдены' WHERE session_id = ?`).run(session)
             }
           } catch (e) {
             console.error('❌ Ошибка запуска налогового анализа:', e)

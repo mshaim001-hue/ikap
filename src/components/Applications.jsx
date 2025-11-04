@@ -541,7 +541,7 @@ const Applications = () => {
 
                 {/* Налоговая отчетность */}
                 {(() => {
-                  const enabled = selectedApplication.taxStatus === 'completed'
+                  const enabled = selectedApplication.taxStatus === 'completed' && !!selectedApplication.taxReportText
                   return (
                     <button
                       onClick={() => enabled && setShowTaxModal(true)}
@@ -556,7 +556,7 @@ const Applications = () => {
 
                 {/* Финансовая отчетность */}
                 {(() => {
-                  const enabled = selectedApplication.fsStatus === 'completed'
+                  const enabled = selectedApplication.fsStatus === 'completed' && !!selectedApplication.fsReportText
                   return (
                     <button
                       onClick={() => enabled && setShowFsModal(true)}
