@@ -785,13 +785,30 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
       if (uploadedFileIds && uploadedFileIds.length > 0 && typeof agentMessage === 'string') {
         const msg = agentMessage.toLowerCase()
         // Обновляем категорию для всех загруженных файлов, если агент упомянул тип
+        // ВАЖНО: не перезаписываем категорию 'statements' на другие категории
         for (const fileId of uploadedFileIds) {
-          if (msg.includes('налог')) {
-            updateFileCategoryInDB(fileId, 'taxes')
-          } else if (msg.includes('финанс')) {
-            updateFileCategoryInDB(fileId, 'financial')
-          } else if (msg.includes('выписк')) {
-            updateFileCategoryInDB(fileId, 'statements')
+          // Проверяем текущую категорию файла перед обновлением
+          try {
+            const currentFile = await db.prepare('SELECT category FROM files WHERE file_id = ?').get(fileId)
+            const currentCategory = currentFile?.category
+            
+            // Если файл уже категоризирован как 'statements', не перезаписываем его
+            if (currentCategory === 'statements') {
+              console.log(`📎 Файл ${fileId} уже имеет категорию 'statements', не перезаписываем`)
+              continue
+            }
+            
+            // Обновляем категорию только если она не была установлена или была другой
+            if (msg.includes('налог')) {
+              updateFileCategoryInDB(fileId, 'taxes')
+            } else if (msg.includes('финанс')) {
+              updateFileCategoryInDB(fileId, 'financial')
+            } else if (msg.includes('выписк') && currentCategory !== 'statements') {
+              updateFileCategoryInDB(fileId, 'statements')
+            }
+          } catch (error) {
+            console.error(`⚠️ Ошибка проверки категории файла ${fileId}:`, error.message)
+            // Продолжаем работу даже если не удалось проверить категорию
           }
         }
       }
@@ -831,6 +848,43 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
           let allFiles = []
           
           try {
+            // Сначала проверяем наличие файлов выписок ПЕРЕД установкой статуса
+            const getSessionFiles = db.prepare(`
+              SELECT file_id, original_name, file_size, mime_type, category, uploaded_at
+              FROM files 
+              WHERE session_id = ? 
+              ORDER BY uploaded_at ASC
+            `)
+            const dbFiles = await getSessionFiles.all(session)
+            
+            // Преобразуем в формат, совместимый со старым кодом
+            allFiles = dbFiles.map(f => ({
+              fileId: f.file_id,
+              originalName: f.original_name,
+              size: f.file_size,
+              uploadedAt: f.uploaded_at,
+              category: f.category
+            }))
+            
+            // Фильтруем только банковские выписки для финансового аналитика
+            const statementFiles = allFiles.filter(f => f.category === 'statements')
+            
+            console.log(`📊 Проверка выписок для ${session}: всего файлов ${allFiles.length}, выписок ${statementFiles.length}`)
+            
+            if (statementFiles.length === 0) {
+              console.log(`⚠️ Нет банковских выписок для анализа в БД для ${session}`)
+              // Устанавливаем статус error, если нет файлов
+              await db.prepare(`
+                INSERT INTO reports (session_id, status, report_text)
+                VALUES (?, 'error', ?)
+                ON CONFLICT (session_id) DO UPDATE SET
+                  status = 'error',
+                  report_text = EXCLUDED.report_text
+                WHERE status IS NULL OR status = 'pending'
+              `).run(session, 'Нет банковских выписок для анализа')
+              return
+            }
+            
             // Сначала создаем запись в БД, если её нет
             await db.prepare(`
               INSERT INTO reports (session_id, status)
@@ -854,34 +908,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             }
             
             console.log(`🚀 Запускаем анализ банковских выписок для ${session}`)
-            
-            // Получаем файлы из БД вместо памяти
-            const getSessionFiles = db.prepare(`
-              SELECT file_id, original_name, file_size, mime_type, category, uploaded_at
-              FROM files 
-              WHERE session_id = ? 
-              ORDER BY uploaded_at ASC
-            `)
-            const dbFiles = await getSessionFiles.all(session)
-            
-            // Преобразуем в формат, совместимый со старым кодом
-            allFiles = dbFiles.map(f => ({
-              fileId: f.file_id,
-              originalName: f.original_name,
-              size: f.file_size,
-              uploadedAt: f.uploaded_at,
-              category: f.category
-            }))
-            
-            // Фильтруем только банковские выписки для финансового аналитика
-            const statementFiles = allFiles.filter(f => f.category === 'statements')
-            
-            if (statementFiles.length === 0) {
-              console.log(`⚠️ Нет банковских выписок для анализа в БД`)
-              // Сбрасываем статус обратно, если нет файлов
-              await db.prepare(`UPDATE reports SET status = 'error', report_text = 'Нет банковских выписок для анализа' WHERE session_id = ?`).run(session)
-              return
-            }
             
             console.log(`📊 Генерация отчета с ${statementFiles.length} банковскими выписками (из ${allFiles.length} файлов)...`)
             console.log(`📎 Выписки для анализа:`, statementFiles)
@@ -1441,6 +1467,49 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
 
         setImmediate(async () => {
           try {
+            // Сначала проверяем наличие XLSX файлов ПЕРЕД установкой статуса
+            const fsFilesRows = await db.prepare(`
+              SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'financial' ORDER BY uploaded_at ASC
+            `).all(session)
+            const fsFileIds = (fsFilesRows || []).map(r => r.file_id)
+            
+            // Фильтруем только XLSX файлы для анализа (остальные форматы не анализируем)
+            const xlsxFileIds = fsFileIds.filter((fileId, idx) => {
+              const fileName = (fsFilesRows[idx]?.original_name || '').toLowerCase()
+              return fileName.endsWith('.xlsx')
+            })
+            
+            console.log(`📊 Финансовые файлы: всего ${fsFileIds.length}, XLSX для анализа: ${xlsxFileIds.length}`)
+            
+            // Если нет XLSX файлов, сразу завершаем без установки статуса generating
+            if (xlsxFileIds.length === 0) {
+              if (fsFileIds.length > 0) {
+                // Есть файлы, но все некорректного формата
+                const nonXlsxNames = fsFilesRows.map(f => f.original_name).join(', ')
+                await db.prepare(`
+                  INSERT INTO reports (session_id, fs_status, fs_report_text)
+                  VALUES (?, 'error', ?)
+                  ON CONFLICT (session_id) DO UPDATE SET
+                    fs_status = 'error',
+                    fs_report_text = EXCLUDED.fs_report_text
+                  WHERE fs_status IS NULL OR fs_status = 'pending'
+                `).run(session, `Файлы некорректного формата: ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX (Excel).`)
+                console.log(`⏭️ Нет XLSX файлов для анализа финансовой отчетности, установлен статус error`)
+              } else {
+                // Нет файлов вообще
+                await db.prepare(`
+                  INSERT INTO reports (session_id, fs_status, fs_report_text)
+                  VALUES (?, 'error', ?)
+                  ON CONFLICT (session_id) DO UPDATE SET
+                    fs_status = 'error',
+                    fs_report_text = EXCLUDED.fs_report_text
+                  WHERE fs_status IS NULL OR fs_status = 'pending'
+                `).run(session, 'Файлы финансовой отчетности не найдены')
+                console.log(`⏭️ Нет файлов финансовой отчетности, установлен статус error`)
+              }
+              return
+            }
+            
             // Сначала создаем запись в БД, если её нет
             await db.prepare(`
               INSERT INTO reports (session_id, fs_status)
@@ -1464,11 +1533,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             
             console.log(`🚀 Запускаем анализ финансовой отчетности для ${session}`)
             
-            // Собираем файлы финансовой отчетности
-            const fsFilesRows = await db.prepare(`
-              SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'financial' ORDER BY uploaded_at ASC
-            `).all(session)
-            const fsFileIds = (fsFilesRows || []).map(r => r.file_id)
             const fsYearsMissing = []
             const yearNow = new Date().getFullYear()
             const names = (fsFilesRows || []).map(r => (r.original_name || '').toLowerCase())
@@ -1477,14 +1541,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             await db.prepare(`UPDATE reports SET fs_missing_periods = ? WHERE session_id = ?`).run(
               fsYearsMissing.length ? fsYearsMissing.join(',') : null, session
             )
-            
-            // Фильтруем только XLSX файлы для анализа (остальные форматы не анализируем)
-            const xlsxFileIds = fsFileIds.filter((fileId, idx) => {
-              const fileName = (fsFilesRows[idx]?.original_name || '').toLowerCase()
-              return fileName.endsWith('.xlsx')
-            })
-            
-            console.log(`📊 Финансовые файлы: всего ${fsFileIds.length}, XLSX для анализа: ${xlsxFileIds.length}`)
             
             if (xlsxFileIds.length > 0) {
               const fsAgent = new Agent({
@@ -1533,15 +1589,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               } catch (err) {
                 await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'error' WHERE session_id = ?`).run(`Ошибка анализа фин. отчетности: ${err.message}`, session)
               }
-            } else if (fsFileIds.length > 0 && xlsxFileIds.length === 0) {
-              // Есть файлы, но все некорректного формата
-              const nonXlsxNames = fsFilesRows.map(f => f.original_name).join(', ')
-              await db.prepare(`UPDATE reports SET fs_status = 'error', fs_report_text = ? WHERE session_id = ?`).run(
-                `Файлы некорректного формата: ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX (Excel).`,
-                session
-              )
-            } else {
-              await db.prepare(`UPDATE reports SET fs_status = 'error', fs_report_text = 'Файлы финансовой отчетности не найдены' WHERE session_id = ?`).run(session)
             }
           } catch (e) {
             console.error('❌ Ошибка запуска анализа фин. отчетности:', e)
