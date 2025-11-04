@@ -319,10 +319,7 @@ const conversationHistory = new Map()
 // Формат: session -> [{fileId: string, originalName: string, size: number}]
 const sessionFiles = new Map()
 
-// Гварды, чтобы не запускать повторно анализы для одной и той же сессии
-const runningStatementsSessions = new Set()
-const runningTaxSessions = new Set()
-const runningFsSessions = new Set()
+// Гварды удалены - теперь используем атомарные проверки статуса в БД
 
 // Code Interpreter без предустановленных файлов
 // Файлы будут добавляться динамически
@@ -834,20 +831,29 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
           let allFiles = []
           
           try {
-            // Проверка гвардов, чтобы исключить двойной запуск
-            if (runningStatementsSessions.has(session)) {
-              console.log(`⏭️ Анализ банковских выписок уже запущен для ${session}, пропускаем`)
-              return
-            }
-            runningStatementsSessions.add(session)
+            // Сначала создаем запись в БД, если её нет
+            await db.prepare(`
+              INSERT INTO reports (session_id, status)
+              VALUES (?, 'pending')
+              ON CONFLICT (session_id) DO NOTHING
+            `).run(session)
             
-            // Если уже есть статус generating/completed, не запускаем
-            const existing = await db.prepare('SELECT status FROM reports WHERE session_id = ?').get(session)
-            if (existing && (existing.status === 'generating' || existing.status === 'completed')) {
-              console.log(`⏭️ status=${existing.status} для ${session}, повторный запуск не требуется`)
-              runningStatementsSessions.delete(session)
+            // АТОМАРНАЯ проверка и установка статуса в БД (чтобы избежать повторного запуска)
+            // Проверяем и устанавливаем статус generating в одной транзакции
+            const updateStatus = await db.prepare(`
+              UPDATE reports 
+              SET status = 'generating' 
+              WHERE session_id = ? AND (status IS NULL OR status = 'pending')
+            `).run(session)
+            
+            if (updateStatus.changes === 0) {
+              // Статус уже generating или completed - значит анализ уже запущен или завершен
+              const existing = await db.prepare('SELECT status FROM reports WHERE session_id = ?').get(session)
+              console.log(`⏭️ status=${existing?.status || 'unknown'} для ${session}, повторный запуск не требуется`)
               return
             }
+            
+            console.log(`🚀 Запускаем анализ банковских выписок для ${session}`)
             
             // Получаем файлы из БД вместо памяти
             const getSessionFiles = db.prepare(`
@@ -872,7 +878,8 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             
             if (statementFiles.length === 0) {
               console.log(`⚠️ Нет банковских выписок для анализа в БД`)
-              runningStatementsSessions.delete(session)
+              // Сбрасываем статус обратно, если нет файлов
+              await db.prepare(`UPDATE reports SET status = 'error', report_text = 'Нет банковских выписок для анализа' WHERE session_id = ?`).run(session)
               return
             }
             
@@ -1101,7 +1108,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               if (nameMatch) name = nameMatch[1]
             }
             
-            // Сохраняем заявку в БД со статусом "generating"
+            // Сохраняем/обновляем заявку в БД (статус уже установлен в generating выше)
             const filesData = JSON.stringify(statementFiles)
             const insertReport = db.prepare(`
               INSERT INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
@@ -1116,7 +1123,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 phone = EXCLUDED.phone,
                 files_count = EXCLUDED.files_count,
                 files_data = EXCLUDED.files_data
-                -- НЕ обновляем status если он уже completed
+                -- status уже установлен выше, не трогаем его
             `)
             await insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, statementFiles.length, filesData)
             console.log(`💾 Заявка сохранена в БД: ${session}, выписок: ${statementFiles.length}`)
@@ -1340,30 +1347,20 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               `)
               await updateError.run(`Ошибка генерации отчета: ${error.message}`, session)
             }
-          } finally {
-            runningStatementsSessions.delete(session)
           }
         })
 
         // Параллельно запускаем анализ налоговой и фин. отчетности
         setImmediate(async () => {
           try {
-            // Проверка гвардов, чтобы исключить двойной запуск
-            if (runningTaxSessions.has(session)) {
-              console.log(`⏭️ Налоговый анализ уже запущен для ${session}, пропускаем`)
-              return
-            }
-            runningTaxSessions.add(session)
+            // Сначала создаем запись в БД, если её нет
+            await db.prepare(`
+              INSERT INTO reports (session_id, tax_status)
+              VALUES (?, 'pending')
+              ON CONFLICT (session_id) DO NOTHING
+            `).run(session)
             
-            // Если уже есть статус generating/completed, не запускаем
-            const existing = await db.prepare('SELECT tax_status FROM reports WHERE session_id = ?').get(session)
-            if (existing && (existing.tax_status === 'generating' || existing.tax_status === 'completed')) {
-              console.log(`⏭️ tax_status=${existing.tax_status} для ${session}, повторный запуск не требуется`)
-              runningTaxSessions.delete(session)
-              return
-            }
-            
-            // Устанавливаем статус generating АТОМАРНО (только если был pending/null)
+            // АТОМАРНАЯ проверка и установка статуса в БД (чтобы избежать повторного запуска)
             const updateStatus = await db.prepare(`
               UPDATE reports 
               SET tax_status = 'generating' 
@@ -1371,10 +1368,13 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             `).run(session)
             
             if (updateStatus.changes === 0) {
-              console.log(`⏭️ tax_status уже установлен другим процессом для ${session}, пропускаем`)
-              runningTaxSessions.delete(session)
+              // Статус уже generating или completed - значит анализ уже запущен или завершен
+              const existing = await db.prepare('SELECT tax_status FROM reports WHERE session_id = ?').get(session)
+              console.log(`⏭️ tax_status=${existing?.tax_status || 'unknown'} для ${session}, повторный запуск не требуется`)
               return
             }
+            
+            console.log(`🚀 Запускаем налоговый анализ для ${session}`)
             
             // Собираем файлы налоговой отчетности
             const taxFilesRows = await db.prepare(`
@@ -1436,26 +1436,19 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             }
           } catch (e) {
             console.error('❌ Ошибка запуска налогового анализа:', e)
-          } finally {
-            runningTaxSessions.delete(session)
           }
         })
 
         setImmediate(async () => {
           try {
-            if (runningFsSessions.has(session)) {
-              console.log(`⏭️ Фин. анализ уже запущен для ${session}, пропускаем`)
-              return
-            }
-            runningFsSessions.add(session)
-            const existing = await db.prepare('SELECT fs_status FROM reports WHERE session_id = ?').get(session)
-            if (existing && (existing.fs_status === 'generating' || existing.fs_status === 'completed')) {
-              console.log(`⏭️ fs_status=${existing.fs_status} для ${session}, повторный запуск не требуется`)
-              runningFsSessions.delete(session)
-              return
-            }
+            // Сначала создаем запись в БД, если её нет
+            await db.prepare(`
+              INSERT INTO reports (session_id, fs_status)
+              VALUES (?, 'pending')
+              ON CONFLICT (session_id) DO NOTHING
+            `).run(session)
             
-            // Устанавливаем статус generating АТОМАРНО (только если был pending/null)
+            // АТОМАРНАЯ проверка и установка статуса в БД (чтобы избежать повторного запуска)
             const updateStatus = await db.prepare(`
               UPDATE reports 
               SET fs_status = 'generating' 
@@ -1463,10 +1456,13 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             `).run(session)
             
             if (updateStatus.changes === 0) {
-              console.log(`⏭️ fs_status уже установлен другим процессом для ${session}, пропускаем`)
-              runningFsSessions.delete(session)
+              // Статус уже generating или completed - значит анализ уже запущен или завершен
+              const existing = await db.prepare('SELECT fs_status FROM reports WHERE session_id = ?').get(session)
+              console.log(`⏭️ fs_status=${existing?.fs_status || 'unknown'} для ${session}, повторный запуск не требуется`)
               return
             }
+            
+            console.log(`🚀 Запускаем анализ финансовой отчетности для ${session}`)
             
             // Собираем файлы финансовой отчетности
             const fsFilesRows = await db.prepare(`
@@ -1549,8 +1545,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             }
           } catch (e) {
             console.error('❌ Ошибка запуска анализа фин. отчетности:', e)
-          } finally {
-            runningFsSessions.delete(session)
           }
         })
       }
