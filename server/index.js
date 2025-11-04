@@ -324,35 +324,6 @@ const runningStatementsSessions = new Set()
 const runningTaxSessions = new Set()
 const runningFsSessions = new Set()
 
-// Извлечение текста из ответа агента (универсальная)
-function extractAgentText(items) {
-  for (let i = items.length - 1; i >= 0; i--) {
-    const item = items[i]
-    if (item.rawItem?.role !== 'assistant') continue
-
-    const content = item.rawItem.content
-    if (Array.isArray(content)) {
-      for (const c of content) {
-        if ((c.type === 'text' || c.type === 'output_text') && c.text) {
-          return typeof c.text === 'string' ? c.text : (c.text.value || '')
-        }
-      }
-    } else if (typeof content === 'string') {
-      return content
-    }
-  }
-  return null
-}
-
-// Запуск агента с таймаутом
-async function runAgentWithTimeout(agent, messages, timeoutMs) {
-  const runner = new Runner({})
-  const timeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(`Timeout ${timeoutMs / 1000}s`)), timeoutMs)
-  )
-  return Promise.race([runner.run(agent, messages), timeout])
-}
-
 // Code Interpreter без предустановленных файлов
 // Файлы будут добавляться динамически
 const codeInterpreter = codeInterpreterTool({
@@ -855,54 +826,734 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                             agentMessage.includes('Ожидайте уведомления от платформы iKapitalist')
       
       if (isFinalMessage) {
-        console.log(`Заявка завершена! Генерируем финансовый отчет...`)
-      
-        // Запускаем все анализы асинхронно, не блокируя ответ клиенту
+        console.log(`✅ Заявка завершена! Генерируем финансовый отчет...`)
+        
+        // Генерируем отчет асинхронно (не блокируем ответ клиенту)
+        setImmediate(async () => {
+          // Определяем allFiles в начале для доступа в catch блоке
+          let allFiles = []
+          
+          try {
+            // Проверка гвардов, чтобы исключить двойной запуск
+            if (runningStatementsSessions.has(session)) {
+              console.log(`⏭️ Анализ банковских выписок уже запущен для ${session}, пропускаем`)
+              return
+            }
+            runningStatementsSessions.add(session)
+            
+            // Если уже есть статус generating/completed, не запускаем
+            const existing = await db.prepare('SELECT status FROM reports WHERE session_id = ?').get(session)
+            if (existing && (existing.status === 'generating' || existing.status === 'completed')) {
+              console.log(`⏭️ status=${existing.status} для ${session}, повторный запуск не требуется`)
+              runningStatementsSessions.delete(session)
+              return
+            }
+            
+            // Получаем файлы из БД вместо памяти
+            const getSessionFiles = db.prepare(`
+              SELECT file_id, original_name, file_size, mime_type, category, uploaded_at
+              FROM files 
+              WHERE session_id = ? 
+              ORDER BY uploaded_at ASC
+            `)
+            const dbFiles = await getSessionFiles.all(session)
+            
+            // Преобразуем в формат, совместимый со старым кодом
+            allFiles = dbFiles.map(f => ({
+              fileId: f.file_id,
+              originalName: f.original_name,
+              size: f.file_size,
+              uploadedAt: f.uploaded_at,
+              category: f.category
+            }))
+            
+            // Фильтруем только банковские выписки для финансового аналитика
+            const statementFiles = allFiles.filter(f => f.category === 'statements')
+            
+            if (statementFiles.length === 0) {
+              console.log(`⚠️ Нет банковских выписок для анализа в БД`)
+              runningStatementsSessions.delete(session)
+              return
+            }
+            
+            console.log(`📊 Генерация отчета с ${statementFiles.length} банковскими выписками (из ${allFiles.length} файлов)...`)
+            console.log(`📎 Выписки для анализа:`, statementFiles)
+            
+            // Извлекаем только fileId для передачи в агента
+            const fileIds = statementFiles.map(f => f.fileId)
+            
+            // Извлекаем ключевую информацию из истории (без передачи всех сообщений)
+            let amount = 'не указана'
+            let termMonths = 'не указан'
+            let purpose = 'не указана'
+            let bin = 'не указан'
+            let name = 'не указано'
+            let email = 'не указан'
+            let phone = 'не указан'
+            
+            // Парсим историю для извлечения данных
+            const historyText = history.map(msg => {
+              if (typeof msg.content === 'string') return msg.content
+              if (Array.isArray(msg.content)) return msg.content.map(c => c.text || '').join(' ')
+              return ''
+            }).join(' ')
+            
+            // Извлечение данных из истории сообщений
+            // Ищем сумму - сначала в последовательности вопрос-ответ
+            console.log(`🔍 Поиск суммы в истории из ${history.length} сообщений...`)
+            for (let i = 0; i < history.length; i++) {
+              const msg = history[i]
+              if (msg.role === 'assistant') {
+                const assistantText = typeof msg.content === 'string' 
+                  ? msg.content 
+                  : (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join(' ') : '')
+                
+                // Если агент спрашивает о сумме
+                if (assistantText.match(/какую сумму|сумму.*получить/i)) {
+                  console.log(`✅ Найден вопрос о сумме в элементе ${i}: "${assistantText.substring(0, 100)}"`)
+                  // Берем следующее сообщение пользователя
+                  if (i + 1 < history.length && history[i + 1].role === 'user') {
+                    const userResponse = typeof history[i + 1].content === 'string'
+                      ? history[i + 1].content
+                      : (Array.isArray(history[i + 1].content) ? history[i + 1].content.map(c => c.text || '').join(' ') : '')
+                    
+                    console.log(`📝 Ответ пользователя: "${userResponse}"`)
+                    // Ищем сумму в ответе пользователя
+                    let amountMatch = userResponse.match(/(\d+)\s*(мил|млн|миллион)/i)
+                    if (amountMatch) {
+                      amount = `${amountMatch[1]} млн KZT`
+                      break
+                    }
+                    
+                    // Ищем большие суммы в виде цифр
+                    amountMatch = userResponse.match(/(\d{7,})/g)
+                    if (amountMatch) {
+                      // Берем первое число >= 10 млн (7+ цифр)
+                      const num = parseInt(amountMatch[0])
+                      console.log(`💰 Найдено число: ${num}`)
+                      if (num >= 10000000) {
+                        amount = `${num} KZT`
+                        console.log(`✅ Сумма установлена: ${amount}`)
+                        break
+                      } else {
+                        console.log(`⚠️ Число ${num} меньше 10 млн, пропускаем`)
+                      }
+                    }
+                    
+                    // Ищем суммы с разделителями тысяч
+                    amountMatch = userResponse.match(/(\d+)\s+(\d{3})\s+(\d{3})/)
+                    if (amountMatch) {
+                      const num = parseInt(amountMatch[1] + amountMatch[2] + amountMatch[3])
+                      if (num >= 10000000) {
+                        amount = `${num} KZT`
+                        break
+                      }
+                    }
+                    
+                    // Ищем суммы с "тыс"
+                    amountMatch = userResponse.match(/(\d+)\s*тыс/i)
+                    if (amountMatch) {
+                      const num = parseInt(amountMatch[1]) * 1000
+                      if (num >= 10000000) {
+                        amount = `${num} KZT`
+                        break
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            
+            // Если не нашли в последовательности, пробуем по ключевым словам
+            if (amount === 'не указана') {
+              let amountMatch = historyText.match(/(\d+)\s*(мил|млн|миллион)/i)
+              if (amountMatch) {
+                amount = `${amountMatch[1]} млн KZT`
+              } else {
+                // Ищем большие суммы в виде цифр
+                amountMatch = historyText.match(/(\d{7,})/g)
+                if (amountMatch) {
+                  const num = parseInt(amountMatch[0])
+                  console.log(`💰 Fallback: найдено число: ${num}`)
+                  if (num >= 10000000) {
+                    amount = `${num} KZT`
+                    console.log(`✅ Fallback: сумма установлена: ${amount}`)
+                  } else {
+                    console.log(`⚠️ Fallback: число ${num} меньше 10 млн, пропускаем`)
+                  }
+                } else {
+                  // Ищем суммы с разделителями тысяч
+                  amountMatch = historyText.match(/(\d+)\s+(\d{3})\s+(\d{3})/)
+                  if (amountMatch) {
+                    const num = parseInt(amountMatch[1] + amountMatch[2] + amountMatch[3])
+                    if (num >= 10000000) {
+                      amount = `${num} KZT`
+                    }
+                  } else {
+                    // Ищем суммы с "тыс"
+                    amountMatch = historyText.match(/(\d+)\s*тыс/i)
+                    if (amountMatch) {
+                      const num = parseInt(amountMatch[1]) * 1000
+                      if (num >= 10000000) {
+                        amount = `${num} KZT`
+                      }
+                    }
+                  }
+                }
+              }
+            }
+            
+            // Ищем срок - сначала в последовательности вопрос-ответ
+            for (let i = 0; i < history.length; i++) {
+              const msg = history[i]
+              if (msg.role === 'assistant') {
+                const assistantText = typeof msg.content === 'string' 
+                  ? msg.content 
+                  : (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join(' ') : '')
+                
+                // Если агент спрашивает о сроке
+                if (assistantText.match(/срок|месяц/i)) {
+                  // Берем следующее сообщение пользователя
+                  if (i + 1 < history.length && history[i + 1].role === 'user') {
+                    const userResponse = typeof history[i + 1].content === 'string'
+                      ? history[i + 1].content
+                      : (Array.isArray(history[i + 1].content) ? history[i + 1].content.map(c => c.text || '').join(' ') : '')
+                    
+                    // Ищем число в ответе пользователя
+                    const numberMatch = userResponse.match(/(\d+)/)
+                    if (numberMatch) {
+                      termMonths = `${numberMatch[1]} месяцев`
+                      break
+                    }
+                  }
+                }
+              }
+            }
+            
+            // Если не нашли в последовательности, пробуем по ключевым словам
+            if (termMonths === 'не указан') {
+              const termMatch = historyText.match(/(\d+)\s*месяц/i) || 
+                               historyText.match(/срок[:\s]*(\d+)/i) ||
+                               historyText.match(/(\d+)\s*мес/i) ||
+                               historyText.match(/срок[^0-9]*(\d+)/i)
+              if (termMatch) termMonths = `${termMatch[1]} месяцев`
+            }
+            
+            const binMatch = historyText.match(/\b(\d{12})\b/)
+            if (binMatch) bin = binMatch[1]
+            
+            // Ищем цель финансирования в истории
+            // Сначала пытаемся найти в последовательности сообщений
+            for (let i = 0; i < history.length; i++) {
+              const msg = history[i]
+              if (msg.role === 'assistant') {
+                const assistantText = typeof msg.content === 'string' 
+                  ? msg.content 
+                  : (Array.isArray(msg.content) ? msg.content.map(c => c.text || '').join(' ') : '')
+                
+                // Если агент спрашивает о цели
+                if (assistantText.match(/для чего|цел[ьи]|привлекаете финансирование/i)) {
+                  // Берем следующее сообщение пользователя
+                  if (i + 1 < history.length && history[i + 1].role === 'user') {
+                    const userResponse = typeof history[i + 1].content === 'string'
+                      ? history[i + 1].content
+                      : (Array.isArray(history[i + 1].content) ? history[i + 1].content.map(c => c.text || '').join(' ') : '')
+                    
+                    // Очищаем от служебной информации о файлах и датах
+                    purpose = userResponse
+                      .replace(/\[Прикреплен файл.*?\]/g, '')
+                      .replace(/\[ДАТА:.*?\]/g, '')
+                      .replace(/^\s*\[.*?\]\s*/g, '') // Убираем любые [скобки] в начале
+                      .trim()
+                    if (purpose) break
+                  }
+                }
+              }
+            }
+            
+            // Если не нашли, пробуем по ключевым словам
+            if (purpose === 'не указана') {
+              const purposeKeywords = ['новый бизнес', 'расширение', 'оборотные средства', 'инвестиции', 'пополнение']
+              for (const keyword of purposeKeywords) {
+                if (historyText.toLowerCase().includes(keyword)) {
+                  purpose = keyword
+                  break
+                }
+              }
+            }
+            
+            // Извлекаем контакты из ПОСЛЕДНЕГО сообщения пользователя
+            const lastUserMessage = [...history].reverse().find(msg => msg.role === 'user')
+            if (lastUserMessage) {
+              const contactText = typeof lastUserMessage.content === 'string' 
+                ? lastUserMessage.content 
+                : (Array.isArray(lastUserMessage.content) 
+                  ? lastUserMessage.content.map(c => c.text || '').join(' ') 
+                  : '')
+              
+              const emailMatch = contactText.match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/i)
+              if (emailMatch) email = emailMatch[1]
+              
+              const phoneMatch = contactText.match(/(\+?\d[\d\s-]{9,})/g)
+              if (phoneMatch) phone = phoneMatch[phoneMatch.length - 1]
+              
+              const nameMatch = contactText.match(/([А-Яа-яЁё]+\s+[А-Яа-яЁё]+)/i)
+              if (nameMatch) name = nameMatch[1]
+            }
+            
+            // Сохраняем заявку в БД со статусом "generating"
+            const filesData = JSON.stringify(statementFiles)
+            const insertReport = db.prepare(`
+              INSERT INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generating')
+              ON CONFLICT (session_id) DO UPDATE SET
+                company_bin = EXCLUDED.company_bin,
+                amount = EXCLUDED.amount,
+                term = EXCLUDED.term,
+                purpose = EXCLUDED.purpose,
+                name = EXCLUDED.name,
+                email = EXCLUDED.email,
+                phone = EXCLUDED.phone,
+                files_count = EXCLUDED.files_count,
+                files_data = EXCLUDED.files_data
+                -- НЕ обновляем status если он уже completed
+            `)
+            await insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, statementFiles.length, filesData)
+            console.log(`💾 Заявка сохранена в БД: ${session}, выписок: ${statementFiles.length}`)
+            
+            // Формируем компактный запрос
+            const reportRequest = `Создай подробный финансовый отчет на основе предоставленных банковских выписок.
+
+ДАННЫЕ ЗАЯВКИ:
+- Компания (БИН): ${bin}
+- Запрашиваемая сумма: ${amount}
+- Срок: ${termMonths}
+- Цель финансирования: ${purpose}
+- Контакты: ${name}, ${email}, ${phone}
+
+ЗАДАЧА:
+Проанализируй все ${statementFiles.length} банковские выписки (файлы уже прикреплены) и создай финансовый отчет по структуре из твоих инструкций.`
+            
+            console.log(`📝 Запрос к агенту:`)
+            console.log(reportRequest)
+            console.log(`\n⏱️ Запускаем Financial Analyst Agent...`)
+            
+            const startAnalysis = Date.now()
+            
+            // Добавляем таймаут на 30 минут для анализа банковских выписок (PDF анализ может быть долгим)
+            const TIMEOUT_MS = 30 * 60 * 1000 // 30 минут
+            const analysisTimeout = new Promise((_, reject) =>
+              setTimeout(() => reject(new Error(`Financial Analyst timeout (${TIMEOUT_MS/1000}s)`)), TIMEOUT_MS)
+            )
+            
+            // Функция для запуска Financial Analyst Agent через Agents SDK
+            const runWithAgentSDK = async () => {
+              try {
+                console.log(`🚀 Запускаем Financial Analyst Agent через Agents SDK...`)
+                
+                // Создаем агента с доступом только к банковским выпискам
+                const analystWithFiles = new Agent({
+                  ...financialAnalystAgent,
+                  tools: [codeInterpreterTool({ 
+                    container: { 
+                      type: 'auto', 
+                      file_ids: fileIds 
+                    } 
+                  })]
+                })
+                console.log(`✅ Financial Analyst Agent создан с файлами (model: ${financialAnalystAgent.model})`)
+                
+                // Создаем Runner
+                const reportRunner = new Runner({})
+                
+                console.log(`⚙️ Запускаем агента с запросом: "${reportRequest.substring(0, 100)}..."`)
+                
+                // Запускаем агента с одним сообщением пользователя
+                const result = await reportRunner.run(analystWithFiles, [{
+                  role: 'user',
+                  content: [{ type: 'input_text', text: reportRequest }]
+                }])
+                
+                console.log(`✅ Agent completed! Получено ${result.newItems.length} новых элементов`)
+                
+                return result
+              } catch (runError) {
+                console.error(`❌ Ошибка внутри runWithAgentSDK:`, runError.message)
+                console.error(`❌ Стек внутри runWithAgentSDK:`, runError.stack)
+                throw runError
+              }
+            }
+            
+            console.log(`⏳ Ожидание ответа от Financial Analyst Agent...`)
+            console.log(`🔄 Начинаем runWithAgentSDK через Agents SDK...`)
+            
+            // Запускаем с таймаутом
+            const reportResult = await Promise.race([
+              runWithAgentSDK(),
+              analysisTimeout
+            ])
+            
+            console.log(`✅ Financial Analyst Agent завершен успешно`)
+            const analysisTime = ((Date.now() - startAnalysis) / 1000).toFixed(2)
+            console.log(`⏱️ Анализ завершен за ${analysisTime}s`)
+            console.log(`📦 Получено элементов: ${reportResult.newItems.length}`)
+            console.log(`✅ Отчет успешно получен от OpenAI`)
+            
+            // Логируем структуру ответа для отладки
+            console.log(`🔍 Структура ответа (newItems: ${reportResult.newItems?.length || 0}):`)
+            
+            // Детальное логирование каждого элемента
+            reportResult.newItems?.forEach((item, i) => {
+              console.log(`\n📦 Элемент ${i}:`)
+              console.log(`  - role: ${item.rawItem?.role}`)
+              console.log(`  - content type: ${Array.isArray(item.rawItem?.content) ? 'array' : typeof item.rawItem?.content}`)
+              
+              if (Array.isArray(item.rawItem?.content)) {
+                item.rawItem.content.forEach((c, ci) => {
+                  console.log(`  - content[${ci}].type: ${c?.type}`)
+                  if (c?.type === 'text') {
+                    console.log(`  - content[${ci}].text length: ${c?.text?.length || 0}`)
+                    if (c?.text && typeof c.text === 'string') {
+                      console.log(`  - content[${ci}].text preview: ${c.text.substring(0, 100)}...`)
+                    } else if (c?.text && typeof c.text === 'object') {
+                      console.log(`  - content[${ci}].text is object: ${JSON.stringify(c.text).substring(0, 100)}...`)
+                    } else {
+                      console.log(`  - content[${ci}].text type: ${typeof c.text}`)
+                    }
+                  }
+                })
+              } else if (typeof item.rawItem?.content === 'string') {
+                console.log(`  - content (string) length: ${item.rawItem.content.length}`)
+                console.log(`  - content preview: ${item.rawItem.content.substring(0, 100)}...`)
+              }
+            })
+            
+            // Извлекаем отчет - пробуем все варианты
+            let report = null
+            
+            // Вариант 1: ищем последний assistant message с текстом
+            for (let i = reportResult.newItems.length - 1; i >= 0; i--) {
+              const item = reportResult.newItems[i]
+              if (item.rawItem?.role === 'assistant') {
+                console.log(`\n🔍 Проверяем элемент ${i} (assistant):`)
+                
+                // Проверяем разные форматы content
+                if (Array.isArray(item.rawItem.content)) {
+                  // content - массив объектов
+                  for (const contentItem of item.rawItem.content) {
+                    // Проверяем как 'text', так и 'output_text' типы
+                    if ((contentItem?.type === 'text' || contentItem?.type === 'output_text') && contentItem?.text) {
+                      if (typeof contentItem.text === 'string') {
+                        report = contentItem.text
+                        console.log(`✅ Найден отчет (${contentItem.type} type) в элементе ${i}, длина: ${report.length} символов`)
+                        break
+                      } else if (typeof contentItem.text === 'object' && contentItem.text.value) {
+                        report = contentItem.text.value
+                        console.log(`✅ Найден отчет (${contentItem.type}.text.value) в элементе ${i}, длина: ${report.length} символов`)
+                        break
+                      } else {
+                        console.log(`⚠️ contentItem.text не является строкой: ${typeof contentItem.text}`)
+                      }
+                    }
+                  }
+                } else if (typeof item.rawItem.content === 'string') {
+                  // content - строка
+                  report = item.rawItem.content
+                  console.log(`✅ Найден отчет (string) в элементе ${i}, длина: ${report.length} символов`)
+                }
+                
+                if (report) break
+              }
+            }
+            
+            // Вариант 2: если не нашли, пробуем через content.text.value для output_text
+            if (!report) {
+              console.log(`⚠️ Вариант 1 не сработал, пробуем альтернативные пути (output_text/text.value)...`)
+              for (let i = reportResult.newItems.length - 1; i >= 0; i--) {
+                const item = reportResult.newItems[i]
+                if (item.rawItem?.role === 'assistant' && item.rawItem.content) {
+                  for (const content of item.rawItem.content) {
+                    if ((content.type === 'text' || content.type === 'output_text') && content.text?.value) {
+                      report = content.text.value
+                      console.log(`✅ Найден отчет через ${content.type}.text.value в элементе ${i}`)
+                      break
+                    }
+                  }
+                  if (report) break
+                }
+              }
+            }
+            
+            // Вариант 3: если все еще не нашли, выводим полную структуру всех assistant messages
+            if (!report && reportResult.newItems.length > 0) {
+              console.log(`⚠️ Вариант 2 не сработал. Полная структура всех assistant messages:`)
+              reportResult.newItems.forEach((item, i) => {
+                if (item.rawItem?.role === 'assistant') {
+                  console.log(`\n--- Assistant message ${i} ---`)
+                  console.log(JSON.stringify(item.rawItem, null, 2))
+                }
+              })
+            }
+            
+            // Если все еще не нашли, устанавливаем дефолтное сообщение
+            if (!report) {
+              report = 'Отчет не сгенерирован - не удалось извлечь текст из ответа агента. Проверьте логи выше.'
+              console.error(`❌ Не удалось извлечь отчет из ${reportResult.newItems.length} элементов`)
+            }
+            
+            // Сохраняем отчет в БД
+            console.log(`💾 Сохраняем отчет в БД...`)
+            console.log(`📝 Длина отчета: ${report ? report.length : 0} символов`)
+            
+            const updateReport = db.prepare(`
+              UPDATE reports 
+              SET report_text = ?, status = 'completed', completed_at = CURRENT_TIMESTAMP
+              WHERE session_id = ?
+            `)
+            await updateReport.run(report, session)
+            console.log(`💾 Отчет сохранен в БД для сессии: ${session}`)
+            
+            // Проверяем что действительно сохранилось
+            const checkReport = db.prepare('SELECT status, LENGTH(report_text) as report_length FROM reports WHERE session_id = ?')
+            const checkResult = await checkReport.get(session)
+            console.log(`🔍 Проверка БД: статус=${checkResult?.status}, длина отчета=${checkResult?.report_length}`)
+            
+            console.log(`✅ Финансовый отчет сгенерирован и сохранен в БД для сессии ${session}`)
+            console.log(`📊 ========== ОТЧЕТ ДЛЯ МЕНЕДЖЕРА ==========`)
+            console.log(report.substring(0, 500) + '...')
+            console.log(`📊 ==========================================\n`)
+            
+          } catch (error) {
+            console.error(`❌ Ошибка генерации отчета:`, error.message)
+            console.error(`❌ Стек ошибки:`, error.stack)
+            
+            // Если это таймаут — НЕ помечаем отчет как error, оставляем status=generating.
+            // Агент мог продолжить выполнение в OpenAI, и отчет придет позже.
+            if (String(error.message || '').includes('timeout')) {
+              console.warn('⏳ Financial Analyst не успел за таймаут. Статус оставлен generating, отчет может появиться позже.')
+            } else {
+              // Сохраняем ошибку в БД
+              const updateError = db.prepare(`
+                UPDATE reports 
+                SET report_text = ?, status = 'error', completed_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+              `)
+              await updateError.run(`Ошибка генерации отчета: ${error.message}`, session)
+            }
+          } finally {
+            runningStatementsSessions.delete(session)
+          }
+        })
+
+        // Параллельно запускаем анализ налоговой и фин. отчетности
         setImmediate(async () => {
           try {
-            // === 1. Финансовый анализ банковских выписок ===
-            await generateFinancialReport(session, history, db)
-      
-            // === 2. Налоговый анализ ===
-            await generateTaxReport(session, db)
-      
-            // === 3. Анализ финансовой отчетности ===
-            await generateFinancialStatementsReport(session, db)
-      
-          } catch (error) {
-            console.error(`Критическая ошибка при запуске анализов:`, error)
+            // Проверка гвардов, чтобы исключить двойной запуск
+            if (runningTaxSessions.has(session)) {
+              console.log(`⏭️ Налоговый анализ уже запущен для ${session}, пропускаем`)
+              return
+            }
+            runningTaxSessions.add(session)
+            
+            // Если уже есть статус generating/completed, не запускаем
+            const existing = await db.prepare('SELECT tax_status FROM reports WHERE session_id = ?').get(session)
+            if (existing && (existing.tax_status === 'generating' || existing.tax_status === 'completed')) {
+              console.log(`⏭️ tax_status=${existing.tax_status} для ${session}, повторный запуск не требуется`)
+              runningTaxSessions.delete(session)
+              return
+            }
+            
+            // Устанавливаем статус generating АТОМАРНО (только если был pending/null)
+            const updateStatus = await db.prepare(`
+              UPDATE reports 
+              SET tax_status = 'generating' 
+              WHERE session_id = ? AND (tax_status IS NULL OR tax_status = 'pending')
+            `).run(session)
+            
+            if (updateStatus.changes === 0) {
+              console.log(`⏭️ tax_status уже установлен другим процессом для ${session}, пропускаем`)
+              runningTaxSessions.delete(session)
+              return
+            }
+            
+            // Собираем файлы налоговой отчетности
+            const taxFilesRows = await db.prepare(`
+              SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'taxes' ORDER BY uploaded_at ASC
+            `).all(session)
+            const taxFileIds = (taxFilesRows || []).map(r => r.file_id)
+            const taxYearsMissing = []
+            // Простая проверка покрытия двух лет по именам файлов
+            const yearNow = new Date().getFullYear()
+            const names = (taxFilesRows || []).map(r => (r.original_name || '').toLowerCase())
+            if (!names.some(n => n.includes(String(yearNow)))) taxYearsMissing.push(String(yearNow))
+            if (!names.some(n => n.includes(String(yearNow - 1)))) taxYearsMissing.push(String(yearNow - 1))
+            
+            await db.prepare(`UPDATE reports SET tax_missing_periods = ? WHERE session_id = ?`).run(
+              taxYearsMissing.length ? taxYearsMissing.join(',') : null, session
+            )
+            
+            if (taxFileIds.length > 0) {
+              const taxAgent = new Agent({
+                name: 'Tax Analyst',
+                instructions: `Ты налоговый аналитик. Проанализируй прикрепленные PDF-файлы налоговой отчетности.
+                Требования:
+                - Сфокусируйся на текущем и предыдущем годах
+                - Если какого-то года нет, упомяни, что данные неполные, но сделай анализ по имеющимся
+                - Сделай краткий вывод по налоговым обязательствам, начислениям, задолженностям, штрафам
+                - Используй четкую структуру, перечисления, суммы с тысячными разделителями.`,
+                model: 'gpt-5',
+                tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: taxFileIds } })],
+                modelSettings: { store: true }
+              })
+              const taxRunner = new Runner({})
+              try {
+                const TAX_TIMEOUT_MS = 30 * 60 * 1000
+                const taxResult = await Promise.race([
+                  taxRunner.run(taxAgent, [{ role: 'user', content: [{ type: 'input_text', text: 'Сделай анализ налоговой отчетности за текущий и предыдущий год.' }] }]),
+                  new Promise((_, reject) => setTimeout(() => reject(new Error(`Tax Analyst timeout (${TAX_TIMEOUT_MS/1000}s)`)), TAX_TIMEOUT_MS))
+                ])
+                let taxText = ''
+                for (let i = taxResult.newItems.length - 1; i >= 0; i--) {
+                  const it = taxResult.newItems[i]
+                  if (it.rawItem?.role === 'assistant') {
+                    const c = it.rawItem.content
+                    if (Array.isArray(c)) {
+                      const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
+                      taxText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
+                    } else if (typeof it.rawItem.content === 'string') {
+                      taxText = it.rawItem.content
+                    }
+                    if (taxText) break
+                  }
+                }
+                if (!taxText) taxText = 'Анализ налоговой отчетности не удалось извлечь из ответа агента.'
+                await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(taxText, session)
+              } catch (err) {
+                await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'error' WHERE session_id = ?`).run(`Ошибка анализа налогов: ${err.message}`, session)
+              }
+            } else {
+              await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = 'Файлы налоговой отчетности не найдены' WHERE session_id = ?`).run(session)
+            }
+          } catch (e) {
+            console.error('❌ Ошибка запуска налогового анализа:', e)
+          } finally {
+            runningTaxSessions.delete(session)
+          }
+        })
+
+        setImmediate(async () => {
+          try {
+            if (runningFsSessions.has(session)) {
+              console.log(`⏭️ Фин. анализ уже запущен для ${session}, пропускаем`)
+              return
+            }
+            runningFsSessions.add(session)
+            const existing = await db.prepare('SELECT fs_status FROM reports WHERE session_id = ?').get(session)
+            if (existing && (existing.fs_status === 'generating' || existing.fs_status === 'completed')) {
+              console.log(`⏭️ fs_status=${existing.fs_status} для ${session}, повторный запуск не требуется`)
+              runningFsSessions.delete(session)
+              return
+            }
+            
+            // Устанавливаем статус generating АТОМАРНО (только если был pending/null)
+            const updateStatus = await db.prepare(`
+              UPDATE reports 
+              SET fs_status = 'generating' 
+              WHERE session_id = ? AND (fs_status IS NULL OR fs_status = 'pending')
+            `).run(session)
+            
+            if (updateStatus.changes === 0) {
+              console.log(`⏭️ fs_status уже установлен другим процессом для ${session}, пропускаем`)
+              runningFsSessions.delete(session)
+              return
+            }
+            
+            // Собираем файлы финансовой отчетности
+            const fsFilesRows = await db.prepare(`
+              SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'financial' ORDER BY uploaded_at ASC
+            `).all(session)
+            const fsFileIds = (fsFilesRows || []).map(r => r.file_id)
+            const fsYearsMissing = []
+            const yearNow = new Date().getFullYear()
+            const names = (fsFilesRows || []).map(r => (r.original_name || '').toLowerCase())
+            if (!names.some(n => n.includes(String(yearNow)))) fsYearsMissing.push(String(yearNow))
+            if (!names.some(n => n.includes(String(yearNow - 1)))) fsYearsMissing.push(String(yearNow - 1))
+            await db.prepare(`UPDATE reports SET fs_missing_periods = ? WHERE session_id = ?`).run(
+              fsYearsMissing.length ? fsYearsMissing.join(',') : null, session
+            )
+            
+            // Фильтруем только XLSX файлы для анализа (остальные форматы не анализируем)
+            const xlsxFileIds = fsFileIds.filter((fileId, idx) => {
+              const fileName = (fsFilesRows[idx]?.original_name || '').toLowerCase()
+              return fileName.endsWith('.xlsx')
+            })
+            
+            console.log(`📊 Финансовые файлы: всего ${fsFileIds.length}, XLSX для анализа: ${xlsxFileIds.length}`)
+            
+            if (xlsxFileIds.length > 0) {
+              const fsAgent = new Agent({
+                name: 'Financial Statements Analyst',
+                instructions: `Ты аналитик финансовой отчетности. Проанализируй Баланс и ОПУ (P&L) в прикрепленных файлах.
+                Требования:
+                - Сфокусируйся на текущем и предыдущем годах
+                - Если какого-то года нет, явно укажи об этом и сделай анализ по имеющимся данным
+                - Дай ключевые метрики: выручка, валовая прибыль/маржа, операционная прибыль, чистая прибыль, активы/обязательства
+                - Выведи краткий вывод о динамике и рисках.`,
+                model: 'gpt-5',
+                tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: xlsxFileIds } })],
+                modelSettings: { store: true }
+              })
+              const fsRunner = new Runner({})
+              try {
+                const FS_TIMEOUT_MS = 30 * 60 * 1000
+                const fsResult = await Promise.race([
+                  fsRunner.run(fsAgent, [{ role: 'user', content: [{ type: 'input_text', text: 'Сделай анализ финансовой отчетности (Баланс и ОПУ) за текущий и предыдущий годы.' }] }]),
+                  new Promise((_, reject) => setTimeout(() => reject(new Error(`Financial Statements Analyst timeout (${FS_TIMEOUT_MS/1000}s)`)), FS_TIMEOUT_MS))
+                ])
+                let fsText = ''
+                for (let i = fsResult.newItems.length - 1; i >= 0; i--) {
+                  const it = fsResult.newItems[i]
+                  if (it.rawItem?.role === 'assistant') {
+                    const c = it.rawItem.content
+                    if (Array.isArray(c)) {
+                      const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
+                      fsText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
+                    } else if (typeof it.rawItem.content === 'string') {
+                      fsText = it.rawItem.content
+                    }
+                    if (fsText) break
+                  }
+                }
+                if (!fsText) fsText = 'Анализ финансовой отчетности не удалось извлечь из ответа агента.'
+                
+                // Добавляем информацию о некорректных форматах
+                const nonXlsxFiles = fsFilesRows.filter(f => !f.original_name.toLowerCase().endsWith('.xlsx'))
+                if (nonXlsxFiles.length > 0) {
+                  const nonXlsxNames = nonXlsxFiles.map(f => f.original_name).join(', ')
+                  fsText += `\n\n⚠️ Файлы некорректного формата (не проанализированы): ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX.`
+                }
+                
+                await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'completed' WHERE session_id = ?`).run(fsText, session)
+              } catch (err) {
+                await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'error' WHERE session_id = ?`).run(`Ошибка анализа фин. отчетности: ${err.message}`, session)
+              }
+            } else if (fsFileIds.length > 0 && xlsxFileIds.length === 0) {
+              // Есть файлы, но все некорректного формата
+              const nonXlsxNames = fsFilesRows.map(f => f.original_name).join(', ')
+              await db.prepare(`UPDATE reports SET fs_status = 'error', fs_report_text = ? WHERE session_id = ?`).run(
+                `Файлы некорректного формата: ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX (Excel).`,
+                session
+              )
+            } else {
+              await db.prepare(`UPDATE reports SET fs_status = 'error', fs_report_text = 'Файлы финансовой отчетности не найдены' WHERE session_id = ?`).run(session)
+            }
+          } catch (e) {
+            console.error('❌ Ошибка запуска анализа фин. отчетности:', e)
+          } finally {
+            runningFsSessions.delete(session)
           }
         })
       }
-
-// Извлечение текста из ответа агента (универсальная)
-function extractAgentText(items) {
-  for (let i = items.length - 1; i >= 0; i--) {
-    const item = items[i]
-    if (item.rawItem?.role !== 'assistant') continue
-
-    const content = item.rawItem.content
-    if (Array.isArray(content)) {
-      for (const c of content) {
-        if ((c.type === 'text' || c.type === 'output_text') && c.text) {
-          return typeof c.text === 'string' ? c.text : (c.text.value || '')
-        }
-      }
-    } else if (typeof content === 'string') {
-      return content
-    }
-  }
-  return null
-}
-
-// Запуск агента с таймаутом
-async function runAgentWithTimeout(agent, messages, timeoutMs) {
-  const runner = new Runner({})
-  const timeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(`Timeout ${timeoutMs / 1000}s`)), timeoutMs)
-  )
-  return Promise.race([runner.run(agent, messages), timeout])
-}
       
       // Возвращаем прогресс по факту загруженных файлов
       const progress = await getSessionProgress(session)
@@ -1266,82 +1917,6 @@ if (process.env.NODE_ENV === 'production') {
   })
 }
 
-// === АНАЛИЗЫ ===
-
-async function generateFinancialReport(session, history, db) {
-  const cleanup = () => runningStatementsSessions.delete(session)
-  if (!(await setStatusGenerating(db, session, 'status', runningStatementsSessions))) return
-
-  try {
-    // Получаем file_ids из БД
-    const files = await db.prepare('SELECT file_id FROM files WHERE session_id = ? AND category = ?').all(session, 'statements')
-    const fileIds = files.map(f => f.file_id)
-
-    if (fileIds.length === 0) {
-      await db.prepare('UPDATE reports SET status = ?, report_text = ? WHERE session_id = ?')
-        .run('completed', 'Банковские выписки не загружены.', session)
-      return
-    }
-
-    // Создаём Code Interpreter с файлами
-    const interpreter = codeInterpreterTool({
-      container: { type: 'auto', file_ids: fileIds }
-    })
-
-    const analystAgent = new Agent({
-      ...financialAnalystAgent,
-      tools: [interpreter]
-    })
-
-    const result = await runAgentWithTimeout(analystAgent, history, 20 * 60 * 1000)
-    const reportText = extractAgentText(result.newItems) || 'Отчёт не сформирован.'
-
-    await db.prepare(`
-      UPDATE reports 
-      SET status = 'completed', report_text = ?, completed_at = CURRENT_TIMESTAMP 
-      WHERE session_id = ?
-    `).run(reportText, session)
-
-    console.log(`[${session}] Финансовый отчёт сгенерирован`)
-  } catch (err) {
-    console.error(`[${session}] Ошибка анализа выписок:`, err)
-    await db.prepare('UPDATE reports SET status = ?, report_text = ? WHERE session_id = ?')
-      .run('error', 'Ошибка анализа выписок.', session)
-  } finally {
-    cleanup()
-  }
-}
-
-async function generateTaxReport(session, db) {
-  const cleanup = () => runningTaxSessions.delete(session)
-  if (!(await setStatusGenerating(db, session, 'tax_status', runningTaxSessions))) return
-
-  try {
-    // Логика налогового анализа
-    await db.prepare('UPDATE reports SET tax_status = ?, tax_report_text = ? WHERE session_id = ?')
-      .run('completed', 'Налоговый анализ завершён.', session)
-  } catch (err) {
-    console.error(`[${session}] Ошибка налогового анализа:`, err)
-  } finally {
-    cleanup()
-  }
-}
-
-async function generateFinancialStatementsReport(session, db) {
-  const cleanup = () => runningFsSessions.delete(session)
-  if (!(await setStatusGenerating(db, session, 'fs_status', runningFsSessions))) return
-
-  try {
-    // Логика анализа фин. отчетности
-    await db.prepare('UPDATE reports SET fs_status = ?, fs_report_text = ? WHERE session_id = ?')
-      .run('completed', 'Анализ финансовой отчётности завершён.', session)
-  } catch (err) {
-    console.error(`[${session}] Ошибка анализа фин. отчётности:`, err)
-  } finally {
-    cleanup()
-  }
-}
-
 const PORT = process.env.PORT || 8787
 app.listen(PORT, () => {
   console.log(`[server] listening on ${PORT}`)
@@ -1361,30 +1936,3 @@ process.on('SIGINT', () => {
   process.exit(0)
 })
 
-// === ГЛОБАЛЬНЫЕ УТИЛИТЫ ===
-async function setStatusGenerating(db, session, field, runningSet) {
-  if (runningSet.has(session)) {
-    console.log(`[${session}] Анализ уже запущен для ${field}, пропускаем`)
-    return false
-  }
-  runningSet.add(session)
-
-  const existing = await db.prepare(`SELECT ${field} FROM reports WHERE session_id = ?`).get(session)
-  if (existing && ['generating', 'completed'].includes(existing[field])) {
-    console.log(`[${session}] ${field}=${existing[field]}, повторный запуск не требуется`)
-    runningSet.delete(session)
-    return false
-  }
-
-  const update = await db.prepare(`
-    UPDATE reports SET ${field} = 'generating' 
-    WHERE session_id = ? AND (${field} IS NULL OR ${field} = 'pending')
-  `).run(session)
-
-  if (update.changes === 0) {
-    console.log(`[${session}] ${field} уже установлен другим процессом`)
-    runningSet.delete(session)
-    return false
-  }
-  return true
-}
