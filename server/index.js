@@ -1486,25 +1486,35 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               if (fsFileIds.length > 0) {
                 // Есть файлы, но все некорректного формата
                 const nonXlsxNames = fsFilesRows.map(f => f.original_name).join(', ')
+                // Создаем запись, если её нет
                 await db.prepare(`
                   INSERT INTO reports (session_id, fs_status, fs_report_text)
                   VALUES (?, 'error', ?)
-                  ON CONFLICT (session_id) DO UPDATE SET
-                    fs_status = 'error',
-                    fs_report_text = EXCLUDED.fs_report_text
-                  WHERE fs_status IS NULL OR fs_status = 'pending'
+                  ON CONFLICT (session_id) DO NOTHING
                 `).run(session, `Файлы некорректного формата: ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX (Excel).`)
+                // Обновляем только если статус был NULL или pending
+                await db.prepare(`
+                  UPDATE reports 
+                  SET fs_status = 'error', 
+                      fs_report_text = ?
+                  WHERE session_id = ? AND (fs_status IS NULL OR fs_status = 'pending')
+                `).run(`Файлы некорректного формата: ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX (Excel).`, session)
                 console.log(`⏭️ Нет XLSX файлов для анализа финансовой отчетности, установлен статус error`)
               } else {
                 // Нет файлов вообще
+                // Создаем запись, если её нет
                 await db.prepare(`
                   INSERT INTO reports (session_id, fs_status, fs_report_text)
                   VALUES (?, 'error', ?)
-                  ON CONFLICT (session_id) DO UPDATE SET
-                    fs_status = 'error',
-                    fs_report_text = EXCLUDED.fs_report_text
-                  WHERE fs_status IS NULL OR fs_status = 'pending'
+                  ON CONFLICT (session_id) DO NOTHING
                 `).run(session, 'Файлы финансовой отчетности не найдены')
+                // Обновляем только если статус был NULL или pending
+                await db.prepare(`
+                  UPDATE reports 
+                  SET fs_status = 'error', 
+                      fs_report_text = ?
+                  WHERE session_id = ? AND (fs_status IS NULL OR fs_status = 'pending')
+                `).run('Файлы финансовой отчетности не найдены', session)
                 console.log(`⏭️ Нет файлов финансовой отчетности, установлен статус error`)
               }
               return
