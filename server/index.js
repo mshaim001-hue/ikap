@@ -876,11 +876,10 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               return
             }
             
-            console.log(`📊 Генерация отчета с ${statementFiles.length} банковскими выписками (из ${allFiles.length} файлов)...`)
+            console.log(`📊 Генерация отчетов для ${statementFiles.length} банковских выписок (из ${allFiles.length} файлов)...`)
             console.log(`📎 Выписки для анализа:`, statementFiles)
             
-            // Извлекаем только fileId для передачи в агента
-            const fileIds = statementFiles.map(f => f.fileId)
+            // ИЗМЕНЕНИЕ: Каждый файл будет анализироваться отдельно
             
             // Извлекаем ключевую информацию из истории (без передачи всех сообщений)
             let amount = 'не указана'
@@ -1121,8 +1120,16 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             await insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, statementFiles.length, filesData)
             console.log(`💾 Заявка сохранена в БД: ${session}, выписок: ${statementFiles.length}`)
             
-            // Формируем компактный запрос
-            const reportRequest = `Создай подробный финансовый отчет на основе предоставленных банковских выписок.
+            // ИЗМЕНЕНИЕ: Анализируем каждый файл отдельно
+            const TIMEOUT_MS = 30 * 60 * 1000 // 30 минут на файл
+            const fileReports = [] // Массив отчетов для каждого файла
+            
+            // Функция для анализа одного файла
+            const analyzeSingleFile = async (file) => {
+              const fileStartTime = Date.now()
+              console.log(`\n📄 Анализируем файл: ${file.originalName} (${file.fileId})`)
+              
+              const reportRequest = `Создай подробный финансовый отчет на основе банковской выписки.
 
 ДАННЫЕ ЗАЯВКИ:
 - Компания (БИН): ${bin}
@@ -1132,195 +1139,125 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
 - Контакты: ${name}, ${email}, ${phone}
 
 ЗАДАЧА:
-Проанализируй все ${statementFiles.length} банковские выписки (файлы уже прикреплены) и создай финансовый отчет по структуре из твоих инструкций.`
-            
-            console.log(`📝 Запрос к агенту:`)
-            console.log(reportRequest)
-            console.log(`\n⏱️ Запускаем Financial Analyst Agent...`)
-            
-            const startAnalysis = Date.now()
-            
-            // Добавляем таймаут на 30 минут для анализа банковских выписок (PDF анализ может быть долгим)
-            const TIMEOUT_MS = 30 * 60 * 1000 // 30 минут
-            const analysisTimeout = new Promise((_, reject) =>
-              setTimeout(() => reject(new Error(`Financial Analyst timeout (${TIMEOUT_MS/1000}s)`)), TIMEOUT_MS)
-            )
-            
-            // Функция для запуска Financial Analyst Agent через Agents SDK
-            const runWithAgentSDK = async () => {
+Проанализируй банковскую выписку "${file.originalName}" (файл прикреплен) и создай финансовый отчет по структуре из твоих инструкций. Сфокусируйся на этом конкретном файле.`
+              
+              const analysisTimeout = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error(`Financial Analyst timeout для ${file.originalName} (${TIMEOUT_MS/1000}s)`)), TIMEOUT_MS)
+              )
+              
               try {
-                console.log(`🚀 Запускаем Financial Analyst Agent через Agents SDK...`)
-                
-                // Создаем агента с доступом только к банковским выпискам
-                const analystWithFiles = new Agent({
+                // Создаем агента с доступом только к одному файлу
+                const analystWithFile = new Agent({
                   ...financialAnalystAgent,
                   tools: [codeInterpreterTool({ 
                     container: { 
                       type: 'auto', 
-                      file_ids: fileIds 
+                      file_ids: [file.fileId] 
                     } 
                   })]
                 })
-                console.log(`✅ Financial Analyst Agent создан с файлами (model: ${financialAnalystAgent.model})`)
                 
-                // Создаем Runner
                 const reportRunner = new Runner({})
                 
-                console.log(`⚙️ Запускаем агента с запросом: "${reportRequest.substring(0, 100)}..."`)
+                console.log(`⚙️ Запускаем анализ файла "${file.originalName}"...`)
                 
-                // Запускаем агента с одним сообщением пользователя
-                const result = await reportRunner.run(analystWithFiles, [{
-                  role: 'user',
-                  content: [{ type: 'input_text', text: reportRequest }]
-                }])
+                const result = await Promise.race([
+                  reportRunner.run(analystWithFile, [{
+                    role: 'user',
+                    content: [{ type: 'input_text', text: reportRequest }]
+                  }]),
+                  analysisTimeout
+                ])
                 
-                console.log(`✅ Agent completed! Получено ${result.newItems.length} новых элементов`)
+                // Извлекаем отчет из результата
+                let report = null
+                for (let i = result.newItems.length - 1; i >= 0; i--) {
+                  const item = result.newItems[i]
+                  if (item.rawItem?.role === 'assistant') {
+                    if (Array.isArray(item.rawItem.content)) {
+                      for (const contentItem of item.rawItem.content) {
+                        if ((contentItem?.type === 'text' || contentItem?.type === 'output_text') && contentItem?.text) {
+                          if (typeof contentItem.text === 'string') {
+                            report = contentItem.text
+                            break
+                          } else if (typeof contentItem.text === 'object' && contentItem.text.value) {
+                            report = contentItem.text.value
+                            break
+                          }
+                        }
+                      }
+                    } else if (typeof item.rawItem.content === 'string') {
+                      report = item.rawItem.content
+                    }
+                    if (report) break
+                  }
+                }
                 
-                return result
-              } catch (runError) {
-                console.error(`❌ Ошибка внутри runWithAgentSDK:`, runError.message)
-                console.error(`❌ Стек внутри runWithAgentSDK:`, runError.stack)
-                throw runError
+                if (!report) {
+                  report = `Отчет для файла "${file.originalName}" не сгенерирован - не удалось извлечь текст из ответа агента.`
+                }
+                
+                const fileAnalysisTime = ((Date.now() - fileStartTime) / 1000).toFixed(2)
+                console.log(`✅ Анализ файла "${file.originalName}" завершен за ${fileAnalysisTime}s`)
+                
+                return {
+                  fileId: file.fileId,
+                  fileName: file.originalName,
+                  report: report
+                }
+              } catch (error) {
+                console.error(`❌ Ошибка анализа файла "${file.originalName}":`, error.message)
+                return {
+                  fileId: file.fileId,
+                  fileName: file.originalName,
+                  report: `Ошибка анализа файла "${file.originalName}": ${error.message}`
+                }
               }
             }
             
-            console.log(`⏳ Ожидание ответа от Financial Analyst Agent...`)
-            console.log(`🔄 Начинаем runWithAgentSDK через Agents SDK...`)
+            // Анализируем все файлы параллельно
+            console.log(`\n🚀 Запускаем анализ ${statementFiles.length} файлов параллельно...`)
+            const analysisPromises = statementFiles.map(file => analyzeSingleFile(file))
+            const results = await Promise.allSettled(analysisPromises)
             
-            // Запускаем с таймаутом
-            const reportResult = await Promise.race([
-              runWithAgentSDK(),
-              analysisTimeout
-            ])
-            
-            console.log(`✅ Financial Analyst Agent завершен успешно`)
-            const analysisTime = ((Date.now() - startAnalysis) / 1000).toFixed(2)
-            console.log(`⏱️ Анализ завершен за ${analysisTime}s`)
-            console.log(`📦 Получено элементов: ${reportResult.newItems.length}`)
-            console.log(`✅ Отчет успешно получен от OpenAI`)
-            
-            // Логируем структуру ответа для отладки
-            console.log(`🔍 Структура ответа (newItems: ${reportResult.newItems?.length || 0}):`)
-            
-            // Детальное логирование каждого элемента
-            reportResult.newItems?.forEach((item, i) => {
-              console.log(`\n📦 Элемент ${i}:`)
-              console.log(`  - role: ${item.rawItem?.role}`)
-              console.log(`  - content type: ${Array.isArray(item.rawItem?.content) ? 'array' : typeof item.rawItem?.content}`)
-              
-              if (Array.isArray(item.rawItem?.content)) {
-                item.rawItem.content.forEach((c, ci) => {
-                  console.log(`  - content[${ci}].type: ${c?.type}`)
-                  if (c?.type === 'text') {
-                    console.log(`  - content[${ci}].text length: ${c?.text?.length || 0}`)
-                    if (c?.text && typeof c.text === 'string') {
-                      console.log(`  - content[${ci}].text preview: ${c.text.substring(0, 100)}...`)
-                    } else if (c?.text && typeof c.text === 'object') {
-                      console.log(`  - content[${ci}].text is object: ${JSON.stringify(c.text).substring(0, 100)}...`)
-                    } else {
-                      console.log(`  - content[${ci}].text type: ${typeof c.text}`)
-                    }
-                  }
+            // Собираем успешные отчеты
+            results.forEach((result, index) => {
+              if (result.status === 'fulfilled') {
+                fileReports.push(result.value)
+                console.log(`✅ Отчет ${index + 1}/${statementFiles.length} готов: ${result.value.fileName}`)
+              } else {
+                const file = statementFiles[index]
+                fileReports.push({
+                  fileId: file.fileId,
+                  fileName: file.originalName,
+                  report: `Ошибка анализа: ${result.reason?.message || 'Неизвестная ошибка'}`
                 })
-              } else if (typeof item.rawItem?.content === 'string') {
-                console.log(`  - content (string) length: ${item.rawItem.content.length}`)
-                console.log(`  - content preview: ${item.rawItem.content.substring(0, 100)}...`)
+                console.error(`❌ Ошибка анализа файла ${file.originalName}:`, result.reason)
               }
             })
             
-            // Извлекаем отчет - пробуем все варианты
-            let report = null
+            // Объединяем все отчеты в один текст
+            const combinedReport = fileReports.map((fr, idx) => {
+              return `\n\n${'='.repeat(80)}\nОТЧЕТ ${idx + 1} из ${fileReports.length}\nФайл: ${fr.fileName}\n${'='.repeat(80)}\n\n${fr.report}`
+            }).join('\n\n')
             
-            // Вариант 1: ищем последний assistant message с текстом
-            for (let i = reportResult.newItems.length - 1; i >= 0; i--) {
-              const item = reportResult.newItems[i]
-              if (item.rawItem?.role === 'assistant') {
-                console.log(`\n🔍 Проверяем элемент ${i} (assistant):`)
-                
-                // Проверяем разные форматы content
-                if (Array.isArray(item.rawItem.content)) {
-                  // content - массив объектов
-                  for (const contentItem of item.rawItem.content) {
-                    // Проверяем как 'text', так и 'output_text' типы
-                    if ((contentItem?.type === 'text' || contentItem?.type === 'output_text') && contentItem?.text) {
-                      if (typeof contentItem.text === 'string') {
-                        report = contentItem.text
-                        console.log(`✅ Найден отчет (${contentItem.type} type) в элементе ${i}, длина: ${report.length} символов`)
-                        break
-                      } else if (typeof contentItem.text === 'object' && contentItem.text.value) {
-                        report = contentItem.text.value
-                        console.log(`✅ Найден отчет (${contentItem.type}.text.value) в элементе ${i}, длина: ${report.length} символов`)
-                        break
-                      } else {
-                        console.log(`⚠️ contentItem.text не является строкой: ${typeof contentItem.text}`)
-                      }
-                    }
-                  }
-                } else if (typeof item.rawItem.content === 'string') {
-                  // content - строка
-                  report = item.rawItem.content
-                  console.log(`✅ Найден отчет (string) в элементе ${i}, длина: ${report.length} символов`)
-                }
-                
-                if (report) break
-              }
-            }
-            
-            // Вариант 2: если не нашли, пробуем через content.text.value для output_text
-            if (!report) {
-              console.log(`⚠️ Вариант 1 не сработал, пробуем альтернативные пути (output_text/text.value)...`)
-              for (let i = reportResult.newItems.length - 1; i >= 0; i--) {
-                const item = reportResult.newItems[i]
-                if (item.rawItem?.role === 'assistant' && item.rawItem.content) {
-                  for (const content of item.rawItem.content) {
-                    if ((content.type === 'text' || content.type === 'output_text') && content.text?.value) {
-                      report = content.text.value
-                      console.log(`✅ Найден отчет через ${content.type}.text.value в элементе ${i}`)
-                      break
-                    }
-                  }
-                  if (report) break
-                }
-              }
-            }
-            
-            // Вариант 3: если все еще не нашли, выводим полную структуру всех assistant messages
-            if (!report && reportResult.newItems.length > 0) {
-              console.log(`⚠️ Вариант 2 не сработал. Полная структура всех assistant messages:`)
-              reportResult.newItems.forEach((item, i) => {
-                if (item.rawItem?.role === 'assistant') {
-                  console.log(`\n--- Assistant message ${i} ---`)
-                  console.log(JSON.stringify(item.rawItem, null, 2))
-                }
-              })
-            }
-            
-            // Если все еще не нашли, устанавливаем дефолтное сообщение
-            if (!report) {
-              report = 'Отчет не сгенерирован - не удалось извлечь текст из ответа агента. Проверьте логи выше.'
-              console.error(`❌ Не удалось извлечь отчет из ${reportResult.newItems.length} элементов`)
-            }
-            
-            // Сохраняем отчет в БД
-            console.log(`💾 Сохраняем отчет в БД...`)
-            console.log(`📝 Длина отчета: ${report ? report.length : 0} символов`)
-            
+            // Сохраняем объединенный отчет в БД
+            console.log(`💾 Сохраняем ${fileReports.length} отчетов в БД...`)
             const updateReport = db.prepare(`
               UPDATE reports 
               SET report_text = ?, status = 'completed', completed_at = CURRENT_TIMESTAMP
               WHERE session_id = ?
             `)
-            await updateReport.run(report, session)
-            console.log(`💾 Отчет сохранен в БД для сессии: ${session}`)
+            await updateReport.run(combinedReport, session)
+            console.log(`💾 Отчеты сохранены в БД для сессии: ${session}`)
             
-            // Проверяем что действительно сохранилось
-            const checkReport = db.prepare('SELECT status, LENGTH(report_text) as report_length FROM reports WHERE session_id = ?')
-            const checkResult = await checkReport.get(session)
-            console.log(`🔍 Проверка БД: статус=${checkResult?.status}, длина отчета=${checkResult?.report_length}`)
-            
-            console.log(`✅ Финансовый отчет сгенерирован и сохранен в БД для сессии ${session}`)
-            console.log(`📊 ========== ОТЧЕТ ДЛЯ МЕНЕДЖЕРА ==========`)
-            console.log(report.substring(0, 500) + '...')
+            console.log(`✅ Финансовые отчеты сгенерированы для всех ${fileReports.length} файлов`)
+            console.log(`📊 ========== ОТЧЕТЫ ДЛЯ МЕНЕДЖЕРА ==========`)
+            console.log(`Всего отчетов: ${fileReports.length}`)
+            fileReports.forEach((fr, idx) => {
+              console.log(`\nОтчет ${idx + 1}: ${fr.fileName}`)
+              console.log(fr.report.substring(0, 200) + '...')
+            })
             console.log(`📊 ==========================================\n`)
             
           } catch (error) {
@@ -1379,44 +1316,123 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             )
             
             if (taxFileIds.length > 0) {
-              const taxAgent = new Agent({
-                name: 'Tax Analyst',
-                instructions: `Ты налоговый аналитик. Проанализируй прикрепленные PDF-файлы налоговой отчетности.
-                Требования:
-                - Сфокусируйся на текущем и предыдущем годах
-                - Если какого-то года нет, упомяни, что данные неполные, но сделай анализ по имеющимся
-                - Сделай краткий вывод по налоговым обязательствам, начислениям, задолженностям, штрафам
-                - Используй четкую структуру, перечисления, суммы с тысячными разделителями.`,
-                model: 'gpt-5',
-                tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: taxFileIds } })],
-                modelSettings: { store: true }
-              })
-              const taxRunner = new Runner({})
-              try {
-                const TAX_TIMEOUT_MS = 30 * 60 * 1000
-                const taxResult = await Promise.race([
-                  taxRunner.run(taxAgent, [{ role: 'user', content: [{ type: 'input_text', text: 'Сделай анализ налоговой отчетности за текущий и предыдущий год.' }] }]),
-                  new Promise((_, reject) => setTimeout(() => reject(new Error(`Tax Analyst timeout (${TAX_TIMEOUT_MS/1000}s)`)), TAX_TIMEOUT_MS))
-                ])
-                let taxText = ''
-                for (let i = taxResult.newItems.length - 1; i >= 0; i--) {
-                  const it = taxResult.newItems[i]
-                  if (it.rawItem?.role === 'assistant') {
-                    const c = it.rawItem.content
-                    if (Array.isArray(c)) {
-                      const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
-                      taxText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
-                    } else if (typeof it.rawItem.content === 'string') {
-                      taxText = it.rawItem.content
+              // ИЗМЕНЕНИЕ: Анализируем каждый файл отдельно
+              const TAX_TIMEOUT_MS = 30 * 60 * 1000 // 30 минут на файл
+              const taxFileReports = [] // Массив отчетов для каждого файла
+              
+              // Преобразуем в удобный формат
+              const taxFiles = taxFilesRows.map(r => ({
+                fileId: r.file_id,
+                originalName: r.original_name
+              }))
+              
+              // Функция для анализа одного файла налоговой отчетности
+              const analyzeSingleTaxFile = async (file) => {
+                const fileStartTime = Date.now()
+                console.log(`\n📄 Анализируем налоговый файл: ${file.originalName} (${file.fileId})`)
+                
+                const taxRequest = `Сделай анализ налоговой отчетности для файла "${file.originalName}".
+Требования:
+- Сфокусируйся на текущем и предыдущем годах
+- Если какого-то года нет, упомяни, что данные неполные, но сделай анализ по имеющимся
+- Сделай краткий вывод по налоговым обязательствам, начислениям, задолженностям, штрафам
+- Используй четкую структуру, перечисления, суммы с тысячными разделителями.
+Файл прикреплен.`
+                
+                const analysisTimeout = new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error(`Tax Analyst timeout для ${file.originalName} (${TAX_TIMEOUT_MS/1000}s)`)), TAX_TIMEOUT_MS)
+                )
+                
+                try {
+                  const taxAgent = new Agent({
+                    name: 'Tax Analyst',
+                    instructions: `Ты налоговый аналитик. Проанализируй прикрепленный PDF-файл налоговой отчетности.
+                    Требования:
+                    - Сфокусируйся на текущем и предыдущем годах
+                    - Если какого-то года нет, упомяни, что данные неполные, но сделай анализ по имеющимся
+                    - Сделай краткий вывод по налоговым обязательствам, начислениям, задолженностям, штрафам
+                    - Используй четкую структуру, перечисления, суммы с тысячными разделителями.`,
+                    model: 'gpt-5',
+                    tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [file.fileId] } })],
+                    modelSettings: { store: true }
+                  })
+                  const taxRunner = new Runner({})
+                  
+                  console.log(`⚙️ Запускаем анализ налогового файла "${file.originalName}"...`)
+                  
+                  const result = await Promise.race([
+                    taxRunner.run(taxAgent, [{ role: 'user', content: [{ type: 'input_text', text: taxRequest }] }]),
+                    analysisTimeout
+                  ])
+                  
+                  // Извлекаем отчет
+                  let taxText = ''
+                  for (let i = result.newItems.length - 1; i >= 0; i--) {
+                    const it = result.newItems[i]
+                    if (it.rawItem?.role === 'assistant') {
+                      const c = it.rawItem.content
+                      if (Array.isArray(c)) {
+                        const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
+                        taxText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
+                      } else if (typeof it.rawItem.content === 'string') {
+                        taxText = it.rawItem.content
+                      }
+                      if (taxText) break
                     }
-                    if (taxText) break
+                  }
+                  
+                  if (!taxText) {
+                    taxText = `Анализ налоговой отчетности для файла "${file.originalName}" не удалось извлечь из ответа агента.`
+                  }
+                  
+                  const fileAnalysisTime = ((Date.now() - fileStartTime) / 1000).toFixed(2)
+                  console.log(`✅ Анализ налогового файла "${file.originalName}" завершен за ${fileAnalysisTime}s`)
+                  
+                  return {
+                    fileId: file.fileId,
+                    fileName: file.originalName,
+                    report: taxText
+                  }
+                } catch (error) {
+                  console.error(`❌ Ошибка анализа налогового файла "${file.originalName}":`, error.message)
+                  return {
+                    fileId: file.fileId,
+                    fileName: file.originalName,
+                    report: `Ошибка анализа файла "${file.originalName}": ${error.message}`
                   }
                 }
-                if (!taxText) taxText = 'Анализ налоговой отчетности не удалось извлечь из ответа агента.'
-                await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(taxText, session)
-              } catch (err) {
-                await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'error' WHERE session_id = ?`).run(`Ошибка анализа налогов: ${err.message}`, session)
               }
+              
+              // Анализируем все файлы параллельно
+              console.log(`\n🚀 Запускаем анализ ${taxFiles.length} налоговых файлов параллельно...`)
+              const taxAnalysisPromises = taxFiles.map(file => analyzeSingleTaxFile(file))
+              const taxResults = await Promise.allSettled(taxAnalysisPromises)
+              
+              // Собираем успешные отчеты
+              taxResults.forEach((result, index) => {
+                if (result.status === 'fulfilled') {
+                  taxFileReports.push(result.value)
+                  console.log(`✅ Налоговый отчет ${index + 1}/${taxFiles.length} готов: ${result.value.fileName}`)
+                } else {
+                  const file = taxFiles[index]
+                  taxFileReports.push({
+                    fileId: file.fileId,
+                    fileName: file.originalName,
+                    report: `Ошибка анализа: ${result.reason?.message || 'Неизвестная ошибка'}`
+                  })
+                  console.error(`❌ Ошибка анализа налогового файла ${file.originalName}:`, result.reason)
+                }
+              })
+              
+              // Объединяем все отчеты в один текст
+              const combinedTaxReport = taxFileReports.map((fr, idx) => {
+                return `\n\n${'='.repeat(80)}\nОТЧЕТ ${idx + 1} из ${taxFileReports.length}\nФайл: ${fr.fileName}\n${'='.repeat(80)}\n\n${fr.report}`
+              }).join('\n\n')
+              
+              // Сохраняем объединенный отчет в БД
+              console.log(`💾 Сохраняем ${taxFileReports.length} налоговых отчетов в БД...`)
+              await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(combinedTaxReport, session)
+              console.log(`✅ Налоговые отчеты сгенерированы для всех ${taxFileReports.length} файлов`)
             } else {
               await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = 'Файлы налоговой отчетности не найдены' WHERE session_id = ?`).run(session)
             }
@@ -1455,61 +1471,135 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             )
             
             // Фильтруем только XLSX файлы для анализа (остальные форматы не анализируем)
-            const xlsxFileIds = fsFileIds.filter((fileId, idx) => {
-              const fileName = (fsFilesRows[idx]?.original_name || '').toLowerCase()
-              return fileName.endsWith('.xlsx')
-            })
+            const xlsxFiles = fsFilesRows.filter(f => f.original_name.toLowerCase().endsWith('.xlsx'))
+            const nonXlsxFiles = fsFilesRows.filter(f => !f.original_name.toLowerCase().endsWith('.xlsx'))
             
-            console.log(`📊 Финансовые файлы: всего ${fsFileIds.length}, XLSX для анализа: ${xlsxFileIds.length}`)
+            console.log(`📊 Финансовые файлы: всего ${fsFileIds.length}, XLSX для анализа: ${xlsxFiles.length}`)
             
-            if (xlsxFileIds.length > 0) {
-              const fsAgent = new Agent({
-                name: 'Financial Statements Analyst',
-                instructions: `Ты аналитик финансовой отчетности. Проанализируй Баланс и ОПУ (P&L) в прикрепленных файлах.
-                Требования:
-                - Сфокусируйся на текущем и предыдущем годах
-                - Если какого-то года нет, явно укажи об этом и сделай анализ по имеющимся данным
-                - Дай ключевые метрики: выручка, валовая прибыль/маржа, операционная прибыль, чистая прибыль, активы/обязательства
-                - Выведи краткий вывод о динамике и рисках.`,
-                model: 'gpt-5',
-                tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: xlsxFileIds } })],
-                modelSettings: { store: true }
-              })
-              const fsRunner = new Runner({})
-              try {
-                const FS_TIMEOUT_MS = 30 * 60 * 1000
-                const fsResult = await Promise.race([
-                  fsRunner.run(fsAgent, [{ role: 'user', content: [{ type: 'input_text', text: 'Сделай анализ финансовой отчетности (Баланс и ОПУ) за текущий и предыдущий годы.' }] }]),
-                  new Promise((_, reject) => setTimeout(() => reject(new Error(`Financial Statements Analyst timeout (${FS_TIMEOUT_MS/1000}s)`)), FS_TIMEOUT_MS))
-                ])
-                let fsText = ''
-                for (let i = fsResult.newItems.length - 1; i >= 0; i--) {
-                  const it = fsResult.newItems[i]
-                  if (it.rawItem?.role === 'assistant') {
-                    const c = it.rawItem.content
-                    if (Array.isArray(c)) {
-                      const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
-                      fsText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
-                    } else if (typeof it.rawItem.content === 'string') {
-                      fsText = it.rawItem.content
+            if (xlsxFiles.length > 0) {
+              // ИЗМЕНЕНИЕ: Анализируем каждый файл отдельно
+              const FS_TIMEOUT_MS = 30 * 60 * 1000 // 30 минут на файл
+              const fsFileReports = [] // Массив отчетов для каждого файла
+              
+              // Преобразуем в удобный формат
+              const formattedFsFiles = xlsxFiles.map(r => ({
+                fileId: r.file_id,
+                originalName: r.original_name
+              }))
+              
+              // Функция для анализа одного файла финансовой отчетности
+              const analyzeSingleFsFile = async (file) => {
+                const fileStartTime = Date.now()
+                console.log(`\n📄 Анализируем финансовый файл: ${file.originalName} (${file.fileId})`)
+                
+                const fsRequest = `Сделай анализ финансовой отчетности для файла "${file.originalName}".
+Требования:
+- Сфокусируйся на текущем и предыдущем годах
+- Если какого-то года нет, явно укажи об этом и сделай анализ по имеющимся данным
+- Дай ключевые метрики: выручка, валовая прибыль/маржа, операционная прибыль, чистая прибыль, активы/обязательства
+- Выведи краткий вывод о динамике и рисках.
+Файл прикреплен.`
+                
+                const analysisTimeout = new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error(`Financial Statements Analyst timeout для ${file.originalName} (${FS_TIMEOUT_MS/1000}s)`)), FS_TIMEOUT_MS)
+                )
+                
+                try {
+                  const fsAgent = new Agent({
+                    name: 'Financial Statements Analyst',
+                    instructions: `Ты аналитик финансовой отчетности. Проанализируй Баланс и ОПУ (P&L) в прикрепленном файле.
+                    Требования:
+                    - Сфокусируйся на текущем и предыдущем годах
+                    - Если какого-то года нет, явно укажи об этом и сделай анализ по имеющимся данным
+                    - Дай ключевые метрики: выручка, валовая прибыль/маржа, операционная прибыль, чистая прибыль, активы/обязательства
+                    - Выведи краткий вывод о динамике и рисках.`,
+                    model: 'gpt-5',
+                    tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [file.fileId] } })],
+                    modelSettings: { store: true }
+                  })
+                  const fsRunner = new Runner({})
+                  
+                  console.log(`⚙️ Запускаем анализ финансового файла "${file.originalName}"...`)
+                  
+                  const result = await Promise.race([
+                    fsRunner.run(fsAgent, [{ role: 'user', content: [{ type: 'input_text', text: fsRequest }] }]),
+                    analysisTimeout
+                  ])
+                  
+                  // Извлекаем отчет
+                  let fsText = ''
+                  for (let i = result.newItems.length - 1; i >= 0; i--) {
+                    const it = result.newItems[i]
+                    if (it.rawItem?.role === 'assistant') {
+                      const c = it.rawItem.content
+                      if (Array.isArray(c)) {
+                        const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
+                        fsText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
+                      } else if (typeof it.rawItem.content === 'string') {
+                        fsText = it.rawItem.content
+                      }
+                      if (fsText) break
                     }
-                    if (fsText) break
+                  }
+                  
+                  if (!fsText) {
+                    fsText = `Анализ финансовой отчетности для файла "${file.originalName}" не удалось извлечь из ответа агента.`
+                  }
+                  
+                  const fileAnalysisTime = ((Date.now() - fileStartTime) / 1000).toFixed(2)
+                  console.log(`✅ Анализ финансового файла "${file.originalName}" завершен за ${fileAnalysisTime}s`)
+                  
+                  return {
+                    fileId: file.fileId,
+                    fileName: file.originalName,
+                    report: fsText
+                  }
+                } catch (error) {
+                  console.error(`❌ Ошибка анализа финансового файла "${file.originalName}":`, error.message)
+                  return {
+                    fileId: file.fileId,
+                    fileName: file.originalName,
+                    report: `Ошибка анализа файла "${file.originalName}": ${error.message}`
                   }
                 }
-                if (!fsText) fsText = 'Анализ финансовой отчетности не удалось извлечь из ответа агента.'
-                
-                // Добавляем информацию о некорректных форматах
-                const nonXlsxFiles = fsFilesRows.filter(f => !f.original_name.toLowerCase().endsWith('.xlsx'))
-                if (nonXlsxFiles.length > 0) {
-                  const nonXlsxNames = nonXlsxFiles.map(f => f.original_name).join(', ')
-                  fsText += `\n\n⚠️ Файлы некорректного формата (не проанализированы): ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX.`
-                }
-                
-                await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'completed' WHERE session_id = ?`).run(fsText, session)
-              } catch (err) {
-                await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'error' WHERE session_id = ?`).run(`Ошибка анализа фин. отчетности: ${err.message}`, session)
               }
-            } else if (fsFileIds.length > 0 && xlsxFileIds.length === 0) {
+              
+              // Анализируем все файлы параллельно
+              console.log(`\n🚀 Запускаем анализ ${formattedFsFiles.length} финансовых файлов параллельно...`)
+              const fsAnalysisPromises = formattedFsFiles.map(file => analyzeSingleFsFile(file))
+              const fsResults = await Promise.allSettled(fsAnalysisPromises)
+              
+              // Собираем успешные отчеты
+              fsResults.forEach((result, index) => {
+                if (result.status === 'fulfilled') {
+                  fsFileReports.push(result.value)
+                  console.log(`✅ Финансовый отчет ${index + 1}/${formattedFsFiles.length} готов: ${result.value.fileName}`)
+                } else {
+                  const file = formattedFsFiles[index]
+                  fsFileReports.push({
+                    fileId: file.fileId,
+                    fileName: file.originalName,
+                    report: `Ошибка анализа: ${result.reason?.message || 'Неизвестная ошибка'}`
+                  })
+                  console.error(`❌ Ошибка анализа финансового файла ${file.originalName}:`, result.reason)
+                }
+              })
+              
+              // Добавляем информацию о некорректных форматах
+              let combinedFsReport = fsFileReports.map((fr, idx) => {
+                return `\n\n${'='.repeat(80)}\nОТЧЕТ ${idx + 1} из ${fsFileReports.length}\nФайл: ${fr.fileName}\n${'='.repeat(80)}\n\n${fr.report}`
+              }).join('\n\n')
+              
+              if (nonXlsxFiles.length > 0) {
+                const nonXlsxNames = nonXlsxFiles.map(f => f.original_name).join(', ')
+                combinedFsReport += `\n\n⚠️ Файлы некорректного формата (не проанализированы): ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX.`
+              }
+              
+              // Сохраняем объединенный отчет в БД
+              console.log(`💾 Сохраняем ${fsFileReports.length} финансовых отчетов в БД...`)
+              await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'completed' WHERE session_id = ?`).run(combinedFsReport, session)
+              console.log(`✅ Финансовые отчеты сгенерированы для всех ${fsFileReports.length} файлов`)
+            } else if (fsFileIds.length > 0 && xlsxFiles.length === 0) {
               // Есть файлы, но все некорректного формата
               const nonXlsxNames = fsFilesRows.map(f => f.original_name).join(', ')
               await db.prepare(`UPDATE reports SET fs_status = 'error', fs_report_text = ? WHERE session_id = ?`).run(
