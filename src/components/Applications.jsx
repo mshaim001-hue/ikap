@@ -598,7 +598,43 @@ const Applications = () => {
                       </button>
                     </div>
                     <div className="report-modal-body">
-                      <pre className="report-text">{selectedApplication.reportText}</pre>
+                      {(() => {
+                        // Парсим объединенный отчет на отдельные отчеты по файлам
+                        const reportText = selectedApplication.reportText || ''
+                        // Разделяем по паттерну "ОТЧЕТ X из Y\nФайл: имя\n===...\n"
+                        const reportSections = reportText.split(/\n\n={80,}\nОТЧЕТ\s+\d+\s+из\s+\d+\nФайл:\s*(.+?)\n={80,}\n\n/)
+                        
+                        if (reportSections.length > 1) {
+                          // Парсим заголовки отдельно
+                          const matches = [...reportText.matchAll(/\n\n={80,}\nОТЧЕТ\s+(\d+)\s+из\s+(\d+)\nФайл:\s*(.+?)\n={80,}\n\n/g)]
+                          
+                          return (
+                            <div className="reports-list">
+                              {matches.map((match, idx) => {
+                                const reportNum = match[1]
+                                const totalNum = match[2]
+                                const fileName = match[3]
+                                const startIndex = match.index + match[0].length
+                                const endIndex = idx < matches.length - 1 ? matches[idx + 1].index : reportText.length
+                                const reportContent = reportText.substring(startIndex, endIndex).trim()
+                                
+                                return (
+                                  <div key={idx} className="report-file-section">
+                                    <div className="report-file-header">
+                                      <FileText size={16} />
+                                      <h4>Отчет {reportNum} из {totalNum}: {fileName}</h4>
+                                    </div>
+                                    <pre className="report-text">{reportContent}</pre>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          )
+                        } else {
+                          // Если разделителей нет - показываем как есть
+                          return <pre className="report-text">{reportText}</pre>
+                        }
+                      })()}
                     </div>
                   </div>
                 </div>
@@ -612,7 +648,41 @@ const Applications = () => {
                       <button onClick={() => setShowTaxModal(false)} className="report-modal-close">×</button>
                     </div>
                     <div className="report-modal-body">
-                      <pre className="report-text">{selectedApplication.taxReportText || 'Анализ не готов'}</pre>
+                      {(() => {
+                        const taxReportText = selectedApplication.taxReportText || ''
+                        if (!taxReportText || taxReportText === 'Анализ не готов') {
+                          return <pre className="report-text">Анализ не готов</pre>
+                        }
+                        
+                        const matches = [...taxReportText.matchAll(/\n\n={80,}\nОТЧЕТ\s+(\d+)\s+из\s+(\d+)\nФайл:\s*(.+?)\n={80,}\n\n/g)]
+                        
+                        if (matches.length > 0) {
+                          return (
+                            <div className="reports-list">
+                              {matches.map((match, idx) => {
+                                const reportNum = match[1]
+                                const totalNum = match[2]
+                                const fileName = match[3]
+                                const startIndex = match.index + match[0].length
+                                const endIndex = idx < matches.length - 1 ? matches[idx + 1].index : taxReportText.length
+                                const reportContent = taxReportText.substring(startIndex, endIndex).trim()
+                                
+                                return (
+                                  <div key={idx} className="report-file-section">
+                                    <div className="report-file-header">
+                                      <FileText size={16} />
+                                      <h4>Отчет {reportNum} из {totalNum}: {fileName}</h4>
+                                    </div>
+                                    <pre className="report-text">{reportContent}</pre>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          )
+                        } else {
+                          return <pre className="report-text">{taxReportText}</pre>
+                        }
+                      })()}
                     </div>
                   </div>
                 </div>
@@ -626,7 +696,41 @@ const Applications = () => {
                       <button onClick={() => setShowFsModal(false)} className="report-modal-close">×</button>
                     </div>
                     <div className="report-modal-body">
-                      <pre className="report-text">{selectedApplication.fsReportText || 'Анализ не готов'}</pre>
+                      {(() => {
+                        const fsReportText = selectedApplication.fsReportText || ''
+                        if (!fsReportText || fsReportText === 'Анализ не готов') {
+                          return <pre className="report-text">Анализ не готов</pre>
+                        }
+                        
+                        const matches = [...fsReportText.matchAll(/\n\n={80,}\nОТЧЕТ\s+(\d+)\s+из\s+(\d+)\nФайл:\s*(.+?)\n={80,}\n\n/g)]
+                        
+                        if (matches.length > 0) {
+                          return (
+                            <div className="reports-list">
+                              {matches.map((match, idx) => {
+                                const reportNum = match[1]
+                                const totalNum = match[2]
+                                const fileName = match[3]
+                                const startIndex = match.index + match[0].length
+                                const endIndex = idx < matches.length - 1 ? matches[idx + 1].index : fsReportText.length
+                                const reportContent = fsReportText.substring(startIndex, endIndex).trim()
+                                
+                                return (
+                                  <div key={idx} className="report-file-section">
+                                    <div className="report-file-header">
+                                      <FileText size={16} />
+                                      <h4>Отчет {reportNum} из {totalNum}: {fileName}</h4>
+                                    </div>
+                                    <pre className="report-text">{reportContent}</pre>
+                                  </div>
+                                )
+                              })}
+                            </div>
+                          )
+                        } else {
+                          return <pre className="report-text">{fsReportText}</pre>
+                        }
+                      })()}
                     </div>
                   </div>
                 </div>
