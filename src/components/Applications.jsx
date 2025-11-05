@@ -110,6 +110,10 @@ const Applications = () => {
       
       if (data.ok && data.report) {
         setSelectedApplication(data.report)
+        // Также обновляем заявку в списке
+        setApplications(prev => prev.map(app => 
+          app.sessionId === sessionId ? data.report : app
+        ))
       }
     } catch (error) {
       console.error('Ошибка загрузки отчета:', error)
@@ -201,6 +205,27 @@ const Applications = () => {
       // Cleanup если нужно
     }
   }, [])
+
+  // Автоматическое обновление статуса заявки, если она генерируется
+  useEffect(() => {
+    if (!selectedApplication) return
+
+    // Если заявка завершена или не генерируется, не обновляем
+    const isGenerating = selectedApplication.status === 'generating' || 
+                        selectedApplication.taxStatus === 'generating' || 
+                        selectedApplication.fsStatus === 'generating'
+    
+    if (!isGenerating) return
+
+    // Обновляем статус каждые 5 секунд
+    const interval = setInterval(async () => {
+      if (selectedApplication?.sessionId) {
+        await refreshApplication(selectedApplication.sessionId)
+      }
+    }, 5000)
+
+    return () => clearInterval(interval)
+  }, [selectedApplication])
 
   const handleDeleteApplication = async (applicationId, event) => {
     event.stopPropagation() // Предотвращаем открытие деталей заявки
@@ -526,45 +551,72 @@ const Applications = () => {
               <div className="detail-actions" style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 {/* Аналитика выписок */}
                 {(() => {
-                  const enabled = selectedApplication.status === 'completed' && !!selectedApplication.reportText
+                  const isGenerating = selectedApplication.status === 'generating'
+                  const isCompleted = selectedApplication.status === 'completed' && !!selectedApplication.reportText
+                  const enabled = isCompleted
                   return (
                     <button
                       onClick={() => enabled && setShowStatementsModal(true)}
                       className={`analysis-button ${enabled ? 'enabled' : 'disabled'}`}
                       disabled={!enabled}
-                      title={enabled ? 'Открыть аналитику выписок' : 'Аналитика выписок еще не готова'}
+                      title={
+                        isGenerating 
+                          ? 'Аналитика выписок генерируется...' 
+                          : enabled 
+                            ? 'Открыть аналитику выписок' 
+                            : 'Аналитика выписок еще не готова'
+                      }
                     >
-                      <FileText size={16} /> Аналитика выписок
+                      <FileText size={16} /> 
+                      {isGenerating ? 'Аналитика выписок (генерируется...)' : 'Аналитика выписок'}
                     </button>
                   )
                 })()}
 
                 {/* Налоговая отчетность */}
                 {(() => {
-                  const enabled = selectedApplication.taxStatus === 'completed' && !!selectedApplication.taxReportText
+                  const isGenerating = selectedApplication.taxStatus === 'generating'
+                  const isCompleted = selectedApplication.taxStatus === 'completed' && !!selectedApplication.taxReportText
+                  const enabled = isCompleted
                   return (
                     <button
                       onClick={() => enabled && setShowTaxModal(true)}
                       className={`analysis-button ${enabled ? 'enabled' : 'disabled'}`}
                       disabled={!enabled}
-                      title={enabled ? 'Открыть анализ налоговой отчетности' : 'Анализ налоговой отчетности еще не готов'}
+                      title={
+                        isGenerating 
+                          ? 'Анализ налоговой отчетности генерируется...' 
+                          : enabled 
+                            ? 'Открыть анализ налоговой отчетности' 
+                            : 'Анализ налоговой отчетности еще не готов'
+                      }
                     >
-                      <FileText size={16} /> Аналитика по налогам
+                      <FileText size={16} /> 
+                      {isGenerating ? 'Аналитика по налогам (генерируется...)' : 'Аналитика по налогам'}
                     </button>
                   )
                 })()}
 
                 {/* Финансовая отчетность */}
                 {(() => {
-                  const enabled = selectedApplication.fsStatus === 'completed' && !!selectedApplication.fsReportText
+                  const isGenerating = selectedApplication.fsStatus === 'generating'
+                  const isCompleted = selectedApplication.fsStatus === 'completed' && !!selectedApplication.fsReportText
+                  const enabled = isCompleted
                   return (
                     <button
                       onClick={() => enabled && setShowFsModal(true)}
                       className={`analysis-button ${enabled ? 'enabled' : 'disabled'}`}
                       disabled={!enabled}
-                      title={enabled ? 'Открыть анализ финансовой отчетности' : 'Анализ фин. отчетности еще не готов'}
+                      title={
+                        isGenerating 
+                          ? 'Анализ финансовой отчетности генерируется...' 
+                          : enabled 
+                            ? 'Открыть анализ финансовой отчетности' 
+                            : 'Анализ фин. отчетности еще не готов'
+                      }
                     >
-                      <FileText size={16} /> Аналитика по фин. отчетам
+                      <FileText size={16} /> 
+                      {isGenerating ? 'Аналитика по фин. отчетам (генерируется...)' : 'Аналитика по фин. отчетам'}
                     </button>
                   )
                 })()}
