@@ -2,6 +2,8 @@ const express = require('express')
 const cors = require('cors')
 const multer = require('multer')
 const OpenAI = require('openai')
+const path = require('path')
+const fs = require('fs')
 const { createDb } = require('./db')
 try { require('dotenv').config({ path: '.env.local' }) } catch {}
 require('dotenv').config()
@@ -14,7 +16,7 @@ const upload = multer({
 })
 
 console.log('Loading Agents SDK...')
-const { codeInterpreterTool, Agent, Runner } = require('@openai/agents')
+const { codeInterpreterTool, Agent, Runner, MCPServerStdio } = require('@openai/agents')
 const { z } = require('zod')
 console.log('Agents SDK loaded successfully')
 
@@ -53,9 +55,49 @@ app.use(cors({
 }))
 app.use(express.json({ limit: '10mb' }))
 
+// Инициализация MCP сервера со справочной информацией iKapitalist
+let ikapInfoMcpServer = null
+const ikapInfoServerPath = path.join(__dirname, 'mcp', 'ikap-info-server.js')
+
+if (fs.existsSync(ikapInfoServerPath)) {
+  try {
+    ikapInfoMcpServer = new MCPServerStdio({
+      command: process.execPath,
+      args: [ikapInfoServerPath],
+      cwd: path.join(__dirname, 'mcp'),
+      env: {
+        ...process.env
+      },
+      cacheToolsList: true
+    })
+
+    ikapInfoMcpServer
+      .connect()
+      .then(() => {
+        console.log('✅ MCP сервер информации iKapitalist запущен')
+      })
+      .catch((error) => {
+        console.error('❌ Не удалось подключить MCP сервер информации iKapitalist:', error)
+        ikapInfoMcpServer = null
+      })
+  } catch (error) {
+    console.error('❌ Ошибка инициализации MCP сервера информации iKapitalist:', error)
+    ikapInfoMcpServer = null
+  }
+} else {
+  console.warn(`⚠️ MCP сервер информации отсутствует по пути ${ikapInfoServerPath}`)
+}
+
+process.on('exit', () => {
+  if (ikapInfoMcpServer?.close) {
+    ikapInfoMcpServer.close().catch((error) => {
+      console.error('⚠️ Ошибка закрытия MCP сервера информации:', error)
+    })
+  }
+})
+
 // В production отдаем статические файлы после сборки
 if (process.env.NODE_ENV === 'production') {
-  const path = require('path')
   app.use(express.static(path.join(__dirname, '../dist')))
 }
 
@@ -565,9 +607,18 @@ const investmentAgent = new Agent({
 
 const informationAgent = new Agent({
   name: 'Information Agent',
-  instructions: 'Отвечай на вопросы о процессе привлечения инвестиций.',
+  instructions: `Ты информационный агент краудфандинговой платформы iKapitalist.
+
+Твоя задача — на русском языке ясно и кратко отвечать на вопросы инвесторов и заемщиков о платформе, её услугах, требованиях, рисках, лицензировании, политике AML и порядке взаимодействия.
+
+ПРАВИЛА:
+1. Перед ответом используй ресурсы MCP сервера "ikapitalist-info": запрашивай нужные разделы через инструмент \`ikapitalist_get_section\` или читай URI вида \`ikapitalist://*\`.
+2. Сопоставляй несколько разделов, если это помогает дать полный ответ; не ограничивайся обзором, если вопрос уточняющий.
+3. Приводи цифры и условия точно так, как указано в данных. Если информации недостаточно, честно сообщи об этом и предложи обратиться к платформе.
+4. Отвечай структурированно (короткие абзацы или маркированные списки) и избегай домыслов.`,
   model: 'gpt-5-mini',
-  modelSettings: { store: true }
+  modelSettings: { store: true },
+  mcpServers: ikapInfoMcpServer ? [ikapInfoMcpServer] : []
 })
 
 // Middleware для логирования полей запроса перед multer
@@ -582,6 +633,8 @@ app.use('/api/agents/run', (req, res, next) => {
 app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
   try {
     const { text, sessionId } = req.body
+    const agentNameRaw = String(req.body.agent || '').toLowerCase()
+    const agentName = agentNameRaw === 'information' ? 'information' : 'investment'
     const files = req.files || []
     let session = sessionId || `session_${Date.now()}`
     
@@ -597,12 +650,21 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
     
     console.log(`\n🤖 [${new Date().toLocaleTimeString()}] Новый запрос:`)
     console.log(`📝 Пользователь: "${text}"`)
+    console.log(`🎯 Агент: ${agentName}`)
     console.log(`🆔 Сессия: ${session}`)
     if (files.length > 0) {
       console.log(`📎 Файлов загружено: ${files.length}`)
       console.log(`📎 Детали файлов:`, req.files.map(f => ({ name: f.originalname, size: f.size })))
     } else {
       console.log(`📎 Файлов не загружено (req.files: ${Array.isArray(req.files) ? req.files.length : typeof req.files})`)
+    }
+    
+    if (agentName === 'information' && files.length > 0) {
+      return res.json({
+        ok: false,
+        message: 'Для получения информации о платформе файлы прикреплять не нужно.',
+        sessionId: session
+      })
     }
     
     // Команда сброса: начать новую заявку, игнорируя прошлую историю/сессию
@@ -636,7 +698,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
     
     // Если есть файлы, загружаем их через OpenAI API (без анализа)
     const uploadedFileIds = []
-    if (files && files.length > 0) {
+    if (agentName === 'investment' && files && files.length > 0) {
       console.log(`📎 Обрабатываем ${files.length} файл(ов)...`)
       
       const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
@@ -727,7 +789,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
       
       // НЕ используем Code Interpreter для анализа файлов - агент просто принимает файлы
       // Файлы уже загружены в OpenAI и сохранены, но агент их не анализирует при загрузке
-      const agentToRun = investmentAgent
+      const agentToRun = agentName === 'information' ? informationAgent : investmentAgent
       
       // Запускаем агента с таймаутом 30 минут (единый SLA)
       // Передаем всю историю - не можем обрезать из-за reasoning items в gpt-5
@@ -829,7 +891,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
       const isFinalMessage = agentMessage.includes('Ваша заявка принята на рассмотрение') || 
                             agentMessage.includes('Ожидайте уведомления от платформы iKapitalist')
       
-      if (isFinalMessage) {
+      if (agentName === 'investment' && isFinalMessage) {
         console.log(`✅ Заявка завершена! Генерируем финансовый отчет...`)
         
         // Генерируем отчет асинхронно (не блокируем ответ клиенту)
@@ -1638,14 +1700,23 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
         })
       }
       
-      // Возвращаем прогресс по факту загруженных файлов
-      const progress = await getSessionProgress(session)
-      return res.json({ 
-        ok: true, 
+      if (agentName === 'investment') {
+        // Возвращаем прогресс по факту загруженных файлов
+        const progress = await getSessionProgress(session)
+        return res.json({ 
+          ok: true, 
+          message: agentMessage,
+          sessionId: session,
+          completed: isFinalMessage,
+          data: { progress }
+        })
+      }
+
+      return res.json({
+        ok: true,
         message: agentMessage,
         sessionId: session,
-        completed: isFinalMessage,
-        data: { progress }
+        completed: false
       })
   } catch (e) {
     console.error('❌ Ошибка в /api/agents/run:', e)

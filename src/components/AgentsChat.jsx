@@ -42,9 +42,12 @@ const AgentsChat = ({ onProgressChange }) => {
   const [sessionId, setSessionId] = useState(null)
   const [selectedFiles, setSelectedFiles] = useState([])
   const [showPrivacyModal, setShowPrivacyModal] = useState(false)
-  const [dialogState, setDialogState] = useState('greeting') // greeting, name_collected, terms_accepted, data_collection
+  const [dialogState, setDialogState] = useState('greeting') // greeting, name_collected, post_terms_choice, info_mode, data_collection
   const [userName, setUserName] = useState('')
   const [isCompleted, setIsCompleted] = useState(false) // Флаг завершения заявки
+  const [infoSessionId, setInfoSessionId] = useState(null)
+  const [currentAgent, setCurrentAgent] = useState('investment')
+  const [applyPromptShown, setApplyPromptShown] = useState(false)
   const fileInputRef = useRef(null)
   const messagesEndRef = useRef(null)
 
@@ -94,14 +97,20 @@ const AgentsChat = ({ onProgressChange }) => {
   }
 
   // Общая функция для отправки сообщений к агенту
-  const sendToAgent = async (messageText, files = []) => {
+  const sendToAgent = async (messageText, files = [], options = {}) => {
     setIsLoading(true)
 
     try {
+      const agentType = options.agent || currentAgent || 'investment'
+      const sessionIdOverride = options.sessionIdOverride || (agentType === 'information' ? infoSessionId : sessionId)
+
       // Подготавливаем FormData для отправки файлов
       const formData = new FormData()
       formData.append('text', messageText)
-      if (sessionId) formData.append('sessionId', sessionId)
+      formData.append('agent', agentType)
+      if (sessionIdOverride) {
+        formData.append('sessionId', sessionIdOverride)
+      }
       if (files && files.length > 0) {
         // Отправляем массив файлов
         files.forEach(file => {
@@ -145,9 +154,12 @@ const AgentsChat = ({ onProgressChange }) => {
       const result = await resp.json()
       
       // Сохраняем sessionId для следующих запросов
-      if (result.sessionId && !sessionId) {
-        setSessionId(result.sessionId)
-        localStorage.setItem('ikap_sessionId', result.sessionId)
+      if (result.sessionId) {
+        if (agentType === 'information') {
+          setInfoSessionId(result.sessionId)
+        } else {
+          setSessionId(result.sessionId)
+        }
       }
       
       // Проверяем, был ли запрос успешным
@@ -242,6 +254,16 @@ const AgentsChat = ({ onProgressChange }) => {
   const handleSendMessage = async () => {
     if ((!inputMessage.trim() && selectedFiles.length === 0) || isLoading) return
 
+    if (dialogState === 'post_terms_choice') {
+      const reminderMessage = createBotMessage(
+        'Пожалуйста, выберите один из вариантов: узнать подробнее о платформе или перейти к подаче заявки.'
+      )
+      setMessages(prev => [...prev, reminderMessage])
+      setInputMessage('')
+      setSelectedFiles([])
+      return
+    }
+
     // Очищаем числа от пробелов перед отправкой
     const cleanMessageText = cleanNumbersForSending(inputMessage.trim())
     const userMessage = createUserMessage(cleanMessageText, selectedFiles)
@@ -261,13 +283,14 @@ const AgentsChat = ({ onProgressChange }) => {
     if (dialogState === 'greeting') {
       setUserName(messageText)
       setDialogState('name_collected')
+      setCurrentAgent('investment')
       
       // Показываем спинер на 3 секунды
       setIsLoading(true)
       
       setTimeout(() => {
         const botMessage = createBotMessage(
-          `Здравствуйте, ${messageText}! Наша платформа помогает бизнесу привлекать финансирование от 10 млн до 1 млрд ₸ от 2,5% в месяц. Срок займа — 4–36 месяцев. Быстрое одобрение, прозрачные условия, инвесторы, готовые поддержать ваш проект. Примите условия платформы и подготовьте банковские выписки за последние 12 месяцев.`,
+          `Здравствуйте, ${messageText}! Наша платформа помогает бизнесу привлекать финансирование от 10 млн до 1 млрд ₸ от 2,5% в месяц. Срок займа — 4–36 месяцев. Быстрое одобрение, прозрачные условия, инвесторы, готовые поддержать ваш проект. Примите условия платформы и подготовьте банковские выписки за последние 12 месяцев, чтобы продолжить.`,
           { showTermsButton: true }
         )
         
@@ -283,19 +306,21 @@ const AgentsChat = ({ onProgressChange }) => {
       return
     }
     
-    if (dialogState === 'terms_accepted') {
-      setDialogState('data_collection')
-      
-      // Сразу отправляем в агента после изменения состояния
-      // Поля уже очищены выше
-      await sendToAgent(messageText, filesToSend)
+    const agentForMessage = currentAgent === 'information' ? 'information' : 'investment'
+    
+    if (dialogState === 'info_mode') {
+      await sendToAgent(messageText, filesToSend, { agent: agentForMessage })
       return
     }
     
-    // Если мы в режиме сбора данных, отправляем в агента
+    if (dialogState === 'terms_accepted') {
+      setDialogState('data_collection')
+      await sendToAgent(messageText, filesToSend, { agent: agentForMessage })
+      return
+    }
+    
     if (dialogState === 'data_collection') {
-      // Поля уже очищены выше
-      await sendToAgent(messageText, filesToSend)
+      await sendToAgent(messageText, filesToSend, { agent: agentForMessage })
     }
     // Если не в режиме сбора данных, поля уже очищены выше
   }
@@ -306,16 +331,26 @@ const AgentsChat = ({ onProgressChange }) => {
 
   const handleAcceptTerms = () => {
     setShowPrivacyModal(false)
-    setDialogState('terms_accepted')
+    setDialogState('post_terms_choice')
+    setCurrentAgent('investment')
+    setApplyPromptShown(false)
     
-    // Показываем спиннер на 3 секунды
+    // Показываем спиннер перед выводом вариантов
     setIsLoading(true)
     
     setTimeout(() => {
-      const botMessage = createBotMessage("Какую сумму в тенге Вы хотите получить?")
+      const botMessage = createBotMessage(
+        'Отлично! Вы можете узнать подробнее о платформе или сразу перейти к подаче заявки. Что предпочитаете?',
+        {
+          choiceButtons: [
+            { label: 'Узнать подробнее о платформе', value: 'info' },
+            { label: 'Перейти к подаче заявки', value: 'apply' }
+          ]
+        }
+      )
       setMessages(prev => [...prev, botMessage])
       setIsLoading(false)
-    }, 3000)
+    }, 1500)
   }
 
   const handleDeclineTerms = () => {
@@ -327,15 +362,85 @@ const AgentsChat = ({ onProgressChange }) => {
     setMessages(prev => [...prev, botMessage])
   }
 
+  const handleChoiceSelection = async (choice) => {
+    if (isLoading) return
+
+    setMessages(prev => prev.map(msg => {
+      if (!msg.choiceButtons) return msg
+      const filteredButtons = msg.choiceButtons.filter(btn => btn.value !== choice)
+      if (filteredButtons.length === msg.choiceButtons.length) {
+        return msg
+      }
+      if (filteredButtons.length === 0) {
+        const { choiceButtons, ...rest } = msg
+        return rest
+      }
+      return { ...msg, choiceButtons: filteredButtons }
+    }))
+
+    if (choice === 'info') {
+      if (dialogState === 'info_mode' && currentAgent === 'information') {
+        return
+      }
+
+      const presetText = 'Пожалуйста, расскажите подробнее о платформе iKapitalist.'
+      const userMessage = createUserMessage(presetText)
+      setMessages(prev => [...prev, userMessage])
+
+      setCurrentAgent('information')
+      setDialogState('info_mode')
+
+      if (!applyPromptShown) {
+        const helperMessage = createBotMessage(
+          'Вы можете задавать уточняющие вопросы о платформе. Когда будете готовы перейти к подаче заявки, нажмите кнопку ниже.',
+          {
+            choiceButtons: [
+              { label: 'Перейти к подаче заявки', value: 'apply' }
+            ]
+          }
+        )
+        setMessages(prev => [...prev, helperMessage])
+        setApplyPromptShown(true)
+      }
+
+      await sendToAgent(presetText, [], { agent: 'information' })
+      return
+    }
+
+    if (choice === 'apply') {
+      if (dialogState === 'data_collection' && currentAgent === 'investment') {
+        return
+      }
+
+      const userMessage = createUserMessage('Перейти к подаче заявки')
+      setMessages(prev => [...prev, userMessage])
+
+      setCurrentAgent('investment')
+      setDialogState('data_collection')
+      setApplyPromptShown(false)
+
+      // Показываем спиннер перед переходом к вопросам заявки
+      setIsLoading(true)
+      setTimeout(() => {
+        const botMessage = createBotMessage('Какую сумму в тенге Вы хотите получить?')
+        setMessages(prev => [...prev, botMessage])
+        setIsLoading(false)
+      }, 800)
+    }
+  }
+
   const handleHardReset = () => {
     // Полная очистка локальной сессии и чата
     try {
       localStorage.removeItem('ikap_sessionId')
     } catch {}
     setSessionId(null)
+    setInfoSessionId(null)
     setSelectedFiles([])
     setIsCompleted(false)
     setDialogState('greeting')
+    setCurrentAgent('investment')
+    setApplyPromptShown(false)
     setUserName('')
     setInputMessage('')
     setMessages([
@@ -402,6 +507,19 @@ const AgentsChat = ({ onProgressChange }) => {
                   >
                     Принять условия платформы
                   </button>
+                </div>
+              )}
+              {message.choiceButtons && (
+                <div className="message-actions">
+                  {message.choiceButtons.map((button) => (
+                    <button
+                      key={button.value}
+                      onClick={() => handleChoiceSelection(button.value)}
+                      className="choice-button"
+                    >
+                      {button.label}
+                    </button>
+                  ))}
                 </div>
               )}
               <div className="message-time">
@@ -477,7 +595,7 @@ const AgentsChat = ({ onProgressChange }) => {
               className="message-input"
               rows="1"
               maxLength={200}
-              inputMode="numeric"
+              inputMode={dialogState === 'data_collection' && currentAgent !== 'information' ? 'numeric' : 'text'}
             />
               <button
                 onClick={() => fileInputRef.current?.click()}
