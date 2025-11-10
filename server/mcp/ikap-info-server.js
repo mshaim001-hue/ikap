@@ -199,13 +199,13 @@ server.registerTool(
   {
     title: 'Получить раздел справки iKapitalist',
     description: 'Возвращает структурированный текст по ключевому разделу справки платформы iKapitalist.',
-    inputSchema: z.object({
-      section: z.enum(sectionIds).default('overview')
-    }),
-    outputSchema: z.object({
+    inputSchema: {
+      section: z.enum(sectionIds).optional()
+    },
+    outputSchema: {
       section: z.string(),
       text: z.string()
-    })
+    }
   },
   async ({ section }) => {
     const key = section || 'overview'
@@ -457,15 +457,13 @@ server.registerTool(
     title: 'Рассчитать график платежей по займу',
     description:
       'Возвращает помесячный график платежей и итоговые суммы по выбранному виду займа.',
-    inputSchema: z
-      .object({
-        loanType: loanTypeEnum,
-        amount: z.number().positive(),
-        termMonths: z.number().int().min(1),
-        annualRate: z.number().positive().optional()
-      })
-      .strict(),
-    outputSchema: z.object({
+    inputSchema: {
+      loanType: loanTypeEnum,
+      amount: z.number().positive(),
+      termMonths: z.number().int().min(1),
+      annualRate: z.number().positive().optional()
+    },
+    outputSchema: {
       loanType: loanTypeEnum,
       amount: z.number(),
       termMonths: z.number(),
@@ -484,7 +482,7 @@ server.registerTool(
         principal: z.number(),
         payments: z.number()
       })
-    })
+    }
   },
   async ({ loanType, amount, termMonths, annualRate }) => {
     const rate = annualRate ?? DEFAULT_ANNUAL_RATE
