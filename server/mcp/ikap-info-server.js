@@ -6,8 +6,10 @@ const { z } = require('zod')
 
 const server = new McpServer({
   name: 'ikapitalist-info',
-  version: '1.0.0'
+  version: '1.1.0'
 })
+
+const DEFAULT_ANNUAL_RATE = 0.3
 
 /** @type {Record<string, string>} */
 const sections = {
@@ -139,6 +141,32 @@ const sections = {
     '- **Ограничения раскрытия:** эмитенты не обязаны предоставлять полный пакет данных, возможен дефицит информации.',
     '- **Неточность отчетности:** финансовая отчетность может быть неаудированной и содержать ошибки.',
     '- **Недостаточная диверсификация:** концентрация вложений в одной сделке повышает вероятность значительных потерь.'
+  ].join('\n'),
+  company_loans: [
+    '# Виды займов для компаний',
+    '',
+    'Платформа предлагает четыре основных формата погашения долга для компаний-заёмщиков. Ниже приведено краткое описание и ключевые особенности каждого вида.',
+    '',
+    '1. **Ежемесячные проценты, основной долг в конце срока**',
+    '   - Заёмщик перечисляет только проценты каждый месяц.',
+    '   - В последний месяц оплачивается очередной процент и вся сумма основного долга.',
+    '   - Удобно для бизнеса, который ожидает крупный денежный поток к окончанию срока.',
+    '',
+    '2. **Равномерное погашение основного долга (аннуитетная логика)**',
+    '   - Основной долг делится на равные части и выплачивается ежемесячно.',
+    '   - Проценты начисляются на оставшийся основной долг, поэтому ежемесячный платёж постепенно снижается.',
+    '   - Возможна отсрочка по основному долгу: в период отсрочки платятся только проценты.',
+    '',
+    '3. **Фиксированная сумма платежа (равные доли основного долга и процентов)**',
+    '   - Основной долг гасится равными долями каждый месяц.',
+    '   - Проценты рассчитываются от первоначальной суммы займа, поэтому ежемесячный платёж остаётся постоянным.',
+    '   - Может предусматривать отсрочку начала погашения основного долга с оплатой процентов.',
+    '',
+    '4. **Полное погашение в конце срока**',
+    '   - Компании удобно, если денежный поток ожидается разово к моменту завершения проекта.',
+    '   - В конце срока выплачивается сумма основного долга и начисленные проценты.',
+    '',
+    `Все расчёты по умолчанию ведутся исходя из 30% годовых (monthly = годовая ставка / 12), но могут быть скорректированы по договорённости с инвесторами.`
   ].join('\n')
 }
 
@@ -171,13 +199,13 @@ server.registerTool(
   {
     title: 'Получить раздел справки iKapitalist',
     description: 'Возвращает структурированный текст по ключевому разделу справки платформы iKapitalist.',
-    inputSchema: {
-      section: z.enum(sectionIds)
-    },
-    outputSchema: {
+    inputSchema: z.object({
+      section: z.enum(sectionIds).default('overview')
+    }),
+    outputSchema: z.object({
       section: z.string(),
       text: z.string()
-    }
+    })
   },
   async ({ section }) => {
     const key = section || 'overview'
@@ -207,6 +235,340 @@ server.registerTool(
         }
       ],
       structuredContent: payload
+    }
+  }
+)
+
+const loanTypeEnum = z.enum([
+  'interest_only',
+  'equal_principal',
+  'fixed_payment',
+  'lump_sum'
+])
+
+/**
+ * @param {number} amount
+ * @param {number} termMonths
+ * @param {number} annualRate
+ */
+const getMonthlyRate = (amount, termMonths, annualRate) => {
+  if (amount <= 0) {
+    throw new Error('Сумма займа должна быть больше 0.')
+  }
+
+  if (termMonths <= 0) {
+    throw new Error('Срок займа в месяцах должен быть больше 0.')
+  }
+
+  if (annualRate <= 0) {
+    throw new Error('Годовая ставка должна быть больше 0.')
+  }
+
+  return annualRate / 12
+}
+
+/**
+ * @typedef {Object} PaymentRow
+ * @property {number} month
+ * @property {number} payment
+ * @property {number} principal
+ * @property {number} interest
+ * @property {number} remainingPrincipal
+ */
+
+/**
+ * @param {number} amount
+ * @param {number} termMonths
+ * @param {number} annualRate
+ * @returns {{ schedule: PaymentRow[], totals: { interest: number, principal: number, payments: number } }}
+ */
+const calculateInterestOnlySchedule = (amount, termMonths, annualRate) => {
+  const monthlyRate = getMonthlyRate(amount, termMonths, annualRate)
+  const monthlyInterest = amount * monthlyRate
+
+  /** @type {PaymentRow[]} */
+  const schedule = []
+  let totalInterest = 0
+
+  for (let month = 1; month <= termMonths; month += 1) {
+    const interest = monthlyInterest
+    const principal = month === termMonths ? amount : 0
+    const payment = interest + principal
+    const remainingPrincipal = month === termMonths ? 0 : amount
+
+    totalInterest += interest
+
+    schedule.push({
+      month,
+      payment,
+      principal,
+      interest,
+      remainingPrincipal
+    })
+  }
+
+  const totals = {
+    interest: totalInterest,
+    principal: amount,
+    payments: amount + totalInterest
+  }
+
+  return { schedule, totals }
+}
+
+/**
+ * @param {number} amount
+ * @param {number} termMonths
+ * @param {number} annualRate
+ * @returns {{ schedule: PaymentRow[], totals: { interest: number, principal: number, payments: number } }}
+ */
+const calculateEqualPrincipalSchedule = (amount, termMonths, annualRate) => {
+  const monthlyRate = getMonthlyRate(amount, termMonths, annualRate)
+  const basePrincipalPayment = amount / termMonths
+
+  /** @type {PaymentRow[]} */
+  const schedule = []
+  let remainingPrincipal = amount
+  let totalInterest = 0
+  let totalPayments = 0
+
+  for (let month = 1; month <= termMonths; month += 1) {
+    const principalPayment =
+      month === termMonths ? remainingPrincipal : basePrincipalPayment
+    const interest = remainingPrincipal * monthlyRate
+    const payment = principalPayment + interest
+
+    remainingPrincipal -= principalPayment
+
+    totalInterest += interest
+    totalPayments += payment
+
+    schedule.push({
+      month,
+      payment,
+      principal: principalPayment,
+      interest,
+      remainingPrincipal: Math.max(remainingPrincipal, 0)
+    })
+  }
+
+  const totals = {
+    interest: totalInterest,
+    principal: amount,
+    payments: totalPayments
+  }
+
+  return { schedule, totals }
+}
+
+/**
+ * @param {number} amount
+ * @param {number} termMonths
+ * @param {number} annualRate
+ * @returns {{ schedule: PaymentRow[], totals: { interest: number, principal: number, payments: number } }}
+ */
+const calculateFixedPaymentSchedule = (amount, termMonths, annualRate) => {
+  const monthlyRate = getMonthlyRate(amount, termMonths, annualRate)
+  const monthlyInterest = amount * monthlyRate
+  const principalPayment = amount / termMonths
+  const monthlyPayment = principalPayment + monthlyInterest
+
+  /** @type {PaymentRow[]} */
+  const schedule = []
+  let remainingPrincipal = amount
+  let totalInterest = 0
+  let totalPayments = 0
+
+  for (let month = 1; month <= termMonths; month += 1) {
+    const principal =
+      month === termMonths ? remainingPrincipal : principalPayment
+    const payment = month === termMonths ? principal + monthlyInterest : monthlyPayment
+    remainingPrincipal -= principal
+
+    totalInterest += monthlyInterest
+    totalPayments += payment
+
+    schedule.push({
+      month,
+      payment,
+      principal,
+      interest: monthlyInterest,
+      remainingPrincipal: Math.max(remainingPrincipal, 0)
+    })
+  }
+
+  const totals = {
+    interest: monthlyInterest * termMonths,
+    principal: amount,
+    payments: totalPayments
+  }
+
+  return { schedule, totals }
+}
+
+/**
+ * @param {number} amount
+ * @param {number} termMonths
+ * @param {number} annualRate
+ * @returns {{ schedule: PaymentRow[], totals: { interest: number, principal: number, payments: number } }}
+ */
+const calculateLumpSumSchedule = (amount, termMonths, annualRate) => {
+  const monthlyRate = getMonthlyRate(amount, termMonths, annualRate)
+  const totalInterest = amount * monthlyRate * termMonths
+  const finalPayment = amount + totalInterest
+
+  /** @type {PaymentRow[]} */
+  const schedule = []
+
+  for (let month = 1; month <= termMonths; month += 1) {
+    const payment = month === termMonths ? finalPayment : 0
+    const interest = month === termMonths ? totalInterest : 0
+    const principal = month === termMonths ? amount : 0
+    const remainingPrincipal = month === termMonths ? 0 : amount
+
+    schedule.push({
+      month,
+      payment,
+      principal,
+      interest,
+      remainingPrincipal
+    })
+  }
+
+  const totals = {
+    interest: totalInterest,
+    principal: amount,
+    payments: finalPayment
+  }
+
+  return { schedule, totals }
+}
+
+const loanCalculators = {
+  interest_only: calculateInterestOnlySchedule,
+  equal_principal: calculateEqualPrincipalSchedule,
+  fixed_payment: calculateFixedPaymentSchedule,
+  lump_sum: calculateLumpSumSchedule
+}
+
+server.registerTool(
+  'ikapitalist_calculate_loan_schedule',
+  {
+    title: 'Рассчитать график платежей по займу',
+    description:
+      'Возвращает помесячный график платежей и итоговые суммы по выбранному виду займа.',
+    inputSchema: z
+      .object({
+        loanType: loanTypeEnum,
+        amount: z.number().positive(),
+        termMonths: z.number().int().min(1),
+        annualRate: z.number().positive().optional()
+      })
+      .strict(),
+    outputSchema: z.object({
+      loanType: loanTypeEnum,
+      amount: z.number(),
+      termMonths: z.number(),
+      annualRate: z.number(),
+      schedule: z.array(
+        z.object({
+          month: z.number().int().min(1),
+          payment: z.number(),
+          principal: z.number(),
+          interest: z.number(),
+          remainingPrincipal: z.number().min(0)
+        })
+      ),
+      totals: z.object({
+        interest: z.number(),
+        principal: z.number(),
+        payments: z.number()
+      })
+    })
+  },
+  async ({ loanType, amount, termMonths, annualRate }) => {
+    const rate = annualRate ?? DEFAULT_ANNUAL_RATE
+    const calculator = loanCalculators[loanType]
+
+    if (!calculator) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Вид займа "${loanType}" не поддерживается. Доступные значения: ${loanTypeEnum.options.join(', ')}.`
+          }
+        ],
+        isError: true
+      }
+    }
+
+    try {
+      const { schedule, totals } = calculator(amount, termMonths, rate)
+      const payload = {
+        loanType,
+        amount,
+        termMonths,
+        annualRate: rate,
+        schedule,
+        totals
+      }
+
+      const textLines = [
+        `Тип займа: ${loanType}`,
+        `Сумма займа: ${amount.toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ₸`,
+        `Срок: ${termMonths} мес.`,
+        `Годовая ставка: ${(rate * 100).toFixed(2)}%`,
+        '',
+        'Помесячный график:'
+      ]
+
+      payload.schedule.forEach((row) => {
+        const payment = row.payment.toLocaleString('ru-RU', {
+          maximumFractionDigits: 2
+        })
+        const principal = row.principal.toLocaleString('ru-RU', {
+          maximumFractionDigits: 2
+        })
+        const interest = row.interest.toLocaleString('ru-RU', {
+          maximumFractionDigits: 2
+        })
+        const remaining = row.remainingPrincipal.toLocaleString('ru-RU', {
+          maximumFractionDigits: 2
+        })
+        textLines.push(
+          `Месяц ${row.month}: платёж ${payment} ₸ (ОД: ${principal} ₸, %: ${interest} ₸), остаток: ${remaining} ₸`
+        )
+      })
+
+      textLines.push(
+        '',
+        `Итого проценты: ${totals.interest.toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ₸`,
+        `Итого основной долг: ${totals.principal.toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ₸`,
+        `Итого платежи: ${totals.payments.toLocaleString('ru-RU', { maximumFractionDigits: 2 })} ₸`
+      )
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: textLines.join('\n')
+          }
+        ],
+        structuredContent: payload
+      }
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text:
+              error instanceof Error
+                ? `Не удалось рассчитать график: ${error.message}`
+                : 'Не удалось рассчитать график из-за неизвестной ошибки.'
+          }
+        ],
+        isError: true
+      }
     }
   }
 )
