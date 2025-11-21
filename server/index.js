@@ -641,15 +641,23 @@ const informationAgent = new Agent({
 
 // Middleware для логирования полей запроса перед multer
 app.use('/api/agents/run', (req, res, next) => {
-  if (req.method === 'POST') {
-    console.log(`\n🔍 [${new Date().toLocaleTimeString()}] Поля запроса перед multer:`)
-    console.log(`📝 Content-Type: ${req.headers['content-type']}`)
+  try {
+    if (req.method === 'POST') {
+      console.log(`\n🔍 [${new Date().toLocaleTimeString()}] Поля запроса перед multer:`)
+      console.log(`📝 Content-Type: ${req.headers['content-type']}`)
+    }
+    next()
+  } catch (error) {
+    console.error('❌ Ошибка в middleware логирования:', error)
+    next(error)
   }
-  next()
 })
 
 app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
   try {
+    console.log('🔍 [DEBUG] Запрос получен, body keys:', Object.keys(req.body || {}))
+    console.log('🔍 [DEBUG] req.files:', req.files ? (Array.isArray(req.files) ? req.files.length : typeof req.files) : 'undefined')
+    
     const { text, sessionId } = req.body
     const agentNameRaw = String(req.body.agent || '').toLowerCase()
     const agentName = agentNameRaw === 'information' ? 'information' : 'investment'
