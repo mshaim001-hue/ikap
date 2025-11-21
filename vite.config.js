@@ -6,7 +6,7 @@ export default defineConfig({
   // Для GitHub Pages нужно указать base path репозитория
   // Если репозиторий называется "ikap", то base: '/ikap/'
   // Если репозиторий username.github.io, то base: '/'
-  base: process.env.VITE_BASE_PATH || '/ikap/',
+  base: process.env.VITE_BASE_PATH || (process.env.NODE_ENV === 'production' ? '/ikap/' : '/'),
   server: {
     port: 3000,
     open: true,

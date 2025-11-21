@@ -740,7 +740,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
           fileNames.push(file.originalname)
           console.log(`✅ Файл загружен в OpenAI: ${uploadedFile.id} (${file.originalname})`)
           
-          // Сохраняем файл в sessionFiles (в памяти)
+          // Сохраняем файл в sessionFiles (в памяти) вместе с buffer для последующей обработки
           if (!sessionFiles.has(session)) {
             sessionFiles.set(session, [])
           }
@@ -748,7 +748,9 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             fileId: uploadedFile.id,
             originalName: file.originalname,
             size: file.size,
-            uploadedAt: new Date().toISOString()
+            uploadedAt: new Date().toISOString(),
+            buffer: file.buffer, // Сохраняем buffer для обработки через новый метод
+            mimetype: file.mimetype
           })
           
           // Категоризируем и сохраняем метаданные файла в БД (с обработкой ошибок)
@@ -1207,33 +1209,33 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             
             // НОВЫЙ МЕТОД: Обрабатываем выписки через новый метод (конвертация -> классификация -> отчет)
             try {
-              console.log(`📥 Скачиваем ${statementFiles.length} файл(ов) из OpenAI для обработки...`)
+              console.log(`📥 Получаем ${statementFiles.length} файл(ов) из памяти для обработки...`)
               
-              // Скачиваем файлы из OpenAI
+              // Получаем файлы из sessionFiles (где сохранены buffer'ы)
               const downloadedFiles = []
+              const sessionFilesData = sessionFiles.get(session) || []
+              
               for (const file of statementFiles) {
-                try {
-                  console.log(`📥 Скачиваем файл: ${file.originalName} (${file.fileId})`)
-                  const fileContent = await openaiClient.files.content(file.fileId)
-                  const buffer = Buffer.from(await fileContent.arrayBuffer())
+                // Ищем файл в sessionFiles по fileId
+                const sessionFile = sessionFilesData.find(f => f.fileId === file.fileId)
+                if (sessionFile && sessionFile.buffer) {
                   downloadedFiles.push({
-                    buffer,
+                    buffer: sessionFile.buffer,
                     originalname: file.originalName,
-                    mimetype: 'application/pdf',
-                    size: buffer.length
+                    mimetype: sessionFile.mimetype || 'application/pdf',
+                    size: sessionFile.size || sessionFile.buffer.length
                   })
-                  console.log(`✅ Файл скачан: ${file.originalName} (${buffer.length} bytes)`)
-                } catch (downloadError) {
-                  console.error(`❌ Ошибка скачивания файла ${file.originalName}:`, downloadError.message)
-                  // Продолжаем с остальными файлами
+                  console.log(`✅ Файл найден в памяти: ${file.originalName} (${sessionFile.buffer.length} bytes)`)
+                } else {
+                  console.warn(`⚠️ Файл ${file.originalName} не найден в памяти, пропускаем`)
                 }
               }
               
               if (downloadedFiles.length === 0) {
-                throw new Error('Не удалось скачать ни один файл из OpenAI')
+                throw new Error('Не удалось найти ни один файл в памяти для обработки')
               }
               
-              console.log(`✅ Скачано ${downloadedFiles.length} файл(ов), начинаем обработку через новый метод...`)
+              console.log(`✅ Найдено ${downloadedFiles.length} файл(ов) в памяти, начинаем обработку через новый метод...`)
               
               // Формируем комментарий с данными заявки
               const commentText = `Данные заявки:
