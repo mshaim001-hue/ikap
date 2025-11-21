@@ -4,7 +4,11 @@ const multer = require('multer')
 const OpenAI = require('openai')
 const path = require('path')
 const fs = require('fs')
+const { randomUUID } = require('crypto')
+const { toFile } = require('openai/uploads')
 const { createDb } = require('./db')
+const { convertPdfsToJson } = require('./pdfConverter')
+const transactionProcessor = require('./transactionProcessor')
 try { require('dotenv').config({ path: '.env.local' }) } catch {}
 require('dotenv').config()
 
@@ -161,6 +165,10 @@ async function initSchema() {
       ALTER TABLE reports ADD COLUMN IF NOT EXISTS fs_report_text TEXT;
       ALTER TABLE reports ADD COLUMN IF NOT EXISTS fs_status TEXT DEFAULT 'pending';
       ALTER TABLE reports ADD COLUMN IF NOT EXISTS fs_missing_periods TEXT;
+      ALTER TABLE reports ADD COLUMN IF NOT EXISTS comment TEXT;
+      ALTER TABLE reports ADD COLUMN IF NOT EXISTS openai_response_id TEXT;
+      ALTER TABLE reports ADD COLUMN IF NOT EXISTS openai_status TEXT;
+      ALTER TABLE reports ADD COLUMN IF NOT EXISTS report_structured TEXT;
     `)
   } else {
     db.exec(`
@@ -1759,6 +1767,599 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
   }
 })
 
+// ========== ЭНДПОИНТ /api/analysis ДЛЯ ОБРАБОТКИ БАНКОВСКИХ ВЫПИСОК ==========
+// Конвертация PDF -> фильтрация -> классификация -> суммирование -> вывод
+
+const activeAnalysisSessions = new Set()
+let analysisRunner = null
+
+const createTransactionClassifierAgent = () => {
+  return new Agent({
+    name: 'Revenue Classifier',
+    instructions: transactionProcessor.transactionClassifierInstructions,
+    model: 'gpt-5.1',
+    modelSettings: { store: true },
+  })
+}
+
+const summariseFilesForLog = (files = []) =>
+  files.map((file) => ({
+    name: file.originalname,
+    size: file.size,
+    mime: file.mimetype,
+  }))
+
+const upsertReport = async (sessionId, payload) => {
+  const {
+    status, reportText, reportStructured, filesCount, filesData,
+    completed, comment, openaiResponseId, openaiStatus,
+  } = payload
+  try {
+    const stmt = db.prepare(`
+      INSERT INTO reports (session_id, status, report_text, report_structured, files_count, files_data, completed_at, comment, openai_response_id, openai_status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(session_id) DO UPDATE SET
+        status = excluded.status,
+        report_text = excluded.report_text,
+        report_structured = COALESCE(excluded.report_structured, reports.report_structured),
+        files_count = excluded.files_count,
+        files_data = excluded.files_data,
+        completed_at = excluded.completed_at,
+        comment = COALESCE(excluded.comment, reports.comment),
+        openai_response_id = COALESCE(excluded.openai_response_id, reports.openai_response_id),
+        openai_status = COALESCE(excluded.openai_status, reports.openai_status)
+    `)
+    await stmt.run(
+      sessionId, status, reportText || null, reportStructured || null,
+      typeof filesCount === 'number' ? filesCount : null, filesData || null,
+      completed || null, comment ?? null, openaiResponseId ?? null, openaiStatus ?? null
+    )
+  } catch (error) {
+    console.error('❌ Ошибка сохранения отчёта в БД:', error)
+  }
+}
+
+app.post('/api/analysis', upload.array('files'), async (req, res) => {
+  const startedAt = new Date()
+  const incomingSession = req.body?.sessionId
+  const sessionId = incomingSession || randomUUID()
+  const comment = (req.body?.comment || '').toString().trim()
+  const metadata = transactionProcessor.normalizeMetadata(req.body?.metadata)
+  const files = req.files || []
+
+  console.log('🛰️ Получен запрос /api/analysis', {
+    sessionId,
+    commentLength: comment.length,
+    files: summariseFilesForLog(files),
+    metadata,
+  })
+
+  if (activeAnalysisSessions.has(sessionId)) {
+    console.warn('⚠️ Попытка запустить анализ для сессии, которая уже обрабатывается:', sessionId)
+    return res.status(409).json({
+      ok: false,
+      code: 'ANALYSIS_IN_PROGRESS',
+      message: 'Анализ для этой сессии уже выполняется. Пожалуйста, подождите.',
+      sessionId,
+    })
+  }
+
+  activeAnalysisSessions.add(sessionId)
+
+  if (!files.length) {
+    console.error('❌ Запрос без файлов, возвращаем 400')
+    activeAnalysisSessions.delete(sessionId)
+    return res.status(400).json({
+      ok: false,
+      code: 'FILES_REQUIRED',
+      message: 'Необходимо прикрепить хотя бы один файл для анализа.',
+    })
+  }
+
+  if (!comment || comment.length === 0) {
+    console.error('❌ Запрос без комментария, возвращаем 400')
+    activeAnalysisSessions.delete(sessionId)
+    return res.status(400).json({
+      ok: false,
+      code: 'COMMENT_REQUIRED',
+      message: 'Укажите важные данные',
+    })
+  }
+
+  try {
+    conversationHistory.set(sessionId, conversationHistory.get(sessionId) || [])
+    const history = conversationHistory.get(sessionId)
+
+    if (comment) {
+      history.push({ role: 'user', content: [{ type: 'text', text: comment }] })
+      await saveMessageToDB(sessionId, 'user', [{ type: 'text', text: comment }], history.length)
+    }
+
+    const attachments = []
+    const pdfFiles = []
+    const otherFiles = []
+    let extractedTransactions = []
+    let convertedExcels = []
+
+    // Разделяем файлы на PDF и остальные
+    for (const file of files) {
+      const isPdf = file.mimetype === 'application/pdf' || file.originalname.toLowerCase().endsWith('.pdf')
+      if (isPdf) {
+        pdfFiles.push(file)
+      } else {
+        otherFiles.push(file)
+      }
+    }
+
+    // Обрабатываем PDF файлы: конвертируем в JSON
+    if (pdfFiles.length > 0) {
+      console.log(`🔄 Конвертирую ${pdfFiles.length} PDF файл(ов) в JSON...`)
+      try {
+        const pdfDataForConversion = pdfFiles.map(file => ({
+          buffer: file.buffer,
+          filename: file.originalname
+        }))
+        
+        const jsonResults = await convertPdfsToJson(pdfDataForConversion)
+        console.log(`✅ Конвертация завершена: получено ${jsonResults.length} результат(ов)`)
+
+        // Объединяем все транзакции из всех файлов
+        const allTransactions = []
+        const allMetadata = []
+        const collectedExcels = []
+        
+        for (const result of jsonResults) {
+          if (result.error) {
+            console.warn(`⚠️ Ошибка при конвертации файла ${result.source_file}: ${result.error}`)
+            continue
+          }
+          
+          if (result.transactions && Array.isArray(result.transactions)) {
+            console.log(`📊 Добавляю ${result.transactions.length} транзакций из файла ${result.source_file}`)
+            allTransactions.push(...result.transactions)
+          }
+          
+          if (result.metadata) {
+            allMetadata.push({
+              source_file: result.source_file,
+              ...result.metadata
+            })
+          }
+
+          if (result.excel_file && typeof result.excel_file === 'object' && result.excel_file.base64) {
+            try {
+              const excelBuffer = Buffer.from(result.excel_file.base64, 'base64')
+              collectedExcels.push({
+                name: result.excel_file.name || (result.source_file ? result.source_file.replace(/\.pdf$/i, '.xlsx') : 'converted.xlsx'),
+                size: result.excel_file.size || excelBuffer.length,
+                mime: result.excel_file.mime || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                source: result.source_file,
+                base64: result.excel_file.base64,
+              })
+            } catch (excelError) {
+              console.error('⚠️ Не удалось обработать Excel файл из результата конвертации', excelError)
+            }
+          }
+        }
+        
+        console.log(`📊 Итого собрано транзакций: ${allTransactions.length}`)
+        convertedExcels = collectedExcels
+
+        const transactionsWithInternalIds = transactionProcessor.attachInternalTransactionIds(allTransactions, sessionId)
+        extractedTransactions = transactionsWithInternalIds
+
+        // Создаем JSON файл с результатами конвертации
+        const jsonData = {
+          metadata: allMetadata,
+          transactions: transactionsWithInternalIds,
+          summary: {
+            total_files: pdfFiles.length,
+            total_transactions: allTransactions.length,
+            converted_at: new Date().toISOString()
+          }
+        }
+
+        const jsonString = JSON.stringify(jsonData, null, 2)
+        const jsonBuffer = Buffer.from(jsonString, 'utf-8')
+        const jsonFilename = `converted_statements_${Date.now()}.json`
+
+        // Загружаем JSON файл в OpenAI Files API
+        let jsonFileId = null
+        if (allTransactions.length > 0) {
+          try {
+            console.log(`📤 Загружаем JSON файл в OpenAI Files API: ${jsonFilename} (${jsonBuffer.length} bytes)`)
+            const uploadedJsonFile = await openaiClient.files.create({
+              file: await toFile(jsonBuffer, jsonFilename, { type: 'application/json' }),
+              purpose: 'assistants',
+            })
+            
+            jsonFileId = uploadedJsonFile.id
+            console.log('✅ JSON файл загружен в OpenAI', {
+              fileId: jsonFileId,
+              filename: uploadedJsonFile.filename,
+              size: jsonBuffer.length,
+              transactions: allTransactions.length,
+            })
+
+            try {
+              await saveFileToDB(
+                sessionId,
+                jsonFileId,
+                jsonFilename,
+                jsonBuffer.length,
+                'application/json',
+                'converted_statement'
+              )
+            } catch (error) {
+              console.error('⚠️ Не удалось сохранить JSON файл в БД, продолжаем работу', error)
+            }
+
+            attachments.push({
+              file_id: jsonFileId,
+              original_filename: jsonFilename,
+              is_converted: true,
+              source_files: pdfFiles.map(f => f.originalname),
+              transaction_count: allTransactions.length
+            })
+          } catch (uploadError) {
+            console.error('❌ Ошибка загрузки JSON файла в OpenAI:', uploadError.message)
+            if (jsonBuffer.length < 100000) {
+              console.warn('⚠️ Используем fallback: вставляем JSON в промпт (файл меньше 100KB)')
+              attachments.push({
+                is_converted: true,
+                source_files: pdfFiles.map(f => f.originalname),
+                json_data: jsonString,
+                transaction_count: allTransactions.length
+              })
+            } else {
+              throw new Error(`Не удалось загрузить JSON файл (${jsonBuffer.length} bytes) в OpenAI. Файл слишком большой для вставки в промпт.`)
+            }
+          }
+        } else {
+          attachments.push({
+            is_converted: true,
+            source_files: pdfFiles.map(f => f.originalname),
+            transaction_count: 0
+          })
+        }
+      } catch (conversionError) {
+        console.error('❌ Ошибка конвертации PDF в JSON:', conversionError.message)
+        throw new Error(`Не удалось конвертировать PDF файлы: ${conversionError.message}`)
+      }
+    }
+
+    // Обрабатываем остальные файлы (не PDF)
+    for (const file of otherFiles) {
+      console.log(`📤 Отправляем файл в OpenAI Files API: ${file.originalname} (${file.mimetype}, ${file.size} bytes)`)
+
+      const uploadedFile = await openaiClient.files.create({
+        file: await toFile(file.buffer, file.originalname, { type: file.mimetype }),
+        purpose: 'assistants',
+      })
+
+      console.log('✅ Файл загружен в OpenAI', {
+        fileId: uploadedFile.id,
+        filename: uploadedFile.filename,
+        purpose: uploadedFile.purpose,
+      })
+
+      const category = categorizeUploadedFile(file.originalname, file.mimetype)
+      try {
+        await saveFileToDB(
+          sessionId,
+          uploadedFile.id,
+          file.originalname,
+          file.size,
+          file.mimetype,
+          category
+        )
+      } catch (error) {
+        console.error('⚠️ Не удалось сохранить файл в БД, продолжаем работу', error)
+      }
+
+      attachments.push({
+        file_id: uploadedFile.id,
+        original_filename: file.originalname,
+      })
+    }
+
+    const filesDataJson = JSON.stringify(
+      files.map((file) => ({
+        name: file.originalname,
+        size: file.size,
+        mime: file.mimetype,
+      }))
+    )
+
+    try {
+      await upsertReport(sessionId, {
+        status: 'generating',
+        reportText: null,
+        reportStructured: null,
+        filesCount: files.length,
+        filesData: filesDataJson,
+        completed: null,
+        comment,
+      })
+    } catch (error) {
+      console.error('⚠️ Не удалось создать запись отчёта перед анализом', error)
+    }
+
+    const transactionsWithIds = Array.isArray(extractedTransactions) ? extractedTransactions : []
+
+    const { obviousRevenue, obviousNonRevenue, needsReview } = transactionProcessor.splitTransactionsByConfidence(transactionsWithIds)
+    const classificationStats = {
+      totalTransactions: transactionsWithIds.length,
+      autoRevenue: obviousRevenue.length,
+      autoNonRevenue: obviousNonRevenue.length,
+      agentReviewed: needsReview.length,
+    }
+
+    console.log('🧮 Подготовка операций перед классификацией', {
+      sessionId,
+      ...classificationStats,
+    })
+
+    // Асинхронная обработка классификации
+    ;(async () => {
+      try {
+        let runResult = null
+        let rawNewItems = []
+        let classificationEntries = []
+
+        if (needsReview.length > 0) {
+          if (!analysisRunner) {
+            analysisRunner = new Runner({})
+          }
+          const classifierAgent = createTransactionClassifierAgent()
+          const agentInput = [{
+            role: 'user',
+            content: [{
+              type: 'input_text',
+              text: transactionProcessor.buildClassifierPrompt(needsReview),
+            }],
+          }]
+
+          console.log('🤖 Запускаем классификатор операций через Runner (async)', {
+            sessionId,
+            needsReview: needsReview.length,
+          })
+
+          runResult = await analysisRunner.run(classifierAgent, agentInput)
+
+          rawNewItems = Array.isArray(runResult.newItems)
+            ? runResult.newItems.map((item) => item?.rawItem || item)
+            : []
+
+          const historyLengthBefore = history.length
+          if (rawNewItems.length > 0) {
+            history.push(...rawNewItems)
+          }
+
+          for (let index = 0; index < rawNewItems.length; index += 1) {
+            const item = rawNewItems[index]
+            const role = item?.role
+            if (role === 'assistant' || role === 'user') {
+              try {
+                await saveMessageToDB(sessionId, role, item.content, historyLengthBefore + index + 1)
+              } catch (dbError) {
+                if (dbError.code === 'XX000' || dbError.message?.includes('db_termination') || dbError.message?.includes('shutdown')) {
+                  console.error('⚠️ БД соединение разорвано при сохранении сообщения агента. Продолжаем работу без сохранения в БД.')
+                } else {
+                  console.error('⚠️ Ошибка сохранения сообщения агента в БД (продолжаем работу):', dbError.message)
+                }
+              }
+            }
+          }
+
+          let finalOutputText = ''
+          if (typeof runResult.finalOutput === 'string') {
+            finalOutputText = runResult.finalOutput.trim()
+          } else if (runResult.finalOutput && typeof runResult.finalOutput === 'object' && typeof runResult.finalOutput.text === 'string') {
+            finalOutputText = runResult.finalOutput.text.trim()
+          }
+
+          if (!finalOutputText) {
+            finalOutputText =
+              transactionProcessor.extractAssistantAnswer(rawNewItems) ||
+              transactionProcessor.extractAssistantAnswer(Array.isArray(runResult.history) ? runResult.history : []) ||
+              ''
+          }
+
+          classificationEntries = transactionProcessor.parseClassifierResponse(finalOutputText)
+
+          console.log('🗂️ Результаты классификации от агента', {
+            sessionId,
+            parsedTransactions: classificationEntries.length,
+            responseId: runResult.lastResponseId,
+          })
+        }
+
+        const decisionsMap = new Map()
+        for (const entry of classificationEntries) {
+          if (!entry || !entry.id) continue
+          const key = String(entry.id)
+          const isRevenue =
+            entry.is_revenue ??
+            entry.isRevenue ??
+            entry.revenue ??
+            (entry.label === 'revenue')
+          decisionsMap.set(key, {
+            isRevenue: Boolean(isRevenue),
+            reason: entry.reason || entry.explanation || '',
+          })
+        }
+
+        const reviewedRevenue = []
+        const reviewedNonRevenue = []
+
+        for (const transaction of needsReview) {
+          const decision =
+            decisionsMap.get(String(transaction._ikap_tx_id)) ||
+            decisionsMap.get(transaction._ikap_tx_id)
+          const isRevenue = decision ? decision.isRevenue : false
+          const reason =
+            decision?.reason ||
+            (decision ? '' : 'нет решения от агента, по умолчанию не выручка')
+
+          const enriched = {
+            ...transaction,
+            _ikap_classification_source: decision ? 'agent' : 'agent_missing',
+            _ikap_classification_reason: reason,
+          }
+
+          if (isRevenue) {
+            reviewedRevenue.push(enriched)
+          } else {
+            reviewedNonRevenue.push(enriched)
+          }
+        }
+
+        // Объединяем транзакции и сортируем по датам
+        const finalNonRevenueTransactions = [...obviousNonRevenue, ...reviewedNonRevenue]
+          .sort((a, b) => {
+            const dateA = transactionProcessor.extractTransactionDate(a)
+            const dateB = transactionProcessor.extractTransactionDate(b)
+            if (!dateA && !dateB) return 0
+            if (!dateA) return 1
+            if (!dateB) return -1
+            return dateA.getTime() - dateB.getTime()
+          })
+        const finalRevenueTransactions = [...obviousRevenue, ...reviewedRevenue]
+          .sort((a, b) => {
+            const dateA = transactionProcessor.extractTransactionDate(a)
+            const dateB = transactionProcessor.extractTransactionDate(b)
+            if (!dateA && !dateB) return 0
+            if (!dateA) return 1
+            if (!dateB) return -1
+            return dateA.getTime() - dateB.getTime()
+          })
+
+        const sortedObviousRevenue = [...obviousRevenue].sort((a, b) => {
+          const dateA = transactionProcessor.extractTransactionDate(a)
+          const dateB = transactionProcessor.extractTransactionDate(b)
+          if (!dateA && !dateB) return 0
+          if (!dateA) return 1
+          if (!dateB) return -1
+          return dateA.getTime() - dateB.getTime()
+        })
+
+        const structuredSummary = transactionProcessor.buildStructuredSummary({
+          revenueTransactions: finalRevenueTransactions,
+          nonRevenueTransactions: finalNonRevenueTransactions,
+          stats: {
+            ...classificationStats,
+            agentDecisions: decisionsMap.size,
+            unresolved: Math.max(0, needsReview.length - decisionsMap.size),
+          },
+          autoRevenuePreview: transactionProcessor.buildTransactionsPreview(sortedObviousRevenue, { limit: 10000 }),
+          convertedExcels,
+        })
+
+        const completedAt = new Date().toISOString()
+        const finalReportPayload = JSON.stringify(structuredSummary, null, 2)
+        const formattedReportText = transactionProcessor.formatReportAsText(structuredSummary)
+        const openaiStatus =
+          needsReview.length === 0 ? 'skipped' : decisionsMap.size > 0 ? 'completed' : 'partial'
+
+        await upsertReport(sessionId, {
+          status: 'completed',
+          reportText: formattedReportText,
+          reportStructured: finalReportPayload,
+          filesCount: files.length,
+          filesData: filesDataJson,
+          completed: completedAt,
+          comment,
+          openaiResponseId: runResult?.lastResponseId || null,
+          openaiStatus,
+        })
+
+        console.log('📦 Классификация операций завершена (async)', {
+          sessionId,
+          durationMs: Date.now() - startedAt.getTime(),
+          totalTransactions: transactionsWithIds.length,
+          autoRevenue: obviousRevenue.length,
+          autoNonRevenue: obviousNonRevenue.length,
+          reviewedByAgent: needsReview.length,
+          agentDecisions: decisionsMap.size,
+        })
+      } catch (streamError) {
+        console.error('❌ Ошибка в фоне при обработке классификации', {
+          sessionId,
+          error: streamError.message,
+        })
+        try {
+          await upsertReport(sessionId, {
+            status: 'failed',
+            reportText: streamError.message,
+            reportStructured: null,
+            filesCount: files.length,
+            filesData: filesDataJson,
+            completed: new Date().toISOString(),
+            comment,
+            openaiResponseId: null,
+            openaiStatus: 'failed',
+          })
+        } catch (dbError) {
+          console.error('⚠️ Не удалось зафиксировать ошибку в БД (async)', dbError)
+        }
+      } finally {
+        activeAnalysisSessions.delete(sessionId)
+      }
+    })().catch((unhandled) => {
+      console.error('❌ Необработанная ошибка фоновой классификации', {
+        sessionId,
+        error: unhandled?.message || unhandled,
+      })
+      activeAnalysisSessions.delete(sessionId)
+    })
+
+    const progress = await getSessionProgress(sessionId)
+
+    return res.status(202).json({
+      ok: true,
+      sessionId,
+      status: 'generating',
+      openaiStatus: 'generating',
+      message: 'Анализ запущен. Обновите историю позже, чтобы увидеть результат.',
+      data: {
+        progress,
+      },
+      completed: false,
+    })
+  } catch (error) {
+    console.error('❌ Ошибка анализа выписок', {
+      sessionId,
+      error: error.message,
+      stack: error.stack,
+    })
+
+    activeAnalysisSessions.delete(sessionId)
+
+    try {
+      await upsertReport(sessionId, {
+        status: 'failed',
+        reportText: error.message,
+        reportStructured: null,
+        filesCount: files.length,
+        filesData: JSON.stringify(summariseFilesForLog(files)),
+        completed: new Date().toISOString(),
+        comment,
+        openaiStatus: 'failed',
+      })
+    } catch (dbError) {
+      console.error('⚠️ Не удалось зафиксировать ошибку в БД', dbError)
+    }
+
+    return res.status(500).json({
+      ok: false,
+      code: 'ANALYSIS_FAILED',
+      message: 'Не удалось завершить анализ выписок. Проверьте логи на сервере.',
+      error: error.message,
+    })
+  }
+})
+
 // Эндпоинт для получения финансового отчета
 // Эндпоинт для получения отчета по session_id
 app.get('/api/reports/:sessionId', async (req, res) => {
@@ -1777,30 +2378,36 @@ app.get('/api/reports/:sessionId', async (req, res) => {
       })
     }
     
-    console.log(`✅ Отчет найден, статус: ${report.status}`)
+    // Форматируем report_text если это JSON
+    const formattedReport = transactionProcessor.ensureHumanReadableReportText({ ...report })
+    
+    console.log(`✅ Отчет найден, статус: ${formattedReport.status}`)
     return res.json({
       ok: true,
       report: {
-        sessionId: report.session_id,
-        bin: report.company_bin,
-        amount: report.amount,
-        term: report.term,
-        purpose: report.purpose,
-        name: report.name,
-        email: report.email,
-        phone: report.phone,
-        filesCount: report.files_count,
-        status: report.status,
-        reportText: report.report_text,
-        createdAt: report.created_at,
-        completedAt: report.completed_at,
+        sessionId: formattedReport.session_id,
+        bin: formattedReport.company_bin,
+        amount: formattedReport.amount,
+        term: formattedReport.term,
+        purpose: formattedReport.purpose,
+        name: formattedReport.name,
+        email: formattedReport.email,
+        phone: formattedReport.phone,
+        filesCount: formattedReport.files_count,
+        status: formattedReport.status,
+        reportText: formattedReport.report_text,
+        reportStructured: formattedReport.report_structured,
+        createdAt: formattedReport.created_at,
+        completedAt: formattedReport.completed_at,
         // Новые поля аналитов
-        taxStatus: report.tax_status,
-        taxReportText: report.tax_report_text,
-        taxMissing: report.tax_missing_periods,
-        fsStatus: report.fs_status,
-        fsReportText: report.fs_report_text,
-        fsMissing: report.fs_missing_periods
+        taxStatus: formattedReport.tax_status,
+        taxReportText: formattedReport.tax_report_text,
+        taxMissing: formattedReport.tax_missing_periods,
+        fsStatus: formattedReport.fs_status,
+        fsReportText: formattedReport.fs_report_text,
+        fsMissing: formattedReport.fs_missing_periods,
+        openaiResponseId: formattedReport.openai_response_id,
+        openaiStatus: formattedReport.openai_status,
       }
     })
   } catch (error) {
@@ -2037,36 +2644,42 @@ app.get('/api/reports', async (req, res) => {
     const reports = await db.prepare(`
       SELECT session_id, company_bin, amount, term, purpose, name, email, phone, 
              status, files_count, created_at, completed_at,
-             tax_status, fs_status
+             tax_status, fs_status, report_text, report_structured,
+             openai_response_id, openai_status
       FROM reports 
       ORDER BY created_at DESC
+      LIMIT 100
     `).all()
     
-    console.log(`📋 Получен список заявок: ${reports.length} шт.`)
-    return res.json({
-      ok: true,
-      reports: reports.map(r => ({
-        sessionId: r.session_id,
-        bin: r.company_bin,
-        amount: r.amount,
-        term: r.term,
-        purpose: r.purpose,
-        name: r.name,
-        email: r.email,
-        phone: r.phone,
-        filesCount: r.files_count,
-        status: r.status,
-        taxStatus: r.tax_status,
-        fsStatus: r.fs_status,
-        createdAt: r.created_at,
-        completedAt: r.completed_at
-      }))
-    })
+    // Форматируем каждый отчет
+    const formattedReports = reports.map(r => transactionProcessor.ensureHumanReadableReportText({ ...r }))
+    
+    console.log(`📋 Получен список заявок: ${formattedReports.length} шт.`)
+    return res.json(formattedReports.map(r => ({
+      session_id: r.session_id,
+      company_bin: r.company_bin,
+      amount: r.amount,
+      term: r.term,
+      purpose: r.purpose,
+      name: r.name,
+      email: r.email,
+      phone: r.phone,
+      files_count: r.files_count,
+      status: r.status,
+      tax_status: r.tax_status,
+      fs_status: r.fs_status,
+      report_text: r.report_text,
+      report_structured: r.report_structured,
+      created_at: r.created_at,
+      completed_at: r.completed_at,
+      openai_response_id: r.openai_response_id,
+      openai_status: r.openai_status,
+    })))
   } catch (error) {
     console.error('❌ Ошибка получения списка заявок:', error)
     return res.status(500).json({
       ok: false,
-      message: 'Ошибка сервера'
+      message: 'Не удалось получить отчёты.'
     })
   }
 })
