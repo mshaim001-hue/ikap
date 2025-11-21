@@ -719,14 +719,13 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
     if (agentName === 'investment' && files && files.length > 0) {
       console.log(`📎 Обрабатываем ${files.length} файл(ов)...`)
       
-      try {
-        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-        const fileNames = []
-        
-        for (const file of files) {
-          try {
-            console.log(`📎 Обрабатываем файл: ${file.originalname}, размер: ${file.size} байт`)
-            console.log(`📎 Тип файла: ${file.mimetype}, buffer type: ${typeof file.buffer}, buffer length: ${file.buffer?.length || 'N/A'}`)
+      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+      const fileNames = []
+      
+      for (const file of files) {
+        try {
+          console.log(`📎 Обрабатываем файл: ${file.originalname}, размер: ${file.size} байт`)
+          console.log(`📎 Тип файла: ${file.mimetype}, buffer type: ${typeof file.buffer}, buffer length: ${file.buffer?.length || 'N/A'}`)
           
           // Создаем File объект для загрузки в OpenAI (используем toFile из openai/uploads)
           const uploadedFile = await openai.files.create({
