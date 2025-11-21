@@ -726,10 +726,8 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
         try {
           console.log(`📎 Обрабатываем файл: ${file.originalname}, размер: ${file.size} байт`)
           
-          // Создаем File объект для Node.js
-          const fileToUpload = new File([file.buffer], file.originalname, {
-            type: file.mimetype
-          })
+          // Создаем File объект для загрузки в OpenAI (используем toFile из openai/uploads)
+          const fileToUpload = await toFile(file.buffer, file.originalname, { type: file.mimetype })
           
           const uploadedFile = await openai.files.create({
             file: fileToUpload,
