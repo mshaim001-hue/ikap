@@ -719,18 +719,18 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
     if (agentName === 'investment' && files && files.length > 0) {
       console.log(`📎 Обрабатываем ${files.length} файл(ов)...`)
       
-      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-      const fileNames = []
-      
-      for (const file of files) {
-        try {
-          console.log(`📎 Обрабатываем файл: ${file.originalname}, размер: ${file.size} байт`)
+      try {
+        const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+        const fileNames = []
+        
+        for (const file of files) {
+          try {
+            console.log(`📎 Обрабатываем файл: ${file.originalname}, размер: ${file.size} байт`)
+            console.log(`📎 Тип файла: ${file.mimetype}, buffer type: ${typeof file.buffer}, buffer length: ${file.buffer?.length || 'N/A'}`)
           
           // Создаем File объект для загрузки в OpenAI (используем toFile из openai/uploads)
-          const fileToUpload = await toFile(file.buffer, file.originalname, { type: file.mimetype })
-          
           const uploadedFile = await openai.files.create({
-            file: fileToUpload,
+            file: await toFile(file.buffer, file.originalname, { type: file.mimetype }),
             purpose: 'assistants'
           })
           
@@ -766,11 +766,12 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
           }
         } catch (error) {
           console.error(`❌ Ошибка загрузки файла ${file.originalname}:`, error)
+          console.error(`❌ Стек ошибки загрузки файла:`, error.stack)
           fileNames.push(`${file.originalname} (ошибка загрузки)`)
         }
       }
       
-      console.log(`💾 Всего файлов в сессии: ${sessionFiles.get(session).length}`)
+      console.log(`💾 Всего файлов в сессии: ${sessionFiles.get(session)?.length || 0}`)
       
       // Добавляем информацию о файлах в текст (без анализа)
       const filesInfo = fileNames.length === 1 
@@ -1824,6 +1825,13 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
       })
   } catch (e) {
     console.error('❌ Ошибка в /api/agents/run:', e)
+    console.error('❌ Стек ошибки:', e.stack)
+    console.error('❌ Детали ошибки:', {
+      name: e.name,
+      message: e.message,
+      code: e.code,
+      stack: e.stack
+    })
     
     // Обработка ошибок Multer
     if (e.name === 'MulterError') {
