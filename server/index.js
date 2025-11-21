@@ -2756,7 +2756,8 @@ app.get('/api/reports', async (req, res) => {
       SELECT session_id, company_bin, amount, term, purpose, name, email, phone, 
              status, files_count, created_at, completed_at,
              tax_status, fs_status, report_text, report_structured,
-             openai_response_id, openai_status
+             openai_response_id, openai_status, tax_report_text, fs_report_text,
+             tax_missing_periods, fs_missing_periods
       FROM reports 
       ORDER BY created_at DESC
       LIMIT 100
@@ -2766,26 +2767,33 @@ app.get('/api/reports', async (req, res) => {
     const formattedReports = reports.map(r => transactionProcessor.ensureHumanReadableReportText({ ...r }))
     
     console.log(`📋 Получен список заявок: ${formattedReports.length} шт.`)
-    return res.json(formattedReports.map(r => ({
-      session_id: r.session_id,
-      company_bin: r.company_bin,
-      amount: r.amount,
-      term: r.term,
-      purpose: r.purpose,
-      name: r.name,
-      email: r.email,
-      phone: r.phone,
-      files_count: r.files_count,
-      status: r.status,
-      tax_status: r.tax_status,
-      fs_status: r.fs_status,
-      report_text: r.report_text,
-      report_structured: r.report_structured,
-      created_at: r.created_at,
-      completed_at: r.completed_at,
-      openai_response_id: r.openai_response_id,
-      openai_status: r.openai_status,
-    })))
+    return res.json({
+      ok: true,
+      reports: formattedReports.map(r => ({
+        sessionId: r.session_id,
+        bin: r.company_bin,
+        amount: r.amount,
+        term: r.term,
+        purpose: r.purpose,
+        name: r.name,
+        email: r.email,
+        phone: r.phone,
+        filesCount: r.files_count,
+        status: r.status,
+        taxStatus: r.tax_status,
+        fsStatus: r.fs_status,
+        reportText: r.report_text,
+        reportStructured: r.report_structured,
+        createdAt: r.created_at,
+        completedAt: r.completed_at,
+        openaiResponseId: r.openai_response_id,
+        openaiStatus: r.openai_status,
+        taxReportText: r.tax_report_text,
+        fsReportText: r.fs_report_text,
+        taxMissing: r.tax_missing_periods,
+        fsMissing: r.fs_missing_periods,
+      }))
+    })
   } catch (error) {
     console.error('❌ Ошибка получения списка заявок:', error)
     return res.status(500).json({
