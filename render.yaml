@@ -14,5 +14,20 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
+      # Adobe PDF Services API (для конвертации PDF выписок)
+      - key: ADOBE_CLIENT_ID
+        sync: false
+      - key: ADOBE_CLIENT_SECRET
+        sync: false
+      # Настройки PDF-сервиса
+      - key: PDF_SERVICE_PATH
+        value: /opt/render/project/src/ikap2/pdf
+      - key: PYTHON_PATH
+        value: python3
+      # Опционально: использовать HTTP сервис для PDF конвертации
+      # - key: USE_PDF_SERVICE_HTTP
+      #   value: "true"
+      # - key: PDF_SERVICE_URL
+      #   value: http://localhost:8000
     healthCheckPath: /api/reports
 
