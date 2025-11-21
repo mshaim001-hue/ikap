@@ -735,9 +735,19 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
           console.log(`📎 Обрабатываем файл: ${file.originalname}, размер: ${file.size} байт`)
           console.log(`📎 Тип файла: ${file.mimetype}, buffer type: ${typeof file.buffer}, buffer length: ${file.buffer?.length || 'N/A'}`)
           
+          // Проверяем, что buffer существует
+          if (!file.buffer || !Buffer.isBuffer(file.buffer)) {
+            throw new Error(`Файл ${file.originalname} не содержит buffer или buffer не является Buffer`)
+          }
+          
           // Создаем File объект для загрузки в OpenAI (используем toFile из openai/uploads)
+          console.log(`📤 Создаем File объект для ${file.originalname}...`)
+          const fileToUpload = await toFile(file.buffer, file.originalname, { type: file.mimetype })
+          console.log(`✅ File объект создан для ${file.originalname}`)
+          
+          console.log(`📤 Загружаем файл в OpenAI...`)
           const uploadedFile = await openai.files.create({
-            file: await toFile(file.buffer, file.originalname, { type: file.mimetype }),
+            file: fileToUpload,
             purpose: 'assistants'
           })
           
