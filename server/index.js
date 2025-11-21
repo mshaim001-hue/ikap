@@ -963,7 +963,8 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             console.log(`📊 Генерация отчетов для ${statementFiles.length} банковских выписок (из ${allFiles.length} файлов)...`)
             console.log(`📎 Выписки для анализа:`, statementFiles)
             
-            // ИЗМЕНЕНИЕ: Каждый файл будет анализироваться отдельно
+            // НОВЫЙ МЕТОД: Используем новую логику обработки выписок (конвертация -> классификация -> отчет)
+            console.log(`🔄 Используем новый метод обработки выписок для ${statementFiles.length} файл(ов)`)
             
             // Извлекаем ключевую информацию из истории (без передачи всех сообщений)
             let amount = 'не указана'
@@ -1204,162 +1205,246 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             await insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, statementFiles.length, filesData)
             console.log(`💾 Заявка сохранена в БД: ${session}, выписок: ${statementFiles.length}`)
             
-            // ИЗМЕНЕНИЕ: Анализируем каждый файл отдельно
-            const TIMEOUT_MS = 30 * 60 * 1000 // 30 минут на файл
-            const fileReports = [] // Массив отчетов для каждого файла
-            
-            // Функция для анализа одного файла
-            const analyzeSingleFile = async (file) => {
-              const fileStartTime = Date.now()
-              console.log(`\n📄 Анализируем файл: ${file.originalName} (${file.fileId})`)
+            // НОВЫЙ МЕТОД: Обрабатываем выписки через новый метод (конвертация -> классификация -> отчет)
+            try {
+              console.log(`📥 Скачиваем ${statementFiles.length} файл(ов) из OpenAI для обработки...`)
               
-              const reportRequest = `Создай подробный финансовый отчет на основе банковской выписки.
-
-ДАННЫЕ ЗАЯВКИ:
+              // Скачиваем файлы из OpenAI
+              const downloadedFiles = []
+              for (const file of statementFiles) {
+                try {
+                  console.log(`📥 Скачиваем файл: ${file.originalName} (${file.fileId})`)
+                  const fileContent = await openaiClient.files.content(file.fileId)
+                  const buffer = Buffer.from(await fileContent.arrayBuffer())
+                  downloadedFiles.push({
+                    buffer,
+                    originalname: file.originalName,
+                    mimetype: 'application/pdf',
+                    size: buffer.length
+                  })
+                  console.log(`✅ Файл скачан: ${file.originalName} (${buffer.length} bytes)`)
+                } catch (downloadError) {
+                  console.error(`❌ Ошибка скачивания файла ${file.originalName}:`, downloadError.message)
+                  // Продолжаем с остальными файлами
+                }
+              }
+              
+              if (downloadedFiles.length === 0) {
+                throw new Error('Не удалось скачать ни один файл из OpenAI')
+              }
+              
+              console.log(`✅ Скачано ${downloadedFiles.length} файл(ов), начинаем обработку через новый метод...`)
+              
+              // Формируем комментарий с данными заявки
+              const commentText = `Данные заявки:
 - Компания (БИН): ${bin}
 - Запрашиваемая сумма: ${amount}
-- Срок: ${termMonths}
+- Срок: ${termMonths} месяцев
 - Цель финансирования: ${purpose}
-- Контакты: ${name}, ${email}, ${phone}
-
-ЗАДАЧА:
-Проанализируй банковскую выписку "${file.originalName}" (файл прикреплен) и создай финансовый отчет по структуре из твоих инструкций.
-
-КРИТИЧЕСКИ ВАЖНО:
-1. Банковская выписка должна содержать данные ЗА ПОСЛЕДНИЕ 12 МЕСЯЦЕВ. Файл может быть очень большим (100+ страниц).
-2. ОБЯЗАТЕЛЬНО прочитай ВЕСЬ файл полностью - все страницы, все разделы. Не останавливайся на первых страницах!
-3. Используй Code Interpreter для чтения ВСЕГО PDF файла целиком. Если файл большой, обработай его по частям, но проанализируй ВСЕ страницы.
-4. Проверь весь период в файле - найди самую раннюю и самую позднюю дату операций. Выписка должна покрывать 12 месяцев.
-5. Если в файле есть данные за несколько месяцев или весь год, проанализируй ВСЕ данные за весь период, а не только первые несколько дней.
-6. Если файл содержит данные за разные периоды на разных страницах, объедини их все для анализа за полный 12-месячный период.
-7. Если после полного анализа файла оказалось, что данных меньше 12 месяцев, укажи это явно, но проанализируй все доступные данные.
-
-ВАЖНО ДЛЯ БОЛЬШИХ ФАЙЛОВ:
-- Файл может содержать 100+ страниц - прочитай ВСЕ страницы
-- Не ограничивайся первыми страницами или первыми днями
-- Проверь все разделы файла, все таблицы операций
-- Используй pandas или другие инструменты для обработки всех данных из файла
-
-Проанализируй файл максимально тщательно, прочитав ВСЕ страницы, ищи все данные за последние 12 месяцев.`
+- Контакты: ${name}, ${email}, ${phone}`
               
-              const analysisTimeout = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error(`Financial Analyst timeout для ${file.originalName} (${TIMEOUT_MS/1000}s)`)), TIMEOUT_MS)
-              )
+              // Используем логику из /api/analysis для обработки файлов
+              // Конвертируем PDF в JSON
+              const pdfFiles = downloadedFiles.filter(f => f.mimetype === 'application/pdf' || f.originalname.toLowerCase().endsWith('.pdf'))
               
-              try {
-                // Создаем агента с доступом только к одному файлу
-                const analystWithFile = new Agent({
-                  ...financialAnalystAgent,
-                  tools: [codeInterpreterTool({ 
-                    container: { 
-                      type: 'auto', 
-                      file_ids: [file.fileId] 
-                    } 
-                  })]
-                })
+              if (pdfFiles.length > 0) {
+                console.log(`🔄 Конвертирую ${pdfFiles.length} PDF файл(ов) в JSON...`)
+                const pdfDataForConversion = pdfFiles.map(file => ({
+                  buffer: file.buffer,
+                  filename: file.originalname
+                }))
                 
-                const reportRunner = new Runner({})
+                const jsonResults = await convertPdfsToJson(pdfDataForConversion)
+                console.log(`✅ Конвертация завершена: получено ${jsonResults.length} результат(ов)`)
                 
-                console.log(`⚙️ Запускаем анализ файла "${file.originalName}"...`)
+                // Объединяем все транзакции из всех файлов
+                const allTransactions = []
+                const allMetadata = []
                 
-                const result = await Promise.race([
-                  reportRunner.run(analystWithFile, [{
-                    role: 'user',
-                    content: [{ type: 'input_text', text: reportRequest }]
-                  }]),
-                  analysisTimeout
-                ])
-                
-                // Извлекаем отчет из результата
-                let report = null
-                for (let i = result.newItems.length - 1; i >= 0; i--) {
-                  const item = result.newItems[i]
-                  if (item.rawItem?.role === 'assistant') {
-                    if (Array.isArray(item.rawItem.content)) {
-                      for (const contentItem of item.rawItem.content) {
-                        if ((contentItem?.type === 'text' || contentItem?.type === 'output_text') && contentItem?.text) {
-                          if (typeof contentItem.text === 'string') {
-                            report = contentItem.text
-                            break
-                          } else if (typeof contentItem.text === 'object' && contentItem.text.value) {
-                            report = contentItem.text.value
-                            break
-                          }
-                        }
-                      }
-                    } else if (typeof item.rawItem.content === 'string') {
-                      report = item.rawItem.content
-                    }
-                    if (report) break
+                for (const result of jsonResults) {
+                  if (result.error) {
+                    console.warn(`⚠️ Ошибка при конвертации файла ${result.source_file}: ${result.error}`)
+                    continue
+                  }
+                  
+                  if (result.transactions && Array.isArray(result.transactions)) {
+                    console.log(`📊 Добавляю ${result.transactions.length} транзакций из файла ${result.source_file}`)
+                    allTransactions.push(...result.transactions)
+                  }
+                  
+                  if (result.metadata) {
+                    allMetadata.push(result.metadata)
                   }
                 }
                 
-                if (!report) {
-                  report = `Отчет для файла "${file.originalName}" не сгенерирован - не удалось извлечь текст из ответа агента.`
-                }
+                console.log(`📊 Итого собрано транзакций: ${allTransactions.length}`)
                 
-                const fileAnalysisTime = ((Date.now() - fileStartTime) / 1000).toFixed(2)
-                console.log(`✅ Анализ файла "${file.originalName}" завершен за ${fileAnalysisTime}s`)
+                const transactionsWithInternalIds = transactionProcessor.attachInternalTransactionIds(allTransactions, session)
                 
-                return {
-                  fileId: file.fileId,
-                  fileName: file.originalName,
-                  report: report
-                }
-              } catch (error) {
-                console.error(`❌ Ошибка анализа файла "${file.originalName}":`, error.message)
-                return {
-                  fileId: file.fileId,
-                  fileName: file.originalName,
-                  report: `Ошибка анализа файла "${file.originalName}": ${error.message}`
-                }
-              }
-            }
-            
-            // Анализируем все файлы параллельно
-            console.log(`\n🚀 Запускаем анализ ${statementFiles.length} файлов параллельно...`)
-            const analysisPromises = statementFiles.map(file => analyzeSingleFile(file))
-            const results = await Promise.allSettled(analysisPromises)
-            
-            // Собираем успешные отчеты
-            results.forEach((result, index) => {
-              if (result.status === 'fulfilled') {
-                fileReports.push(result.value)
-                console.log(`✅ Отчет ${index + 1}/${statementFiles.length} готов: ${result.value.fileName}`)
-              } else {
-                const file = statementFiles[index]
-                fileReports.push({
-                  fileId: file.fileId,
-                  fileName: file.originalName,
-                  report: `Ошибка анализа: ${result.reason?.message || 'Неизвестная ошибка'}`
+                // Классифицируем транзакции
+                const { obviousRevenue, obviousNonRevenue, needsReview } = transactionProcessor.splitTransactionsByConfidence(transactionsWithInternalIds)
+                
+                console.log('🧮 Классификация транзакций:', {
+                  total: transactionsWithInternalIds.length,
+                  autoRevenue: obviousRevenue.length,
+                  autoNonRevenue: obviousNonRevenue.length,
+                  needsReview: needsReview.length,
                 })
-                console.error(`❌ Ошибка анализа файла ${file.originalName}:`, result.reason)
+                
+                // Если есть транзакции для проверки агентом, запускаем классификатор
+                let reviewedRevenue = []
+                let reviewedNonRevenue = []
+                
+                if (needsReview.length > 0) {
+                  console.log(`🤖 Запускаем классификатор для ${needsReview.length} транзакций...`)
+                  if (!analysisRunner) {
+                    analysisRunner = new Runner({})
+                  }
+                  const classifierAgent = createTransactionClassifierAgent()
+                  const agentInput = [{
+                    role: 'user',
+                    content: [{
+                      type: 'input_text',
+                      text: transactionProcessor.buildClassifierPrompt(needsReview),
+                    }],
+                  }]
+                  
+                  const runResult = await analysisRunner.run(classifierAgent, agentInput)
+                  
+                  let finalOutputText = ''
+                  if (typeof runResult.finalOutput === 'string') {
+                    finalOutputText = runResult.finalOutput.trim()
+                  } else if (runResult.finalOutput && typeof runResult.finalOutput === 'object' && typeof runResult.finalOutput.text === 'string') {
+                    finalOutputText = runResult.finalOutput.text.trim()
+                  }
+                  
+                  if (!finalOutputText) {
+                    const rawNewItems = Array.isArray(runResult.newItems)
+                      ? runResult.newItems.map((item) => item?.rawItem || item)
+                      : []
+                    finalOutputText = transactionProcessor.extractAssistantAnswer(rawNewItems) || ''
+                  }
+                  
+                  const classificationEntries = transactionProcessor.parseClassifierResponse(finalOutputText)
+                  
+                  const decisionsMap = new Map()
+                  for (const entry of classificationEntries) {
+                    if (!entry || !entry.id) continue
+                    const key = String(entry.id)
+                    const isRevenue =
+                      entry.is_revenue ??
+                      entry.isRevenue ??
+                      entry.revenue ??
+                      (entry.label === 'revenue')
+                    decisionsMap.set(key, {
+                      isRevenue: Boolean(isRevenue),
+                      reason: entry.reason || entry.explanation || '',
+                    })
+                  }
+                  
+                  for (const transaction of needsReview) {
+                    const decision =
+                      decisionsMap.get(String(transaction._ikap_tx_id)) ||
+                      decisionsMap.get(transaction._ikap_tx_id)
+                    const isRevenue = decision ? decision.isRevenue : false
+                    const reason =
+                      decision?.reason ||
+                      (decision ? '' : 'нет решения от агента, по умолчанию не выручка')
+                    
+                    const enriched = {
+                      ...transaction,
+                      _ikap_classification_source: decision ? 'agent' : 'agent_missing',
+                      _ikap_classification_reason: reason,
+                    }
+                    
+                    if (isRevenue) {
+                      reviewedRevenue.push(enriched)
+                    } else {
+                      reviewedNonRevenue.push(enriched)
+                    }
+                  }
+                  
+                  console.log(`✅ Классификация завершена: ${reviewedRevenue.length} выручка, ${reviewedNonRevenue.length} не выручка`)
+                }
+                
+                // Объединяем транзакции и сортируем по датам
+                const finalNonRevenueTransactions = [...obviousNonRevenue, ...reviewedNonRevenue]
+                  .sort((a, b) => {
+                    const dateA = transactionProcessor.extractTransactionDate(a)
+                    const dateB = transactionProcessor.extractTransactionDate(b)
+                    if (!dateA && !dateB) return 0
+                    if (!dateA) return 1
+                    if (!dateB) return -1
+                    return dateA.getTime() - dateB.getTime()
+                  })
+                const finalRevenueTransactions = [...obviousRevenue, ...reviewedRevenue]
+                  .sort((a, b) => {
+                    const dateA = transactionProcessor.extractTransactionDate(a)
+                    const dateB = transactionProcessor.extractTransactionDate(b)
+                    if (!dateA && !dateB) return 0
+                    if (!dateA) return 1
+                    if (!dateB) return -1
+                    return dateA.getTime() - dateB.getTime()
+                  })
+                
+                const sortedObviousRevenue = [...obviousRevenue].sort((a, b) => {
+                  const dateA = transactionProcessor.extractTransactionDate(a)
+                  const dateB = transactionProcessor.extractTransactionDate(b)
+                  if (!dateA && !dateB) return 0
+                  if (!dateA) return 1
+                  if (!dateB) return -1
+                  return dateA.getTime() - dateB.getTime()
+                })
+                
+                // Формируем структурированный отчет
+                const structuredSummary = transactionProcessor.buildStructuredSummary({
+                  revenueTransactions: finalRevenueTransactions,
+                  nonRevenueTransactions: finalNonRevenueTransactions,
+                  stats: {
+                    totalTransactions: transactionsWithInternalIds.length,
+                    autoRevenue: obviousRevenue.length,
+                    autoNonRevenue: obviousNonRevenue.length,
+                    agentReviewed: needsReview.length,
+                    agentDecisions: needsReview.length > 0 ? (reviewedRevenue.length + reviewedNonRevenue.length) : 0,
+                    unresolved: Math.max(0, needsReview.length - (reviewedRevenue.length + reviewedNonRevenue.length)),
+                  },
+                  autoRevenuePreview: transactionProcessor.buildTransactionsPreview(sortedObviousRevenue, { limit: 10000 }),
+                  convertedExcels: [],
+                })
+                
+                const formattedReportText = transactionProcessor.formatReportAsText(structuredSummary)
+                const finalReportPayload = JSON.stringify(structuredSummary, null, 2)
+                
+                // Сохраняем отчет в БД
+                await upsertReport(session, {
+                  status: 'completed',
+                  reportText: formattedReportText,
+                  reportStructured: finalReportPayload,
+                  filesCount: statementFiles.length,
+                  filesData: JSON.stringify(statementFiles.map(f => ({ name: f.originalName, size: f.size }))),
+                  completed: new Date().toISOString(),
+                  comment: commentText,
+                  openaiResponseId: null,
+                  openaiStatus: needsReview.length === 0 ? 'skipped' : (reviewedRevenue.length + reviewedNonRevenue.length > 0 ? 'completed' : 'partial'),
+                })
+                
+                console.log(`✅ Отчет сгенерирован и сохранен в БД для сессии: ${session}`)
+                console.log(`📊 Статистика: ${finalRevenueTransactions.length} выручка, ${finalNonRevenueTransactions.length} не выручка`)
+              } else {
+                throw new Error('Не найдено PDF файлов для обработки')
               }
-            })
-            
-            // Объединяем все отчеты в один текст
-            const combinedReport = fileReports.map((fr, idx) => {
-              return `\n\n${'='.repeat(80)}\nОТЧЕТ ${idx + 1} из ${fileReports.length}\nФайл: ${fr.fileName}\n${'='.repeat(80)}\n\n${fr.report}`
-            }).join('\n\n')
-            
-            // Сохраняем объединенный отчет в БД
-            console.log(`💾 Сохраняем ${fileReports.length} отчетов в БД...`)
-            const updateReport = db.prepare(`
-              UPDATE reports 
-              SET report_text = ?, status = 'completed', completed_at = CURRENT_TIMESTAMP
-              WHERE session_id = ?
-            `)
-            await updateReport.run(combinedReport, session)
-            console.log(`💾 Отчеты сохранены в БД для сессии: ${session}`)
-            
-            console.log(`✅ Финансовые отчеты сгенерированы для всех ${fileReports.length} файлов`)
-            console.log(`📊 ========== ОТЧЕТЫ ДЛЯ МЕНЕДЖЕРА ==========`)
-            console.log(`Всего отчетов: ${fileReports.length}`)
-            fileReports.forEach((fr, idx) => {
-              console.log(`\nОтчет ${idx + 1}: ${fr.fileName}`)
-              console.log(fr.report.substring(0, 200) + '...')
-            })
-            console.log(`📊 ==========================================\n`)
+            } catch (processingError) {
+              console.error(`❌ Ошибка обработки выписок новым методом:`, processingError.message)
+              console.error(`❌ Стек ошибки:`, processingError.stack)
+              
+              // Сохраняем ошибку в БД
+              const updateError = db.prepare(`
+                UPDATE reports 
+                SET report_text = ?, status = 'error', completed_at = CURRENT_TIMESTAMP
+                WHERE session_id = ?
+              `)
+              await updateError.run(`Ошибка обработки выписок: ${processingError.message}`, session)
+            }
             
           } catch (error) {
             console.error(`❌ Ошибка генерации отчета:`, error.message)
@@ -1368,7 +1453,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             // Если это таймаут — НЕ помечаем отчет как error, оставляем status=generating.
             // Агент мог продолжить выполнение в OpenAI, и отчет придет позже.
             if (String(error.message || '').includes('timeout')) {
-              console.warn('⏳ Financial Analyst не успел за таймаут. Статус оставлен generating, отчет может появиться позже.')
+              console.warn('⏳ Обработка не успела за таймаут. Статус оставлен generating, отчет может появиться позже.')
             } else {
               // Сохраняем ошибку в БД
               const updateError = db.prepare(`
@@ -1382,7 +1467,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             runningStatementsSessions.delete(session)
           }
         })
-
+        
         // Параллельно запускаем анализ налоговой и фин. отчетности
         setImmediate(async () => {
           try {
@@ -1400,6 +1485,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               runningTaxSessions.delete(session)
               return
             }
+            
             // Собираем файлы налоговой отчетности
             const taxFilesRows = await db.prepare(`
               SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'taxes' ORDER BY uploaded_at ASC
