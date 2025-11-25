@@ -109,10 +109,17 @@ except Exception as e:
 print(text)
 `
 
-    const pythonProcess = spawn('python3', ['-c', pythonScript], {
+    // Определяем Python executable
+    const pythonExecutable = process.env.PYTHON_PATH || 'python3'
+    
+    const pythonProcess = spawn(pythonExecutable, ['-c', pythonScript], {
       cwd: TAX_PDF_TO_PATH,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONUNBUFFERED: '1' }
+      env: { 
+        ...process.env, 
+        PYTHONUNBUFFERED: '1',
+        PYTHONPATH: `${TAX_PDF_TO_PATH}:${process.env.PYTHONPATH || ''}`
+      }
     })
 
     let stdout = ''

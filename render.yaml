@@ -3,7 +3,7 @@ services:
     name: ikap-app
     env: node
     plan: starter
-    buildCommand: npm install && npm run build && cd taxpdfto && pip3 install -r requirements.txt || echo "Python dependencies installation skipped"
+    buildCommand: npm install && npm run build && (cd taxpdfto && bash install_deps.sh 2>&1 || echo "Warning: Python dependencies installation failed, continuing...")
     startCommand: npm start
     envVars:
       - key: NODE_ENV
