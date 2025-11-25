@@ -3,7 +3,7 @@ services:
     name: ikap-app
     env: node
     plan: starter
-    buildCommand: npm install && npm run build
+    buildCommand: npm install && npm run build && cd taxpdfto && pip3 install -r requirements.txt || echo "Python dependencies installation skipped"
     startCommand: npm start
     envVars:
       - key: NODE_ENV
@@ -24,6 +24,9 @@ services:
         value: /opt/render/project/src/ikap2/pdf
       - key: PYTHON_PATH
         value: python3
+      # Настройки парсера налоговых PDF
+      - key: TAX_PDF_TO_PATH
+        value: /opt/render/project/src/taxpdfto
       # Опционально: использовать HTTP сервис для PDF конвертации
       # - key: USE_PDF_SERVICE_HTTP
       #   value: "true"

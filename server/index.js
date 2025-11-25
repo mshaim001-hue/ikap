@@ -9,6 +9,7 @@ const { toFile } = require('openai/uploads')
 const { createDb } = require('./db')
 const { convertPdfsToJson } = require('./pdfConverter')
 const transactionProcessor = require('./transactionProcessor')
+const { parseTaxPdfToText } = require('./taxPdfParser')
 try { require('dotenv').config({ path: '.env.local' }) } catch {}
 require('dotenv').config()
 
@@ -1536,13 +1537,43 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 const fileStartTime = Date.now()
                 console.log(`\n📄 Анализируем налоговый файл: ${file.originalName} (${file.fileId})`)
                 
+                let txtFileId = file.fileId // По умолчанию используем оригинальный fileId
+                
+                try {
+                  // ШАГ 1: Скачиваем PDF файл из OpenAI Files API
+                  console.log(`📥 Скачиваем PDF файл "${file.originalName}" из OpenAI...`)
+                  const pdfFileContent = await openaiClient.files.content(file.fileId)
+                  const pdfBuffer = Buffer.from(await pdfFileContent.arrayBuffer())
+                  console.log(`✅ PDF файл скачан (${pdfBuffer.length} bytes)`)
+                  
+                  // ШАГ 2: Парсим PDF в текстовый формат
+                  console.log(`🔍 Парсим PDF "${file.originalName}" в текстовый формат...`)
+                  const parsedText = await parseTaxPdfToText(pdfBuffer, file.originalName)
+                  console.log(`✅ PDF распарсен, получено ${parsedText.length} символов текста`)
+                  
+                  // ШАГ 3: Создаем TXT файл и загружаем его в OpenAI Files API
+                  const txtFilename = file.originalName.replace(/\.pdf$/i, '_parsed.txt')
+                  console.log(`📤 Загружаем TXT файл "${txtFilename}" в OpenAI Files API...`)
+                  const txtFile = await openaiClient.files.create({
+                    file: await toFile(Buffer.from(parsedText, 'utf-8'), txtFilename, { type: 'text/plain' }),
+                    purpose: 'assistants',
+                  })
+                  txtFileId = txtFile.id
+                  console.log(`✅ TXT файл загружен в OpenAI (file_id: ${txtFileId})`)
+                  
+                } catch (parseError) {
+                  console.error(`⚠️ Ошибка парсинга PDF "${file.originalName}":`, parseError.message)
+                  console.log(`⚠️ Продолжаем с оригинальным PDF файлом...`)
+                  // В случае ошибки парсинга продолжаем с оригинальным PDF
+                }
+                
                 const taxRequest = `Сделай анализ налоговой отчетности для файла "${file.originalName}".
 Требования:
 - Сфокусируйся на текущем и предыдущем годах
 - Если какого-то года нет, упомяни, что данные неполные, но сделай анализ по имеющимся
 - Сделай краткий вывод по налоговым обязательствам, начислениям, задолженностям, штрафам
 - Используй четкую структуру, перечисления, суммы с тысячными разделителями.
-Файл прикреплен.`
+${txtFileId !== file.fileId ? 'Файл прикреплен в текстовом формате (распарсен из PDF).' : 'Файл прикреплен.'}`
                 
                 const analysisTimeout = new Promise((_, reject) =>
                   setTimeout(() => reject(new Error(`Tax Analyst timeout для ${file.originalName} (${TAX_TIMEOUT_MS/1000}s)`)), TAX_TIMEOUT_MS)
@@ -1551,19 +1582,29 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 try {
                   const taxAgent = new Agent({
                     name: 'Tax Analyst',
-                    instructions: `Ты налоговый аналитик. Проанализируй прикрепленный PDF-файл налоговой отчетности.
+                    instructions: `Ты налоговый аналитик. Проанализируй прикрепленный файл налоговой отчетности.
+                    
+                    ${txtFileId !== file.fileId ? 
+                      'ВАЖНО: Файл предоставлен в текстовом формате (распарсен из PDF для лучшего извлечения данных). ' +
+                      'Используй Code Interpreter для чтения и анализа текстового файла. ' +
+                      'Текст уже нормализован и готов к анализу - все данные извлечены из PDF и структурированы.' :
+                      'Файл предоставлен в формате PDF. Используй Code Interpreter для анализа PDF файла.'}
+                    
                     Требования:
                     - Сфокусируйся на текущем и предыдущем годах
                     - Если какого-то года нет, упомяни, что данные неполные, но сделай анализ по имеющимся
                     - Сделай краткий вывод по налоговым обязательствам, начислениям, задолженностям, штрафам
-                    - Используй четкую структуру, перечисления, суммы с тысячными разделителями.`,
+                    - Используй четкую структуру, перечисления, суммы с тысячными разделителями
+                    - Внимательно изучи все данные из файла, особенно числовые значения и даты
+                    - Обрати внимание на коды строк налоговой отчетности (формат 100.xx.yyy)
+                    - Если файл в текстовом формате, просто прочитай его содержимое через Code Interpreter и проанализируй`,
                     model: 'gpt-5',
-                    tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [file.fileId] } })],
+                    tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [txtFileId] } })],
                     modelSettings: { store: true }
                   })
                   const taxRunner = new Runner({})
                   
-                  console.log(`⚙️ Запускаем анализ налогового файла "${file.originalName}"...`)
+                  console.log(`⚙️ Запускаем анализ налогового файла "${file.originalName}" (${txtFileId !== file.fileId ? 'TXT' : 'PDF'})...`)
                   
                   const result = await Promise.race([
                     taxRunner.run(taxAgent, [{ role: 'user', content: [{ type: 'input_text', text: taxRequest }] }]),
