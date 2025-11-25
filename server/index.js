@@ -224,6 +224,103 @@ initSchema().catch(e => {
   console.error('❌ DB init failed', e)
 })
 
+// Проверка и установка Python зависимостей для парсера налоговых PDF
+async function checkAndInstallPythonDeps() {
+  if (process.env.NODE_ENV !== 'production') {
+    // В development пропускаем автоматическую установку
+    return
+  }
+  
+  const { spawn } = require('child_process')
+  const path = require('path')
+  const fs = require('fs')
+  
+  const taxpdftoPath = process.env.TAX_PDF_TO_PATH || path.join(__dirname, '..', 'taxpdfto')
+  const installScriptPath = path.join(taxpdftoPath, 'install_deps.sh')
+  
+  // Проверяем, существует ли скрипт установки
+  if (!fs.existsSync(installScriptPath)) {
+    console.log('⚠️ Скрипт установки зависимостей не найден, пропускаем проверку')
+    return
+  }
+  
+  // Проверяем, установлен ли pdfplumber
+  const pythonExecutable = process.env.PYTHON_PATH || 'python3'
+  
+  return new Promise((resolve) => {
+    const checkProcess = spawn(pythonExecutable, ['-c', 'import pdfplumber; print("OK")'], {
+      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      stdio: ['pipe', 'pipe', 'pipe']
+    })
+    
+    let stdout = ''
+    let stderr = ''
+    
+    checkProcess.stdout.on('data', (data) => {
+      stdout += data.toString()
+    })
+    
+    checkProcess.stderr.on('data', (data) => {
+      stderr += data.toString()
+    })
+    
+    checkProcess.on('close', (code) => {
+      if (code === 0 && stdout.includes('OK')) {
+        console.log('✅ Python зависимости для парсера налоговых PDF установлены')
+        resolve()
+      } else {
+        console.log('⚠️ Python зависимости не найдены, пытаемся установить...')
+        
+        // Пытаемся установить зависимости
+        const installProcess = spawn('bash', [installScriptPath], {
+          cwd: taxpdftoPath,
+          env: { ...process.env, PYTHONUNBUFFERED: '1' },
+          stdio: ['pipe', 'pipe', 'pipe']
+        })
+        
+        let installStdout = ''
+        let installStderr = ''
+        
+        installProcess.stdout.on('data', (data) => {
+          installStdout += data.toString()
+          console.log(`[Python deps install] ${data.toString().trim()}`)
+        })
+        
+        installProcess.stderr.on('data', (data) => {
+          installStderr += data.toString()
+          console.log(`[Python deps install] ${data.toString().trim()}`)
+        })
+        
+        installProcess.on('close', (installCode) => {
+          if (installCode === 0) {
+            console.log('✅ Python зависимости установлены при старте сервера')
+          } else {
+            console.warn('⚠️ Не удалось установить Python зависимости при старте, парсинг может не работать')
+          }
+          resolve()
+        })
+        
+        installProcess.on('error', (error) => {
+          console.warn(`⚠️ Ошибка запуска скрипта установки: ${error.message}`)
+          resolve()
+        })
+      }
+    })
+    
+    checkProcess.on('error', (error) => {
+      console.warn(`⚠️ Python не найден или недоступен: ${error.message}`)
+      resolve()
+    })
+  })
+}
+
+// Запускаем проверку зависимостей асинхронно (не блокируем старт сервера)
+setImmediate(() => {
+  checkAndInstallPythonDeps().catch(err => {
+    console.warn('⚠️ Ошибка при проверке Python зависимостей:', err.message)
+  })
+})
+
 // SQLite миграции удалены: проект использует только PostgreSQL
 
 // Вспомогательные функции для работы с БД
