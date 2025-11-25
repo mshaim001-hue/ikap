@@ -1526,11 +1526,19 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               const TAX_TIMEOUT_MS = 30 * 60 * 1000 // 30 минут на файл
               const taxFileReports = [] // Массив отчетов для каждого файла
               
-              // Преобразуем в удобный формат
-              const taxFiles = taxFilesRows.map(r => ({
-                fileId: r.file_id,
-                originalName: r.original_name
-              }))
+              // Получаем файлы из sessionFiles для парсинга
+              const sessionFilesData = sessionFiles.get(session) || []
+              
+              // Преобразуем в удобный формат с проверкой наличия buffer в памяти
+              const taxFiles = taxFilesRows.map(r => {
+                const sessionFile = sessionFilesData.find(f => f.fileId === r.file_id)
+                return {
+                  fileId: r.file_id,
+                  originalName: r.original_name,
+                  buffer: sessionFile?.buffer || null, // Используем buffer из памяти, если есть
+                  mimetype: sessionFile?.mimetype || 'application/pdf'
+                }
+              })
               
               // Функция для анализа одного файла налоговой отчетности
               const analyzeSingleTaxFile = async (file) => {
@@ -1540,11 +1548,26 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 let txtFileId = file.fileId // По умолчанию используем оригинальный fileId
                 
                 try {
-                  // ШАГ 1: Скачиваем PDF файл из OpenAI Files API
-                  console.log(`📥 Скачиваем PDF файл "${file.originalName}" из OpenAI...`)
-                  const pdfFileContent = await openaiClient.files.content(file.fileId)
-                  const pdfBuffer = Buffer.from(await pdfFileContent.arrayBuffer())
-                  console.log(`✅ PDF файл скачан (${pdfBuffer.length} bytes)`)
+                  let pdfBuffer = null
+                  
+                  // ШАГ 1: Получаем PDF buffer из памяти или скачиваем (если доступно)
+                  if (file.buffer && Buffer.isBuffer(file.buffer)) {
+                    // Используем buffer из памяти (предпочтительно)
+                    pdfBuffer = file.buffer
+                    console.log(`✅ Используем PDF buffer из памяти (${pdfBuffer.length} bytes)`)
+                  } else {
+                    // Пытаемся скачать из OpenAI (может не работать для assistants files)
+                    try {
+                      console.log(`📥 Пытаемся скачать PDF файл "${file.originalName}" из OpenAI...`)
+                      const pdfFileContent = await openaiClient.files.content(file.fileId)
+                      pdfBuffer = Buffer.from(await pdfFileContent.arrayBuffer())
+                      console.log(`✅ PDF файл скачан (${pdfBuffer.length} bytes)`)
+                    } catch (downloadError) {
+                      console.warn(`⚠️ Не удалось скачать файл из OpenAI: ${downloadError.message}`)
+                      console.log(`⚠️ Пропускаем парсинг, используем оригинальный PDF...`)
+                      throw new Error('File download not available')
+                    }
+                  }
                   
                   // ШАГ 2: Парсим PDF в текстовый формат
                   console.log(`🔍 Парсим PDF "${file.originalName}" в текстовый формат...`)
