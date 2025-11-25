@@ -19,9 +19,9 @@ services:
         sync: false
       - key: ADOBE_CLIENT_SECRET
         sync: false
-      # Настройки PDF-сервиса
+      # Настройки PDF-сервиса для банковских выписок
       - key: PDF_SERVICE_PATH
-        value: /opt/render/project/src/ikap2/pdf
+        value: /opt/render/project/src/pdf
       - key: PYTHON_PATH
         value: python3
       # Настройки парсера налоговых PDF

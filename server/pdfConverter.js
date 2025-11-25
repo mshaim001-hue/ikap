@@ -128,7 +128,20 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
         }
       }
       
-      throw new Error(`Python скрипт не найден: ${pythonScript}. Проверьте, что папка pdf загружена в репозиторий.`)
+      // Если скрипт не найден, возвращаем пустой результат вместо исключения
+      // Это позволяет системе продолжать работу без конвертации PDF выписок
+      console.warn(`⚠️ Python скрипт для конвертации банковских выписок не найден: ${pythonScript}`)
+      console.warn(`⚠️ Продолжаем без конвертации банковских выписок в JSON`)
+      // Удаляем временный файл
+      try {
+        if (fs.existsSync(tempPdfPath)) {
+          await unlink(tempPdfPath)
+        }
+      } catch (err) {
+        // Игнорируем ошибку удаления
+      }
+      // Возвращаем пустой массив, чтобы система продолжала работу
+      return []
     }
 
     return new Promise((resolve, reject) => {
