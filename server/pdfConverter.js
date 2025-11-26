@@ -14,11 +14,12 @@ const mkdir = promisify(fs.mkdir)
 
 // Путь к Python-сервису конвертации
 // На Render.com путь будет /opt/render/project/src/pdf
-// Локально: ./ikap2/pdf или /Users/mshaimard/pdf
+// В Docker: /app/pdf
+// Локально: ./pdf или /Users/mshaimard/pdf
 const PDF_SERVICE_PATH = process.env.PDF_SERVICE_PATH || 
   (process.env.NODE_ENV === 'production' 
-    ? (process.env.RENDER ? '/opt/render/project/src/pdf' : './pdf')
-    : path.join(__dirname, '..', 'ikap2', 'pdf'))
+    ? (process.env.RENDER ? '/opt/render/project/src/pdf' : '/app/pdf')
+    : path.join(__dirname, '..', 'pdf'))
 const PDF_SERVICE_PORT = process.env.PDF_SERVICE_PORT || 8000
 const PDF_SERVICE_URL = process.env.PDF_SERVICE_URL || `http://localhost:${PDF_SERVICE_PORT}`
 
@@ -112,12 +113,11 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
       
       // Пробуем альтернативные пути
       const alternativePaths = [
+        '/app/pdf/app/cli.py', // Docker путь (приоритет)
+        path.join(__dirname, '..', 'pdf', 'app', 'cli.py'), // Локальная разработка
+        path.join(process.cwd(), 'pdf', 'app', 'cli.py'),
+        '/opt/render/project/src/pdf/app/cli.py', // Render.com
         path.join(__dirname, 'pdf', 'app', 'cli.py'),
-        path.join(process.cwd(), 'pdf', 'app', 'cli.py'),
-        path.join(__dirname, '..', 'ikap2', 'pdf', 'app', 'cli.py'),
-        '/opt/render/project/src/pdf/app/cli.py',
-        '/app/pdf/app/cli.py', // Docker путь
-        path.join(process.cwd(), 'pdf', 'app', 'cli.py'),
         './pdf/app/cli.py'
       ]
       

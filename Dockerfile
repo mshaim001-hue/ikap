@@ -53,8 +53,10 @@ RUN apk add --no-cache \
 # Копируем и устанавливаем Python зависимости
 # Используем --break-system-packages так как это изолированный Docker контейнер
 COPY taxpdfto/requirements.txt ./taxpdfto/
+COPY pdf/requirements.txt ./pdf/
 RUN pip install --no-cache-dir --upgrade pip --break-system-packages && \
-    pip install --no-cache-dir --break-system-packages -r taxpdfto/requirements.txt
+    pip install --no-cache-dir --break-system-packages -r taxpdfto/requirements.txt && \
+    pip install --no-cache-dir --break-system-packages -r pdf/requirements.txt
 
 # Копируем package файлы
 COPY package*.json ./
@@ -68,11 +70,13 @@ COPY --from=frontend-builder /app/dist ./dist
 # Копируем серверный код
 COPY server/ ./server/
 
-# Копируем Python приложение
+# Копируем Python приложения
 COPY taxpdfto/ ./taxpdfto/
+COPY pdf/ ./pdf/
 
-# Создаем директорию для загрузок
-RUN mkdir -p /app/taxpdfto/uploads
+# Создаем директории для загрузок
+RUN mkdir -p /app/taxpdfto/uploads && \
+    mkdir -p /app/pdf/uploads
 
 # Копируем скрипт запуска
 COPY start.sh /app/start.sh
