@@ -34,17 +34,75 @@ function createPostgresAdapter(connectionString) {
     // Не пробрасываем ошибку - пул попытается переподключиться автоматически
   })
 
-  const query = async (text, params = []) => {
-    try {
-      const res = await pool.query(text, params)
-      return res
-    } catch (error) {
-      // Логируем ошибку для отладки, но пробрасываем дальше для обработки вызывающим кодом
-      if (error.code === 'XX000' || error.message?.includes('db_termination') || error.message?.includes('shutdown')) {
-        console.error('⚠️ Ошибка запроса к БД (разрыв соединения):', error.message)
-      }
-      throw error // Пробрасываем ошибку для обработки в вызывающем коде
+  // Функция для проверки, является ли ошибка временной (можно повторить запрос)
+  const isRetryableError = (error) => {
+    if (!error) return false
+    const message = error.message || ''
+    const code = error.code || ''
+    
+    // Ошибки разрыва соединения
+    if (code === 'XX000' || 
+        message.includes('db_termination') || 
+        message.includes('shutdown') ||
+        message.includes('connection terminated') ||
+        message.includes('server closed the connection') ||
+        message.includes('Connection terminated unexpectedly')) {
+      return true
     }
+    
+    // Ошибки таймаута
+    if (code === 'ETIMEDOUT' || message.includes('timeout')) {
+      return true
+    }
+    
+    // Ошибки соединения
+    if (code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'ENOTFOUND') {
+      return true
+    }
+    
+    return false
+  }
+
+  // Функция задержки с экспоненциальной задержкой
+  const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms))
+
+  const query = async (text, params = [], retries = 3) => {
+    let lastError = null
+    
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const res = await pool.query(text, params)
+        // Если это был retry, логируем успех
+        if (attempt > 0) {
+          console.log(`✅ Запрос к БД успешен после ${attempt} попыток`)
+        }
+        return res
+      } catch (error) {
+        lastError = error
+        
+        // Логируем ошибку
+        if (error.code === 'XX000' || error.message?.includes('db_termination') || error.message?.includes('shutdown')) {
+          console.error(`⚠️ Ошибка запроса к БД (разрыв соединения): ${error.message}`)
+        }
+        
+        // Проверяем, можно ли повторить запрос
+        const isRetryable = isRetryableError(error)
+        
+        if (isRetryable && attempt < retries) {
+          // Экспоненциальная задержка: 100ms, 200ms, 400ms
+          const delayMs = 100 * Math.pow(2, attempt)
+          console.log(`🔄 Повтор запроса к БД (попытка ${attempt + 1}/${retries + 1}) через ${delayMs}ms...`)
+          await delay(delayMs)
+          continue // Пробуем снова
+        }
+        
+        // Если это не retryable ошибка или закончились попытки - пробрасываем
+        throw error
+      }
+    }
+    
+    // Если дошли сюда - все попытки исчерпаны
+    throw lastError || new Error('Неизвестная ошибка запроса к БД')
   }
 
   return {

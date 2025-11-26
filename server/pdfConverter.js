@@ -116,6 +116,8 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
         path.join(process.cwd(), 'pdf', 'app', 'cli.py'),
         path.join(__dirname, '..', 'ikap2', 'pdf', 'app', 'cli.py'),
         '/opt/render/project/src/pdf/app/cli.py',
+        '/app/pdf/app/cli.py', // Docker путь
+        path.join(process.cwd(), 'pdf', 'app', 'cli.py'),
         './pdf/app/cli.py'
       ]
       
@@ -132,6 +134,10 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
       // Это позволяет системе продолжать работу без конвертации PDF выписок
       console.warn(`⚠️ Python скрипт для конвертации банковских выписок не найден: ${pythonScript}`)
       console.warn(`⚠️ Продолжаем без конвертации банковских выписок в JSON`)
+      console.warn(`💡 Для парсинга банковских выписок необходимо:`)
+      console.warn(`   1. Добавить PDF сервис в Docker образ (папка pdf/app/cli.py)`)
+      console.warn(`   2. Или настроить HTTP сервис (USE_PDF_SERVICE_HTTP=true)`)
+      console.warn(`   3. Или установить переменную PDF_SERVICE_PATH с правильным путем`)
       // Удаляем временный файл
       try {
         if (fs.existsSync(tempPdfPath)) {

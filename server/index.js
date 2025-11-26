@@ -1805,10 +1805,27 @@ ${txtFileId !== file.fileId ? 'Файл прикреплен в текстово
               
               // Сохраняем объединенный отчет в БД
               console.log(`💾 Сохраняем ${taxFileReports.length} налоговых отчетов в БД...`)
-              await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(combinedTaxReport, session)
-              console.log(`✅ Налоговые отчеты сгенерированы для всех ${taxFileReports.length} файлов`)
+              try {
+                await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(combinedTaxReport, session)
+                console.log(`✅ Налоговые отчеты сгенерированы для всех ${taxFileReports.length} файлов`)
+              } catch (dbError) {
+                console.error(`❌ Ошибка сохранения налоговых отчетов в БД:`, dbError.message)
+                // Пробуем еще раз через небольшую задержку
+                await new Promise(resolve => setTimeout(resolve, 500))
+                try {
+                  await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(combinedTaxReport, session)
+                  console.log(`✅ Налоговые отчеты сохранены после retry`)
+                } catch (retryError) {
+                  console.error(`❌ Ошибка сохранения после retry:`, retryError.message)
+                  // Продолжаем работу, отчет все равно будет доступен в памяти
+                }
+              }
             } else {
-              await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = 'Файлы налоговой отчетности не найдены' WHERE session_id = ?`).run(session)
+              try {
+                await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = 'Файлы налоговой отчетности не найдены' WHERE session_id = ?`).run(session)
+              } catch (dbError) {
+                console.error(`❌ Ошибка сохранения статуса ошибки в БД:`, dbError.message)
+              }
             }
           } catch (e) {
             console.error('❌ Ошибка запуска налогового анализа:', e)
