@@ -200,6 +200,43 @@ npm start
 
 ## Деплой
 
+### Docker Hub (Рекомендуется)
+
+Проект настроен для деплоя через Docker Hub. Это решает проблемы с Python зависимостями.
+
+#### Быстрый старт
+
+1. **Сборка и публикация образа:**
+```bash
+# Войдите в Docker Hub
+docker login
+
+# Используйте скрипт для публикации
+./docker-push.sh your-dockerhub-username [version]
+
+# Или вручную
+docker build -t yourusername/ikap:latest .
+docker push yourusername/ikap:latest
+```
+
+2. **Запуск на сервере:**
+```bash
+# Через docker-compose
+docker-compose up -d
+
+# Или напрямую
+docker run -d \
+  -p 8787:8787 \
+  -p 5000:5000 \
+  --name ikap-app \
+  --restart unless-stopped \
+  -e OPENAI_API_KEY=your_key \
+  -e DATABASE_URL=your_db_url \
+  yourusername/ikap:latest
+```
+
+Подробная инструкция в [DOCKER_DEPLOY.md](./DOCKER_DEPLOY.md)
+
 ### Render.com
 Конфигурация в `render.yaml`. Сервис автоматически:
 - Собирает frontend

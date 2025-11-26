@@ -8,8 +8,9 @@
     "dev:server": "node server/index.js",
     "dev:vite": "vite",
     "build": "vite build",
+    "build:prod": "VITE_API_BASE_URL=https://ikap1-backend-latest.onrender.com vite build",
     "preview": "vite preview",
-    "deploy": "npm run build && gh-pages -d dist",
+    "deploy": "npm run build:prod && gh-pages -d dist",
     "start": "node server/index.js"
   },
   "dependencies": {
