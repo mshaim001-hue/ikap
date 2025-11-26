@@ -31,32 +31,40 @@ const app = express()
 const allowedOrigins = [
   'http://localhost:3000',
   'http://localhost:8787',
-  'https://*.github.io',
-  'https://*.githubpages.io',
+  'https://mshaim001-hue.github.io',
   process.env.FRONTEND_URL
 ].filter(Boolean)
+
+// Паттерны для GitHub Pages
+const githubPagesPattern = /^https:\/\/.*\.github\.io$/
+const githubPagesPatternAlt = /^https:\/\/.*\.githubpages\.io$/
 
 app.use(cors({
   origin: function (origin, callback) {
     // Разрешаем запросы без origin (например, Postman, curl)
-    if (!origin) return callback(null, true)
+    if (!origin) {
+      console.log('🌐 CORS: Request without origin (allowed)')
+      return callback(null, true)
+    }
     
-    // Проверяем совпадение с разрешенными источниками
-    const isAllowed = allowedOrigins.some(allowed => {
-      if (allowed.includes('*')) {
-        const pattern = allowed.replace('*', '.*')
-        return new RegExp(`^${pattern}$`).test(origin)
-      }
-      return origin === allowed
-    })
+    // Проверяем точное совпадение с разрешенными источниками
+    const exactMatch = allowedOrigins.includes(origin)
     
-    if (isAllowed || allowedOrigins.length === 0) {
+    // Проверяем паттерны GitHub Pages
+    const isGitHubPages = githubPagesPattern.test(origin) || githubPagesPatternAlt.test(origin)
+    
+    if (exactMatch || isGitHubPages) {
+      console.log('✅ CORS: Allowed origin:', origin)
       callback(null, true)
     } else {
+      console.log('❌ CORS blocked origin:', origin)
+      console.log('✅ Allowed origins:', allowedOrigins)
       callback(new Error('Not allowed by CORS'))
     }
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
 }))
 app.use(express.json({ limit: '10mb' }))
 

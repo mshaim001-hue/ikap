@@ -32,5 +32,8 @@ services:
       #   value: "true"
       # - key: PDF_SERVICE_URL
       #   value: http://localhost:8000
+      # URL фронтенда для CORS
+      - key: FRONTEND_URL
+        value: https://mshaim001-hue.github.io
     healthCheckPath: /api/reports
 
