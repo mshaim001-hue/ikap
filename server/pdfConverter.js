@@ -13,13 +13,14 @@ const unlink = promisify(fs.unlink)
 const mkdir = promisify(fs.mkdir)
 
 // Путь к Python-сервису конвертации
-// На Render.com путь будет /opt/render/project/src/pdf
-// В Docker: /app/pdf
-// Локально: ./pdf или /Users/mshaimard/pdf
+// Структура проекта: server/ и pdf/ находятся в корне проекта
+// На Render.com: process.cwd() = /opt/render/project/src, значит pdf/ в process.cwd()/pdf
+// В Docker: process.cwd() = /app, значит pdf/ в process.cwd()/pdf
+// Локально: process.cwd() = корень проекта, значит pdf/ в process.cwd()/pdf
 const PDF_SERVICE_PATH = process.env.PDF_SERVICE_PATH || 
   (process.env.NODE_ENV === 'production' 
-    ? (process.env.RENDER ? '/opt/render/project/src/pdf' : '/app/pdf')
-    : path.join(__dirname, '..', 'pdf'))
+    ? path.join(process.cwd(), 'pdf')  // Всегда относительно корня проекта
+    : path.join(__dirname, '..', 'pdf'))  // Локально: относительно server/
 const PDF_SERVICE_PORT = process.env.PDF_SERVICE_PORT || 8000
 const PDF_SERVICE_URL = process.env.PDF_SERVICE_URL || `http://localhost:${PDF_SERVICE_PORT}`
 
@@ -94,50 +95,38 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
     console.log(`📄 PDF сохранен во временный файл: ${tempPdfPath}`)
 
     // Вызываем Python скрипт для конвертации
-    // Используем path.resolve для правильной обработки относительных путей
+    // Используем заданный путь - мы знаем структуру проекта
     const servicePath = customPdfServicePath || PDF_SERVICE_PATH
+    // Если путь абсолютный - используем как есть, иначе разрешаем относительно process.cwd()
     const resolvedPdfServicePath = path.isAbsolute(servicePath) 
       ? servicePath 
-      : path.resolve(__dirname, servicePath)
+      : path.resolve(process.cwd(), servicePath)
     const pythonScript = path.join(resolvedPdfServicePath, 'app', 'cli.py')
     const pythonExecutable = process.env.PYTHON_PATH || 'python3'
+    
+    // Логируем информацию о путях для отладки
+    console.log(`🔍 Используем Python скрипт для конвертации PDF:`)
+    console.log(`   PDF_SERVICE_PATH: ${PDF_SERVICE_PATH}`)
+    console.log(`   servicePath: ${servicePath}`)
+    console.log(`   resolvedPdfServicePath: ${resolvedPdfServicePath}`)
+    console.log(`   pythonScript: ${pythonScript}`)
+    console.log(`   process.cwd(): ${process.cwd()}`)
+    console.log(`   __dirname: ${__dirname}`)
     
     // Проверяем существование файла
     if (!fs.existsSync(pythonScript)) {
       console.error(`❌ Python скрипт не найден: ${pythonScript}`)
-      console.error(`   PDF_SERVICE_PATH: ${PDF_SERVICE_PATH}`)
-      console.error(`   resolvedPdfServicePath: ${resolvedPdfServicePath}`)
-      console.error(`   __dirname: ${__dirname}`)
-      console.error(`   NODE_ENV: ${process.env.NODE_ENV}`)
-      console.error(`   RENDER: ${process.env.RENDER}`)
-      
-      // Пробуем альтернативные пути
-      const alternativePaths = [
-        '/app/pdf/app/cli.py', // Docker путь (приоритет)
-        path.join(__dirname, '..', 'pdf', 'app', 'cli.py'), // Локальная разработка
-        path.join(process.cwd(), 'pdf', 'app', 'cli.py'),
-        '/opt/render/project/src/pdf/app/cli.py', // Render.com
-        path.join(__dirname, 'pdf', 'app', 'cli.py'),
-        './pdf/app/cli.py'
-      ]
-      
-      for (const altPath of alternativePaths) {
-        if (fs.existsSync(altPath)) {
-          console.log(`✅ Найден альтернативный путь: ${altPath}`)
-          // Используем найденный путь
-          const altResolvedPath = path.dirname(path.dirname(altPath))
-          return convertPdfToJsonViaPython(pdfBuffer, filename, altResolvedPath)
-        }
-      }
+      console.error(`   Проверьте, что файл pdf/app/cli.py существует в проекте`)
+      console.error(`   Текущая рабочая директория: ${process.cwd()}`)
       
       // Если скрипт не найден, возвращаем пустой результат вместо исключения
-      // Это позволяет системе продолжать работу без конвертации PDF выписок
-      console.warn(`⚠️ Python скрипт для конвертации банковских выписок не найден: ${pythonScript}`)
+      console.warn(`⚠️ Python скрипт для конвертации банковских выписок не найден`)
       console.warn(`⚠️ Продолжаем без конвертации банковских выписок в JSON`)
-      console.warn(`💡 Для парсинга банковских выписок необходимо:`)
-      console.warn(`   1. Добавить PDF сервис в Docker образ (папка pdf/app/cli.py)`)
-      console.warn(`   2. Или настроить HTTP сервис (USE_PDF_SERVICE_HTTP=true)`)
-      console.warn(`   3. Или установить переменную PDF_SERVICE_PATH с правильным путем`)
+      console.warn(`💡 Убедитесь, что:`)
+      console.warn(`   1. Папка pdf/ с файлом app/cli.py существует в корне проекта`)
+      console.warn(`   2. Или установите переменную PDF_SERVICE_PATH с правильным путем`)
+      console.warn(`   3. Или используйте HTTP сервис (USE_PDF_SERVICE_HTTP=true)`)
+      
       // Удаляем временный файл
       try {
         if (fs.existsSync(tempPdfPath)) {
@@ -149,6 +138,8 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
       // Возвращаем пустой массив, чтобы система продолжала работу
       return []
     }
+
+    console.log(`✅ Python скрипт найден: ${pythonScript}`)
 
     return new Promise((resolve, reject) => {
       // Проверяем, есть ли виртуальное окружение (для локальной разработки)

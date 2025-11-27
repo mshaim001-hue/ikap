@@ -3,7 +3,7 @@ services:
     name: ikap-app
     env: node
     plan: starter
-    buildCommand: npm install && npm run build && (cd taxpdfto && bash install_deps.sh 2>&1 || echo "Warning: Python dependencies installation failed, continuing...")
+    buildCommand: npm install && npm run build && (cd taxpdfto && bash install_deps.sh 2>&1 || echo "Warning: Python dependencies installation failed, continuing...") && (cd pdf && pip install -r requirements.txt 2>&1 || echo "Warning: PDF service dependencies installation failed, continuing...")
     startCommand: npm start
     envVars:
       - key: NODE_ENV
@@ -20,8 +20,8 @@ services:
       - key: ADOBE_CLIENT_SECRET
         sync: false
       # Настройки PDF-сервиса для банковских выписок
-      - key: PDF_SERVICE_PATH
-        value: /opt/render/project/src/pdf
+      # Путь определяется автоматически относительно process.cwd()
+      # На Render.com process.cwd() = /opt/render/project/src, значит pdf/ будет найден автоматически
       - key: PYTHON_PATH
         value: python3
       # Настройки парсера налоговых PDF
