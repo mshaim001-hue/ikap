@@ -14,12 +14,12 @@ const mkdir = promisify(fs.mkdir)
 
 // Путь к Python-сервису конвертации
 // Структура проекта: server/ и pdf/ находятся в корне проекта
-// На Render.com: process.cwd() = /opt/render/project/src, значит pdf/ в process.cwd()/pdf
-// В Docker: process.cwd() = /app, значит pdf/ в process.cwd()/pdf
-// Локально: process.cwd() = корень проекта, значит pdf/ в process.cwd()/pdf
+// В Docker: __dirname = /app/server, process.cwd() = /app, значит pdf/ в /app/pdf
+// На Render.com (без Docker): process.cwd() = /opt/render/project/src, значит pdf/ в process.cwd()/pdf
+// Локально: __dirname = .../server, значит pdf/ в __dirname/../pdf
 const PDF_SERVICE_PATH = process.env.PDF_SERVICE_PATH || 
   (process.env.NODE_ENV === 'production' 
-    ? path.join(process.cwd(), 'pdf')  // Всегда относительно корня проекта
+    ? (__dirname.startsWith('/app/') ? '/app/pdf' : path.join(process.cwd(), 'pdf'))  // Docker или Render.com
     : path.join(__dirname, '..', 'pdf'))  // Локально: относительно server/
 const PDF_SERVICE_PORT = process.env.PDF_SERVICE_PORT || 8000
 const PDF_SERVICE_URL = process.env.PDF_SERVICE_URL || `http://localhost:${PDF_SERVICE_PORT}`
@@ -96,7 +96,18 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
 
     // Вызываем Python скрипт для конвертации
     // Используем заданный путь - мы знаем структуру проекта
-    const servicePath = customPdfServicePath || PDF_SERVICE_PATH
+    let servicePath = customPdfServicePath || PDF_SERVICE_PATH
+    
+    // Если мы в Docker (__dirname начинается с /app/), ВСЕГДА используем /app/pdf
+    // Игнорируем переменную окружения, если она указывает на неправильный путь
+    if (__dirname.startsWith('/app/') && !customPdfServicePath) {
+      servicePath = '/app/pdf'
+      console.log(`🐳 [DOCKER] Обнаружен Docker (__dirname: ${__dirname}), принудительно используем путь: ${servicePath}`)
+      if (process.env.PDF_SERVICE_PATH && process.env.PDF_SERVICE_PATH !== '/app/pdf') {
+        console.warn(`⚠️ [DOCKER] Переменная PDF_SERVICE_PATH установлена в "${process.env.PDF_SERVICE_PATH}", но игнорируется для Docker окружения`)
+      }
+    }
+    
     // Если путь абсолютный - используем как есть, иначе разрешаем относительно process.cwd()
     const resolvedPdfServicePath = path.isAbsolute(servicePath) 
       ? servicePath 
@@ -105,13 +116,16 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
     const pythonExecutable = process.env.PYTHON_PATH || 'python3'
     
     // Логируем информацию о путях для отладки
-    console.log(`🔍 Используем Python скрипт для конвертации PDF:`)
-    console.log(`   PDF_SERVICE_PATH: ${PDF_SERVICE_PATH}`)
+    console.log(`🔍 [NEW CODE] Используем Python скрипт для конвертации PDF:`)
+    console.log(`   PDF_SERVICE_PATH (env): ${process.env.PDF_SERVICE_PATH || 'не установлена'}`)
+    console.log(`   PDF_SERVICE_PATH (computed): ${PDF_SERVICE_PATH}`)
     console.log(`   servicePath: ${servicePath}`)
     console.log(`   resolvedPdfServicePath: ${resolvedPdfServicePath}`)
     console.log(`   pythonScript: ${pythonScript}`)
     console.log(`   process.cwd(): ${process.cwd()}`)
     console.log(`   __dirname: ${__dirname}`)
+    console.log(`   NODE_ENV: ${process.env.NODE_ENV}`)
+    console.log(`   RENDER: ${process.env.RENDER}`)
     
     // Проверяем существование файла
     if (!fs.existsSync(pythonScript)) {
