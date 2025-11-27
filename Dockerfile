@@ -21,42 +21,31 @@ COPY public/ ./public/
 RUN npm run build
 
 # Этап 2: Финальный образ
-FROM node:20-alpine
+FROM node:20-bullseye
 
 WORKDIR /app
 
-# Устанавливаем Python и системные зависимости для pdfplumber
-# pdfplumber требует дополнительные библиотеки для работы с PDF
-RUN apk add --no-cache \
+# Устанавливаем системные зависимости для Python и PDF обработки
+RUN apt-get update && apt-get install -y \
     python3 \
-    py3-pip \
-    gcc \
-    g++ \
-    musl-dev \
-    python3-dev \
-    jpeg-dev \
-    zlib-dev \
-    freetype-dev \
-    lcms2-dev \
-    openjpeg-dev \
-    tiff-dev \
-    tk-dev \
-    tcl-dev \
-    harfbuzz-dev \
-    fribidi-dev \
-    libimagequant-dev \
-    libxcb-dev \
-    libpng-dev \
-    && ln -sf python3 /usr/bin/python \
-    && ln -sf pip3 /usr/bin/pip
+    python3-pip \
+    python3-venv \
+    bash \
+    && rm -rf /var/lib/apt/lists/*
 
 # Копируем и устанавливаем Python зависимости
-# Используем --break-system-packages так как это изолированный Docker контейнер
+# Используем тот же подход, что и в рабочем проекте
 COPY taxpdfto/requirements.txt ./taxpdfto/
 COPY pdf/requirements.txt ./pdf/
-RUN pip install --no-cache-dir --upgrade pip --break-system-packages && \
-    pip install --no-cache-dir --break-system-packages -r taxpdfto/requirements.txt && \
-    pip install --no-cache-dir --break-system-packages -r pdf/requirements.txt
+RUN cd taxpdfto && \
+    python3 -m pip install --upgrade pip setuptools wheel && \
+    python3 -m pip install -r requirements.txt && \
+    cd .. && \
+    cd pdf && \
+    python3 -m pip install --upgrade pip setuptools wheel && \
+    python3 -m pip install -r requirements.txt && \
+    python3 -c "import adobe.pdfservices.operation; print('✅ pdfservices-sdk установлен и импортируется успешно')" && \
+    cd ..
 
 # Копируем package файлы
 COPY package*.json ./
@@ -95,5 +84,5 @@ ENV PYTHON_PORT=5000
 ENV FLASK_DEBUG=False
 
 # Запускаем оба сервиса
-CMD ["/app/start.sh"]
+CMD ["/bin/bash", "/app/start.sh"]
 

@@ -38,7 +38,6 @@ async function parseTaxPdfToText(pdfBuffer, filename) {
 
     // Сохраняем PDF во временный файл
     await writeFile(tempPdfPath, pdfBuffer)
-    console.log(`📝 Временный PDF файл создан: ${tempPdfPath}`)
 
     // Вызываем Python скрипт для парсинга
     const parsedText = await parsePdfWithPython(tempPdfPath, tempOutputPath)

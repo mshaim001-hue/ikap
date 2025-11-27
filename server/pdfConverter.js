@@ -92,20 +92,14 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
 
     // Сохраняем PDF во временный файл
     await writeFile(tempPdfPath, pdfBuffer)
-    console.log(`📄 PDF сохранен во временный файл: ${tempPdfPath}`)
 
     // Вызываем Python скрипт для конвертации
     // Используем заданный путь - мы знаем структуру проекта
     let servicePath = customPdfServicePath || PDF_SERVICE_PATH
     
     // Если мы в Docker (__dirname начинается с /app/), ВСЕГДА используем /app/pdf
-    // Игнорируем переменную окружения, если она указывает на неправильный путь
     if (__dirname.startsWith('/app/') && !customPdfServicePath) {
       servicePath = '/app/pdf'
-      console.log(`🐳 [DOCKER] Обнаружен Docker (__dirname: ${__dirname}), принудительно используем путь: ${servicePath}`)
-      if (process.env.PDF_SERVICE_PATH && process.env.PDF_SERVICE_PATH !== '/app/pdf') {
-        console.warn(`⚠️ [DOCKER] Переменная PDF_SERVICE_PATH установлена в "${process.env.PDF_SERVICE_PATH}", но игнорируется для Docker окружения`)
-      }
     }
     
     // Если путь абсолютный - используем как есть, иначе разрешаем относительно process.cwd()
@@ -115,31 +109,10 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
     const pythonScript = path.join(resolvedPdfServicePath, 'app', 'cli.py')
     const pythonExecutable = process.env.PYTHON_PATH || 'python3'
     
-    // Логируем информацию о путях для отладки
-    console.log(`🔍 [NEW CODE] Используем Python скрипт для конвертации PDF:`)
-    console.log(`   PDF_SERVICE_PATH (env): ${process.env.PDF_SERVICE_PATH || 'не установлена'}`)
-    console.log(`   PDF_SERVICE_PATH (computed): ${PDF_SERVICE_PATH}`)
-    console.log(`   servicePath: ${servicePath}`)
-    console.log(`   resolvedPdfServicePath: ${resolvedPdfServicePath}`)
-    console.log(`   pythonScript: ${pythonScript}`)
-    console.log(`   process.cwd(): ${process.cwd()}`)
-    console.log(`   __dirname: ${__dirname}`)
-    console.log(`   NODE_ENV: ${process.env.NODE_ENV}`)
-    console.log(`   RENDER: ${process.env.RENDER}`)
-    
     // Проверяем существование файла
     if (!fs.existsSync(pythonScript)) {
       console.error(`❌ Python скрипт не найден: ${pythonScript}`)
-      console.error(`   Проверьте, что файл pdf/app/cli.py существует в проекте`)
-      console.error(`   Текущая рабочая директория: ${process.cwd()}`)
-      
-      // Если скрипт не найден, возвращаем пустой результат вместо исключения
-      console.warn(`⚠️ Python скрипт для конвертации банковских выписок не найден`)
       console.warn(`⚠️ Продолжаем без конвертации банковских выписок в JSON`)
-      console.warn(`💡 Убедитесь, что:`)
-      console.warn(`   1. Папка pdf/ с файлом app/cli.py существует в корне проекта`)
-      console.warn(`   2. Или установите переменную PDF_SERVICE_PATH с правильным путем`)
-      console.warn(`   3. Или используйте HTTP сервис (USE_PDF_SERVICE_HTTP=true)`)
       
       // Удаляем временный файл
       try {
@@ -153,8 +126,6 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
       return []
     }
 
-    console.log(`✅ Python скрипт найден: ${pythonScript}`)
-
     return new Promise((resolve, reject) => {
       // Проверяем, есть ли виртуальное окружение (для локальной разработки)
       const venvPython = path.join(resolvedPdfServicePath, 'venv', 'bin', 'python3')
@@ -166,24 +137,7 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
       
       // Функция для запуска Python процесса конвертации
       const runPythonConversion = () => {
-        console.log(`🐍 Используем Python: ${actualPythonExecutable}`)
-        console.log(`📁 Рабочая директория: ${resolvedPdfServicePath}`)
-        console.log(`📄 PDF файл: ${tempPdfPath} (${pdfBuffer.length} bytes)`)
-        
-        // Логируем переменные окружения Adobe API (без секретов)
-        const adobeClientId = pythonEnv.ADOBE_CLIENT_ID || process.env.ADOBE_CLIENT_ID
-        const adobeCredentialsFile = pythonEnv.ADOBE_CREDENTIALS_FILE || process.env.ADOBE_CREDENTIALS_FILE
-        console.log(`🔑 Adobe API Client ID: ${adobeClientId ? '✅ установлен' : '❌ НЕ установлен'}`)
-        console.log(`🔑 Adobe API Credentials File: ${adobeCredentialsFile || 'не установлен'}`)
-        console.log(`🌍 Adobe API Region: ${pythonEnv.ADOBE_REGION || process.env.ADOBE_REGION || 'US (по умолчанию)'}`)
-        
-        // Логируем команду запуска
-        const command = `${actualPythonExecutable} -m app.cli ${tempPdfPath} --json`
-        console.log(`🚀 Команда: ${command}`)
-        
         // Запускаем как модуль, чтобы относительные импорты работали
-        // Используем: python3 -m app.cli file.pdf --json
-        // вместо: python3 app/cli.py file.pdf --json
         const pythonProcess = spawn(actualPythonExecutable, ['-m', 'app.cli', tempPdfPath, '--json'], {
           cwd: resolvedPdfServicePath,
           env: pythonEnv
@@ -193,35 +147,23 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
         let stderr = ''
 
         pythonProcess.stdout.on('data', (data) => {
-          const chunk = data.toString()
-          stdout += chunk
-          // Логируем вывод в реальном времени для отладки
-          process.stdout.write(`[PYTHON STDOUT] ${chunk}`)
+          stdout += data.toString()
         })
 
         pythonProcess.stderr.on('data', (data) => {
-          const chunk = data.toString()
-          stderr += chunk
-          // Логируем ошибки в реальном времени
-          console.error(`[PYTHON STDERR] ${chunk}`)
+          stderr += data.toString()
         })
 
         pythonProcess.on('close', async (code) => {
-          console.log(`\n📊 Python процесс завершен с кодом: ${code}`)
-          console.log(`📏 Размер stdout: ${stdout.length} символов`)
-          console.log(`📏 Размер stderr: ${stderr.length} символов`)
-          
           // Удаляем временный файл
           try {
             await unlink(tempPdfPath)
           } catch (err) {
-            console.warn('⚠️ Не удалось удалить временный файл:', err.message)
+            // Игнорируем ошибку удаления
           }
 
           if (code !== 0) {
-            console.error('❌ Python скрипт завершился с ошибкой')
-            console.error('📋 Полный stderr:', stderr)
-            console.error('📋 Полный stdout:', stdout)
+            console.error(`❌ Ошибка конвертации файла ${filename}: Python скрипт завершился с кодом ${code}`)
             reject(new Error(`Python скрипт завершился с кодом ${code}: ${stderr || stdout}`))
             return
           }
@@ -230,7 +172,6 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
             // Проверяем, есть ли сообщение об отсутствии транзакций
             const stdoutTrimmed = stdout.trim()
             if (stdoutTrimmed === '' || stdoutTrimmed.includes('No credit rows found')) {
-              console.log('⚠️ В PDF файле не найдено операций по кредиту')
               // Возвращаем пустой результат
               resolve([{
                 source_file: filename,
@@ -301,7 +242,6 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
                         
                         // Если это документ с правильной структурой
                         if ((hasSourceFile || hasTransactions) && !(hasTransactionKeys && !hasSourceFile && !hasTransactions)) {
-                          console.log(`✅ Найден правильный JSON через подсчет скобок: массив с документом (source_file: ${hasSourceFile}, transactions: ${hasTransactions ? parsed[0].transactions?.length : 0})`)
                           jsonString = testJson
                           foundValidJson = true
                         }
@@ -309,7 +249,6 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
                     }
                   } catch (e) {
                     // Если не получилось через подсчет скобок, используем старый метод
-                    console.log(`⚠️ Не удалось распарсить JSON через подсчет скобок, пробуем другой метод...`)
                   }
                 }
               }
@@ -446,7 +385,6 @@ async function convertPdfToJsonViaPython(pdfBuffer, filename, customPdfServicePa
               throw parseError
             }
             
-            console.log(`✅ PDF конвертирован в JSON: найдено ${Array.isArray(result) ? result.length : 1} файл(ов)`)
             
             // Логируем структуру для отладки
             if (Array.isArray(result) && result.length > 0) {
@@ -575,28 +513,7 @@ async function convertPdfsToJson(files) {
   
   for (const file of files) {
     try {
-      console.log(`🔄 Конвертирую PDF: ${file.filename}`)
       const result = await convertPdfToJson(file.buffer, file.filename)
-      
-      // Результат может быть массивом (если несколько файлов) или объектом
-      // Python скрипт всегда возвращает массив документов: [{source_file, metadata, transactions}, ...]
-      console.log(`🔍 Результат convertPdfToJson для ${file.filename}:`, {
-        isArray: Array.isArray(result),
-        length: Array.isArray(result) ? result.length : 1,
-        firstItem: Array.isArray(result) && result.length > 0 ? {
-          has_source_file: !!result[0].source_file,
-          source_file: result[0].source_file,
-          has_transactions: !!result[0].transactions,
-          transactions_count: result[0].transactions ? result[0].transactions.length : 0,
-          keys: Object.keys(result[0])
-        } : (result && typeof result === 'object' ? {
-          has_source_file: !!result.source_file,
-          source_file: result.source_file,
-          has_transactions: !!result.transactions,
-          transactions_count: result.transactions ? result.transactions.length : 0,
-          keys: Object.keys(result)
-        } : result)
-      })
       
       // Python скрипт возвращает массив документов, каждый документ имеет структуру:
       // {source_file: string, metadata: object, transactions: array}

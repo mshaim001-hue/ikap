@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 set -e
 
 echo "🚀 Starting iKapitalist application..."
@@ -29,9 +29,9 @@ cleanup() {
     exit 0
 }
 
-# Обрабатываем сигналы завершения
-trap cleanup SIGTERM SIGINT
+# Обрабатываем сигналы завершения (используем bash синтаксис)
+trap cleanup SIGTERM SIGINT EXIT
 
 # Ждем завершения процессов
-wait
+wait $NODE_PID $PYTHON_PID
 

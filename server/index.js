@@ -20,12 +20,103 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 } // 50MB лимит на один файл
 })
 
+const MOJIBAKE_PATTERN = /[ÃÂÐÑ]/ // Распространенные символы "битой" кириллицы
+
+const normalizeFileName = (name = '') => {
+  if (!name) return ''
+  const trimmed = String(name).trim()
+  if (!trimmed) return ''
+  if (!MOJIBAKE_PATTERN.test(trimmed)) {
+    return trimmed
+  }
+  try {
+    return Buffer.from(trimmed, 'latin1').toString('utf8')
+  } catch {
+    return trimmed
+  }
+}
+
+const prepareUploadedFiles = (files = []) => {
+  const timestamp = Date.now()
+  files.forEach((file, index) => {
+    const fallbackName = file?.originalname || file?.originalName || `file_${timestamp}_${index}`
+    const normalized = normalizeFileName(fallbackName) || fallbackName
+    file.originalname = normalized
+    file.originalName = normalized
+  })
+  return files
+}
+
 console.log('Loading Agents SDK...')
 const { codeInterpreterTool, Agent, Runner, MCPServerStdio } = require('@openai/agents')
 const { z } = require('zod')
 console.log('Agents SDK loaded successfully')
 
 const app = express()
+
+const resumePendingAnalyses = async () => {
+  try {
+    const pendingReports = await db.prepare(`
+      SELECT session_id
+      FROM reports
+      WHERE status = 'generating'
+      ORDER BY created_at ASC
+    `).all()
+    
+    const pendingTax = await db.prepare(`
+      SELECT session_id
+      FROM reports
+      WHERE tax_status = 'generating'
+      ORDER BY created_at ASC
+    `).all()
+    
+    const pendingFs = await db.prepare(`
+      SELECT session_id
+      FROM reports
+      WHERE fs_status = 'generating'
+      ORDER BY created_at ASC
+    `).all()
+    
+    const uniqueSessions = new Set([
+      ...pendingReports.map(r => r.session_id),
+      ...pendingTax.map(r => r.session_id),
+      ...pendingFs.map(r => r.session_id),
+    ])
+    
+    if (!uniqueSessions.size) {
+      console.log('✅ Нет незавершённых анализов для восстановления')
+      return
+    }
+    
+    console.log(`⚙️ Восстанавливаем анализ для ${uniqueSessions.size} сессий:`, Array.from(uniqueSessions))
+    
+    for (const sessionId of uniqueSessions) {
+      try {
+        const report = await db.prepare('SELECT * FROM reports WHERE session_id = ?').get(sessionId)
+        if (!report) continue
+        
+        if (report.status === 'generating') {
+          console.log(`🔁 Перезапускаем анализ банковских выписок для ${sessionId}`)
+          runStatementsAnalysis(sessionId)
+        }
+        
+        if (report.tax_status === 'generating') {
+          console.log(`🔁 Перезапускаем налоговый анализ для ${sessionId}`)
+          runTaxAnalysis(sessionId)
+        }
+        
+        if (report.fs_status === 'generating') {
+          console.log(`🔁 Перезапускаем анализ фин. отчётности для ${sessionId}`)
+          runFsAnalysis(sessionId)
+        }
+      } catch (resumeError) {
+        console.error(`⚠️ Не удалось восстановить анализ для ${sessionId}:`, resumeError.message)
+      }
+    }
+  } catch (error) {
+    console.error('❌ Ошибка восстановления незавершённых анализов:', error)
+  }
+}
 
 // Настройка CORS для GitHub Pages
 const allowedOrigins = [
@@ -358,7 +449,6 @@ const saveFileToDB = async (sessionId, fileId, originalName, fileSize, mimeType,
       VALUES (?, ?, ?, ?, ?, ?)
     `)
     await insertFile.run(sessionId, fileId, originalName, fileSize, mimeType, category || null)
-    console.log(`📎 Файл сохранен в БД: ${originalName} [${category || 'uncategorized'}]`)
   } catch (error) {
     // Проверяем, это ошибка разрыва соединения с БД
     if (error.code === 'XX000' || error.message?.includes('db_termination') || error.message?.includes('shutdown')) {
@@ -380,7 +470,6 @@ const updateFileCategoryInDB = async (fileId, category) => {
       WHERE file_id = ?
     `)
     await updateStmt.run(category, fileId)
-    console.log(`📎 Категория файла обновлена: ${fileId} -> ${category}`)
   } catch (error) {
     // Если БД недоступна, логируем но не падаем
     if (error.code === 'XX000' || error.message?.includes('db_termination') || error.message?.includes('shutdown')) {
@@ -748,10 +837,6 @@ const informationAgent = new Agent({
 // Middleware для логирования полей запроса перед multer
 app.use('/api/agents/run', (req, res, next) => {
   try {
-    if (req.method === 'POST') {
-      console.log(`\n🔍 [${new Date().toLocaleTimeString()}] Поля запроса перед multer:`)
-      console.log(`📝 Content-Type: ${req.headers['content-type']}`)
-    }
     next()
   } catch (error) {
     console.error('❌ Ошибка в middleware логирования:', error)
@@ -761,13 +846,10 @@ app.use('/api/agents/run', (req, res, next) => {
 
 app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
   try {
-    console.log('🔍 [DEBUG] Запрос получен, body keys:', Object.keys(req.body || {}))
-    console.log('🔍 [DEBUG] req.files:', req.files ? (Array.isArray(req.files) ? req.files.length : typeof req.files) : 'undefined')
-    
     const { text, sessionId } = req.body
     const agentNameRaw = String(req.body.agent || '').toLowerCase()
     const agentName = agentNameRaw === 'information' ? 'information' : 'investment'
-    const files = req.files || []
+    const files = prepareUploadedFiles(req.files || [])
     let session = sessionId || `session_${Date.now()}`
     
     // Проверка длины текста сообщения (максимум 200 символов)
@@ -780,16 +862,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
       })
     }
     
-    console.log(`\n🤖 [${new Date().toLocaleTimeString()}] Новый запрос:`)
-    console.log(`📝 Пользователь: "${text}"`)
-    console.log(`🎯 Агент: ${agentName}`)
-    console.log(`🆔 Сессия: ${session}`)
-    if (files.length > 0) {
-      console.log(`📎 Файлов загружено: ${files.length}`)
-      console.log(`📎 Детали файлов:`, req.files.map(f => ({ name: f.originalname, size: f.size })))
-    } else {
-      console.log(`📎 Файлов не загружено (req.files: ${Array.isArray(req.files) ? req.files.length : typeof req.files})`)
-    }
+    console.log(`\n🤖 [${new Date().toLocaleTimeString()}] Новый запрос: "${text}" | Агент: ${agentName} | Сессия: ${session}${files.length > 0 ? ` | Файлов: ${files.length}` : ''}`)
     
     if (agentName === 'information' && files.length > 0) {
       return res.json({
@@ -831,27 +904,19 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
     // Если есть файлы, загружаем их через OpenAI API (без анализа)
     const uploadedFileIds = []
     if (agentName === 'investment' && files && files.length > 0) {
-      console.log(`📎 Обрабатываем ${files.length} файл(ов)...`)
-      
       const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
       const fileNames = []
       
       for (const file of files) {
         try {
-          console.log(`📎 Обрабатываем файл: ${file.originalname}, размер: ${file.size} байт`)
-          console.log(`📎 Тип файла: ${file.mimetype}, buffer type: ${typeof file.buffer}, buffer length: ${file.buffer?.length || 'N/A'}`)
-          
           // Проверяем, что buffer существует
           if (!file.buffer || !Buffer.isBuffer(file.buffer)) {
             throw new Error(`Файл ${file.originalname} не содержит buffer или buffer не является Buffer`)
           }
           
-          // Создаем File объект для загрузки в OpenAI (используем toFile из openai/uploads)
-          console.log(`📤 Создаем File объект для ${file.originalname}...`)
+          // Создаем File объект для загрузки в OpenAI
           const fileToUpload = await toFile(file.buffer, file.originalname, { type: file.mimetype })
-          console.log(`✅ File объект создан для ${file.originalname}`)
           
-          console.log(`📤 Загружаем файл в OpenAI...`)
           const uploadedFile = await openai.files.create({
             file: fileToUpload,
             purpose: 'assistants'
@@ -859,7 +924,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
           
           uploadedFileIds.push(uploadedFile.id)
           fileNames.push(file.originalname)
-          console.log(`✅ Файл загружен в OpenAI: ${uploadedFile.id} (${file.originalname})`)
+          console.log(`✅ Файл загружен: ${file.originalname} (${uploadedFile.id})`)
           
           // Сохраняем файл в sessionFiles (в памяти) вместе с buffer для последующей обработки
           if (!sessionFiles.has(session)) {
@@ -1069,7 +1134,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             // Преобразуем в формат, совместимый со старым кодом
             allFiles = dbFiles.map(f => ({
               fileId: f.file_id,
-              originalName: f.original_name,
+              originalName: normalizeFileName(f.original_name),
               size: f.file_size,
               uploadedAt: f.uploaded_at,
               category: f.category
@@ -1085,10 +1150,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             }
             
             console.log(`📊 Генерация отчетов для ${statementFiles.length} банковских выписок (из ${allFiles.length} файлов)...`)
-            console.log(`📎 Выписки для анализа:`, statementFiles)
-            
-            // НОВЫЙ МЕТОД: Используем новую логику обработки выписок (конвертация -> классификация -> отчет)
-            console.log(`🔄 Используем новый метод обработки выписок для ${statementFiles.length} файл(ов)`)
             
             // Извлекаем ключевую информацию из истории (без передачи всех сообщений)
             let amount = 'не указана'
@@ -1108,7 +1169,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             
             // Извлечение данных из истории сообщений
             // Ищем сумму - сначала в последовательности вопрос-ответ
-            console.log(`🔍 Поиск суммы в истории из ${history.length} сообщений...`)
             for (let i = 0; i < history.length; i++) {
               const msg = history[i]
               if (msg.role === 'assistant') {
@@ -1125,7 +1185,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                       ? history[i + 1].content
                       : (Array.isArray(history[i + 1].content) ? history[i + 1].content.map(c => c.text || '').join(' ') : '')
                     
-                    console.log(`📝 Ответ пользователя: "${userResponse}"`)
                     // Ищем сумму в ответе пользователя
                     let amountMatch = userResponse.match(/(\d+)\s*(мил|млн|миллион)/i)
                     if (amountMatch) {
@@ -1331,14 +1390,11 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             
             // НОВЫЙ МЕТОД: Обрабатываем выписки через новый метод (конвертация -> классификация -> отчет)
             try {
-              console.log(`📥 Получаем ${statementFiles.length} файл(ов) из памяти для обработки...`)
-              
               // Получаем файлы из sessionFiles (где сохранены buffer'ы)
               const downloadedFiles = []
               const sessionFilesData = sessionFiles.get(session) || []
               
               for (const file of statementFiles) {
-                // Ищем файл в sessionFiles по fileId
                 const sessionFile = sessionFilesData.find(f => f.fileId === file.fileId)
                 if (sessionFile && sessionFile.buffer) {
                   downloadedFiles.push({
@@ -1347,9 +1403,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                     mimetype: sessionFile.mimetype || 'application/pdf',
                     size: sessionFile.size || sessionFile.buffer.length
                   })
-                  console.log(`✅ Файл найден в памяти: ${file.originalName} (${sessionFile.buffer.length} bytes)`)
-                } else {
-                  console.warn(`⚠️ Файл ${file.originalName} не найден в памяти, пропускаем`)
                 }
               }
               
@@ -1357,29 +1410,24 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 throw new Error('Не удалось найти ни один файл в памяти для обработки')
               }
               
-              console.log(`✅ Найдено ${downloadedFiles.length} файл(ов) в памяти, начинаем обработку через новый метод...`)
-              
               // Формируем комментарий с данными заявки
               const commentText = `Данные заявки:
-- Компания (БИН): ${bin}
-- Запрашиваемая сумма: ${amount}
-- Срок: ${termMonths} месяцев
-- Цель финансирования: ${purpose}
-- Контакты: ${name}, ${email}, ${phone}`
+              - Компания (БИН): ${bin}
+              - Запрашиваемая сумма: ${amount}
+              - Срок: ${termMonths} месяцев
+              - Цель финансирования: ${purpose}
+              - Контакты: ${name}, ${email}, ${phone}`
               
-              // Используем логику из /api/analysis для обработки файлов
               // Конвертируем PDF в JSON
               const pdfFiles = downloadedFiles.filter(f => f.mimetype === 'application/pdf' || f.originalname.toLowerCase().endsWith('.pdf'))
               
               if (pdfFiles.length > 0) {
-                console.log(`🔄 Конвертирую ${pdfFiles.length} PDF файл(ов) в JSON...`)
                 const pdfDataForConversion = pdfFiles.map(file => ({
                   buffer: file.buffer,
                   filename: file.originalname
                 }))
                 
                 const jsonResults = await convertPdfsToJson(pdfDataForConversion)
-                console.log(`✅ Конвертация завершена: получено ${jsonResults.length} результат(ов)`)
                 
                 // Объединяем все транзакции из всех файлов
                 const allTransactions = []
@@ -1392,7 +1440,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                   }
                   
                   if (result.transactions && Array.isArray(result.transactions)) {
-                    console.log(`📊 Добавляю ${result.transactions.length} транзакций из файла ${result.source_file}`)
                     allTransactions.push(...result.transactions)
                   }
                   
@@ -1614,11 +1661,15 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             const taxFilesRows = await db.prepare(`
               SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'taxes' ORDER BY uploaded_at ASC
             `).all(session)
-            const taxFileIds = (taxFilesRows || []).map(r => r.file_id)
+            const taxFilesRowsWithNames = (taxFilesRows || []).map(r => ({
+              ...r,
+              normalized_name: normalizeFileName(r.original_name || '')
+            }))
+            const taxFileIds = taxFilesRowsWithNames.map(r => r.file_id)
             const taxYearsMissing = []
             // Простая проверка покрытия двух лет по именам файлов
             const yearNow = new Date().getFullYear()
-            const names = (taxFilesRows || []).map(r => (r.original_name || '').toLowerCase())
+            const names = taxFilesRowsWithNames.map(r => r.normalized_name.toLowerCase())
             if (!names.some(n => n.includes(String(yearNow)))) taxYearsMissing.push(String(yearNow))
             if (!names.some(n => n.includes(String(yearNow - 1)))) taxYearsMissing.push(String(yearNow - 1))
             
@@ -1635,11 +1686,11 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               const sessionFilesData = sessionFiles.get(session) || []
               
               // Преобразуем в удобный формат с проверкой наличия buffer в памяти
-              const taxFiles = taxFilesRows.map(r => {
+              const taxFiles = taxFilesRowsWithNames.map(r => {
                 const sessionFile = sessionFilesData.find(f => f.fileId === r.file_id)
                 return {
                   fileId: r.file_id,
-                  originalName: r.original_name,
+                  originalName: r.normalized_name,
                   buffer: sessionFile?.buffer || null, // Используем buffer из памяти, если есть
                   mimetype: sessionFile?.mimetype || 'application/pdf'
                 }
@@ -1675,13 +1726,11 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                   }
                   
                   // ШАГ 2: Парсим PDF в текстовый формат
-                  console.log(`🔍 Парсим PDF "${file.originalName}" в текстовый формат...`)
                   const parsedText = await parseTaxPdfToText(pdfBuffer, file.originalName)
-                  console.log(`✅ PDF распарсен, получено ${parsedText.length} символов текста`)
+                  console.log(`✅ PDF распарсен: ${parsedText.length} символов`)
                   
                   // ШАГ 3: Создаем TXT файл и загружаем его в OpenAI Files API
                   const txtFilename = file.originalName.replace(/\.pdf$/i, '_parsed.txt')
-                  console.log(`📤 Загружаем TXT файл "${txtFilename}" в OpenAI Files API...`)
                   const txtFile = await openaiClient.files.create({
                     file: await toFile(Buffer.from(parsedText, 'utf-8'), txtFilename, { type: 'text/plain' }),
                     purpose: 'assistants',
@@ -1693,15 +1742,12 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                   console.error(`⚠️ Ошибка парсинга PDF "${file.originalName}":`, parseError.message)
                   console.log(`⚠️ Продолжаем с оригинальным PDF файлом...`)
                   // В случае ошибки парсинга продолжаем с оригинальным PDF
+                  txtFileId = file.fileId // Явно устанавливаем оригинальный fileId
                 }
                 
                 const taxRequest = `Сделай анализ налоговой отчетности для файла "${file.originalName}".
-Требования:
-- Сфокусируйся на текущем и предыдущем годах
-- Если какого-то года нет, упомяни, что данные неполные, но сделай анализ по имеющимся
-- Сделай краткий вывод по налоговым обязательствам, начислениям, задолженностям, штрафам
-- Используй четкую структуру, перечисления, суммы с тысячными разделителями.
-${txtFileId !== file.fileId ? 'Файл прикреплен в текстовом формате (распарсен из PDF).' : 'Файл прикреплен.'}`
+                В файле могут находиться сразу несколько деклараций (формы 100/200/300/910). 
+                Пройди весь документ целиком, чтобы не пропустить ни одну форму.`
                 
                 const analysisTimeout = new Promise((_, reject) =>
                   setTimeout(() => reject(new Error(`Tax Analyst timeout для ${file.originalName} (${TAX_TIMEOUT_MS/1000}s)`)), TAX_TIMEOUT_MS)
@@ -1711,21 +1757,51 @@ ${txtFileId !== file.fileId ? 'Файл прикреплен в текстово
                   const taxAgent = new Agent({
                     name: 'Tax Analyst',
                     instructions: `Ты налоговый аналитик. Проанализируй прикрепленный файл налоговой отчетности.
-                    
-                    ${txtFileId !== file.fileId ? 
-                      'ВАЖНО: Файл предоставлен в текстовом формате (распарсен из PDF для лучшего извлечения данных). ' +
-                      'Используй Code Interpreter для чтения и анализа текстового файла. ' +
-                      'Текст уже нормализован и готов к анализу - все данные извлечены из PDF и структурированы.' :
-                      'Файл предоставлен в формате PDF. Используй Code Interpreter для анализа PDF файла.'}
-                    
-                    Требования:
-                    - Сфокусируйся на текущем и предыдущем годах
-                    - Если какого-то года нет, упомяни, что данные неполные, но сделай анализ по имеющимся
-                    - Сделай краткий вывод по налоговым обязательствам, начислениям, задолженностям, штрафам
-                    - Используй четкую структуру, перечисления, суммы с тысячными разделителями
-                    - Внимательно изучи все данные из файла, особенно числовые значения и даты
-                    - Обрати внимание на коды строк налоговой отчетности (формат 100.xx.yyy)
-                    - Если файл в текстовом формате, просто прочитай его содержимое через Code Interpreter и проанализируй`,
+${txtFileId !== file.fileId ? 
+  'Файл предоставлен в текстовом формате (распарсен из PDF). Используй Code Interpreter, чтобы прочитать и разобрать всё содержимое.' :
+  'Файл предоставлен в формате PDF. Используй Code Interpreter для извлечения текста и анализа.'}
+
+Алгоритм:
+1. Просканируй весь файл — в нём может быть несколько деклараций подряд. Для каждого обнаруженного блока определи тип формы (100/200/300/910).
+2. Для каждой формы заполни указанные ниже поля. Если значение не найдено, оставь поле пустым (например, \`БИН:\`).
+3. После перечисления всех форм добавь раздел "Краткий анализ по годам" — сгруппируй выводы по налоговым периодам/годам, отметь динамику, задолженности и заметные изменения.
+4. Если в файле отсутствуют требуемые формы, явно укажи это.
+
+Формат вывода:
+- Для КАЖДОЙ найденной формы используй отдельный блок:
+  *\`Форма 100\`*: 
+    БИН: ...
+    Налоговый период: ...
+    Наименование налогоплательщика: ...
+    100.00.015 СОВОКУПНЫЙ ГОДОВОЙ ДОХОД (сумма с 100.00.001 по 100.00.014): ...
+    100.00.055 НАЛОГООБЛАГАЕМЫЙ ДОХОД С УЧЕТОМ ПЕРЕНЕСЕННЫХ УБЫТКОВ (100.00.053 - 100.00.054): ...
+
+  *\`Форма 300\`*: 
+    БИН: ...
+    Налоговый период: ...
+    Наименование налогоплательщика: ...
+    300.00.006 Общий оборот: ...
+    300.00.030 Исчисленная сумма НДС за налоговый период:
+      I. сумма НДС, подлежащая уплате: ...
+      II. Превышение суммы НДС, относимого в зачет, над суммой начисленного налога: ...
+
+  *\`Форма 200\`*: 
+    БИН: ...
+    Налоговый период: ...
+    Наименование налогоплательщика: ...
+    200.01.001 Итого за отчетный квартал: ...
+    Общая численность работников: 3 мес.: ...
+
+  *\`Форма 910\`*: 
+    БИН: ...
+    Налоговый период: ...
+    Наименование налогоплательщика: ...
+    910.00.001 Доход: ...
+    910.00.016 Начисление доходы. Итого за полугодие: ...
+    910.00.005 Сумма начисленных налогов: ...
+    910.00.003 Среднесписочная численность работников, в том числе: ...
+
+5. В конце добавь раздел "Краткий анализ по годам" с выводами по каждому году: итоги доходов/НДС, наличие доначислений или задолженности, существенные отклонения.`,
                     model: 'gpt-5',
                     tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [txtFileId] } })],
                     modelSettings: { store: true }
@@ -1851,10 +1927,14 @@ ${txtFileId !== file.fileId ? 'Файл прикреплен в текстово
             const fsFilesRows = await db.prepare(`
               SELECT file_id, original_name, uploaded_at FROM files WHERE session_id = ? AND category = 'financial' ORDER BY uploaded_at ASC
             `).all(session)
-            const fsFileIds = (fsFilesRows || []).map(r => r.file_id)
+            const fsFilesRowsWithNames = (fsFilesRows || []).map(r => ({
+              ...r,
+              normalized_name: normalizeFileName(r.original_name || '')
+            }))
+            const fsFileIds = fsFilesRowsWithNames.map(r => r.file_id)
             const fsYearsMissing = []
             const yearNow = new Date().getFullYear()
-            const names = (fsFilesRows || []).map(r => (r.original_name || '').toLowerCase())
+            const names = fsFilesRowsWithNames.map(r => r.normalized_name.toLowerCase())
             if (!names.some(n => n.includes(String(yearNow)))) fsYearsMissing.push(String(yearNow))
             if (!names.some(n => n.includes(String(yearNow - 1)))) fsYearsMissing.push(String(yearNow - 1))
             await db.prepare(`UPDATE reports SET fs_status = 'generating', fs_missing_periods = ? WHERE session_id = ?`).run(
@@ -1862,10 +1942,9 @@ ${txtFileId !== file.fileId ? 'Файл прикреплен в текстово
             )
             
             // Фильтруем только XLSX файлы для анализа (остальные форматы не анализируем)
-            const xlsxFiles = fsFilesRows.filter(f => f.original_name.toLowerCase().endsWith('.xlsx'))
-            const nonXlsxFiles = fsFilesRows.filter(f => !f.original_name.toLowerCase().endsWith('.xlsx'))
+            const xlsxFiles = fsFilesRowsWithNames.filter(f => f.normalized_name.toLowerCase().endsWith('.xlsx'))
+            const nonXlsxFiles = fsFilesRowsWithNames.filter(f => !f.normalized_name.toLowerCase().endsWith('.xlsx'))
             
-            console.log(`📊 Финансовые файлы: всего ${fsFileIds.length}, XLSX для анализа: ${xlsxFiles.length}`)
             
             if (xlsxFiles.length > 0) {
               // ИЗМЕНЕНИЕ: Анализируем каждый файл отдельно
@@ -1875,7 +1954,7 @@ ${txtFileId !== file.fileId ? 'Файл прикреплен в текстово
               // Преобразуем в удобный формат
               const formattedFsFiles = xlsxFiles.map(r => ({
                 fileId: r.file_id,
-                originalName: r.original_name
+                originalName: r.normalized_name
               }))
               
               // Функция для анализа одного файла финансовой отчетности
@@ -1992,7 +2071,7 @@ ${txtFileId !== file.fileId ? 'Файл прикреплен в текстово
               console.log(`✅ Финансовые отчеты сгенерированы для всех ${fsFileReports.length} файлов`)
             } else if (fsFileIds.length > 0 && xlsxFiles.length === 0) {
               // Есть файлы, но все некорректного формата
-              const nonXlsxNames = fsFilesRows.map(f => f.original_name).join(', ')
+              const nonXlsxNames = fsFilesRowsWithNames.map(f => f.normalized_name).join(', ')
               await db.prepare(`UPDATE reports SET fs_status = 'error', fs_report_text = ? WHERE session_id = ?`).run(
                 `Файлы некорректного формата: ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX (Excel).`,
                 session
@@ -2080,10 +2159,10 @@ const createTransactionClassifierAgent = () => {
 }
 
 const summariseFilesForLog = (files = []) =>
-  files.map((file) => ({
-    name: file.originalname,
-    size: file.size,
-    mime: file.mimetype,
+  files.map((file, index) => ({
+    name: normalizeFileName(file?.originalname || file?.originalName || file?.name || `file_${index}`),
+    size: file?.size,
+    mime: file?.mimetype || file?.mime_type || file?.mime,
   }))
 
 const upsertReport = async (sessionId, payload) => {
@@ -2122,7 +2201,7 @@ app.post('/api/analysis', upload.array('files'), async (req, res) => {
   const sessionId = incomingSession || randomUUID()
   const comment = (req.body?.comment || '').toString().trim()
   const metadata = transactionProcessor.normalizeMetadata(req.body?.metadata)
-  const files = req.files || []
+  const files = prepareUploadedFiles(req.files || [])
 
   console.log('🛰️ Получен запрос /api/analysis', {
     sessionId,
@@ -2212,7 +2291,6 @@ app.post('/api/analysis', upload.array('files'), async (req, res) => {
           }
           
           if (result.transactions && Array.isArray(result.transactions)) {
-            console.log(`📊 Добавляю ${result.transactions.length} транзакций из файла ${result.source_file}`)
             allTransactions.push(...result.transactions)
           }
           
@@ -2264,7 +2342,6 @@ app.post('/api/analysis', upload.array('files'), async (req, res) => {
         let jsonFileId = null
         if (allTransactions.length > 0) {
           try {
-            console.log(`📤 Загружаем JSON файл в OpenAI Files API: ${jsonFilename} (${jsonBuffer.length} bytes)`)
             const uploadedJsonFile = await openaiClient.files.create({
               file: await toFile(jsonBuffer, jsonFilename, { type: 'application/json' }),
               purpose: 'assistants',
@@ -2327,7 +2404,6 @@ app.post('/api/analysis', upload.array('files'), async (req, res) => {
 
     // Обрабатываем остальные файлы (не PDF)
     for (const file of otherFiles) {
-      console.log(`📤 Отправляем файл в OpenAI Files API: ${file.originalname} (${file.mimetype}, ${file.size} bytes)`)
 
       const uploadedFile = await openaiClient.files.create({
         file: await toFile(file.buffer, file.originalname, { type: file.mimetype }),
@@ -2861,7 +2937,6 @@ app.get('/api/sessions/:sessionId/history', async (req, res) => {
 // Эндпоинт для получения файлов сессии
 app.get('/api/sessions/:sessionId/files', async (req, res) => {
   const { sessionId } = req.params
-  console.log(`📎 Запрос файлов для сессии: ${sessionId}`)
   
   try {
     const getFiles = db.prepare(`
@@ -2877,7 +2952,7 @@ app.get('/api/sessions/:sessionId/files', async (req, res) => {
       ok: true,
       files: files.map(f => ({
         fileId: f.file_id,
-        originalName: f.original_name,
+        originalName: normalizeFileName(f.original_name),
         fileSize: f.file_size,
         mimeType: f.mime_type,
         category: f.category,
@@ -2920,8 +2995,12 @@ app.get('/api/files/:fileId/download', async (req, res) => {
     const buffer = Buffer.from(await fileContent.arrayBuffer())
     
     // Устанавливаем заголовки для скачивания
+    const downloadName = normalizeFileName(file.original_name) || 'file.pdf'
     res.setHeader('Content-Type', file.mime_type || 'application/octet-stream')
-    res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(file.original_name)}"`)
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${encodeURIComponent(downloadName)}"; filename*=UTF-8''${encodeURIComponent(downloadName)}`
+    )
     res.setHeader('Content-Length', buffer.length)
     
     console.log(`✅ Файл ${fileId} отправлен клиенту`)
