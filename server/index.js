@@ -1678,9 +1678,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             )
             
             if (taxFileIds.length > 0) {
-              // ИЗМЕНЕНИЕ: Анализируем каждый файл отдельно
-              const TAX_TIMEOUT_MS = 30 * 60 * 1000 // 30 минут на файл
-              const taxFileReports = [] // Массив отчетов для каждого файла
+              const TAX_TIMEOUT_MS = 30 * 60 * 1000 // 30 минут на анализ
               
               // Получаем файлы из sessionFiles для парсинга
               const sessionFilesData = sessionFiles.get(session) || []
@@ -1696,70 +1694,128 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 }
               })
               
-              // Функция для анализа одного файла налоговой отчетности
-              const analyzeSingleTaxFile = async (file) => {
-                const fileStartTime = Date.now()
-                console.log(`\n📄 Анализируем налоговый файл: ${file.originalName} (${file.fileId})`)
+              console.log(`\n📄 Начинаем парсинг ${taxFiles.length} налоговых PDF файлов в TXT...`)
+              
+              // Функция для парсинга одного PDF файла в TXT
+              const parseSingleTaxFile = async (file) => {
+                console.log(`🔄 Парсим PDF: ${file.originalName}`)
                 
-                let txtFileId = file.fileId // По умолчанию используем оригинальный fileId
+                let pdfBuffer = null
                 
-                try {
-                  let pdfBuffer = null
-                  
-                  // ШАГ 1: Получаем PDF buffer из памяти или скачиваем (если доступно)
-                  if (file.buffer && Buffer.isBuffer(file.buffer)) {
-                    // Используем buffer из памяти (предпочтительно)
-                    pdfBuffer = file.buffer
-                    console.log(`✅ Используем PDF buffer из памяти (${pdfBuffer.length} bytes)`)
-                  } else {
-                    // Пытаемся скачать из OpenAI (может не работать для assistants files)
-                    try {
-                      console.log(`📥 Пытаемся скачать PDF файл "${file.originalName}" из OpenAI...`)
-                      const pdfFileContent = await openaiClient.files.content(file.fileId)
-                      pdfBuffer = Buffer.from(await pdfFileContent.arrayBuffer())
-                      console.log(`✅ PDF файл скачан (${pdfBuffer.length} bytes)`)
-                    } catch (downloadError) {
-                      console.warn(`⚠️ Не удалось скачать файл из OpenAI: ${downloadError.message}`)
-                      console.log(`⚠️ Пропускаем парсинг, используем оригинальный PDF...`)
-                      throw new Error('File download not available')
-                    }
+                // ШАГ 1: Получаем PDF buffer из памяти или скачиваем
+                if (file.buffer && Buffer.isBuffer(file.buffer)) {
+                  pdfBuffer = file.buffer
+                  console.log(`✅ Используем PDF buffer из памяти (${pdfBuffer.length} bytes)`)
+                } else {
+                  // Скачиваем из OpenAI
+                  try {
+                    console.log(`📥 Скачиваем PDF файл "${file.originalName}" из OpenAI...`)
+                    const pdfFileContent = await openaiClient.files.content(file.fileId)
+                    pdfBuffer = Buffer.from(await pdfFileContent.arrayBuffer())
+                    console.log(`✅ PDF файл скачан (${pdfBuffer.length} bytes)`)
+                  } catch (downloadError) {
+                    throw new Error(`Не удалось скачать файл из OpenAI: ${downloadError.message}`)
                   }
-                  
-                  // ШАГ 2: Парсим PDF в текстовый формат
-                  const parsedText = await parseTaxPdfToText(pdfBuffer, file.originalName)
-                  console.log(`✅ PDF распарсен: ${parsedText.length} символов`)
-                  
-                  // ШАГ 3: Создаем TXT файл и загружаем его в OpenAI Files API
-                  const txtFilename = file.originalName.replace(/\.pdf$/i, '_parsed.txt')
-                  const txtFile = await openaiClient.files.create({
-                    file: await toFile(Buffer.from(parsedText, 'utf-8'), txtFilename, { type: 'text/plain' }),
-                    purpose: 'assistants',
-                  })
-                  txtFileId = txtFile.id
-                  console.log(`✅ TXT файл загружен в OpenAI (file_id: ${txtFileId})`)
-                  
-                } catch (parseError) {
-                  console.error(`⚠️ Ошибка парсинга PDF "${file.originalName}":`, parseError.message)
-                  console.log(`⚠️ Продолжаем с оригинальным PDF файлом...`)
-                  // В случае ошибки парсинга продолжаем с оригинальным PDF
-                  txtFileId = file.fileId // Явно устанавливаем оригинальный fileId
                 }
                 
-                const taxRequest = `Сделай анализ налоговой отчетности для файла "${file.originalName}".
-                В файле могут находиться сразу несколько деклараций (формы 100/200/300/910). 
-                Пройди весь документ целиком, чтобы не пропустить ни одну форму.`
+                // ШАГ 2: Парсим PDF в текстовый формат (ОБЯЗАТЕЛЬНО)
+                const parsedText = await parseTaxPdfToText(pdfBuffer, file.originalName)
+                if (!parsedText || parsedText.trim().length === 0) {
+                  throw new Error(`Парсинг PDF вернул пустой текст`)
+                }
                 
-                const analysisTimeout = new Promise((_, reject) =>
-                  setTimeout(() => reject(new Error(`Tax Analyst timeout для ${file.originalName} (${TAX_TIMEOUT_MS/1000}s)`)), TAX_TIMEOUT_MS)
-                )
+                console.log(`✅ PDF "${file.originalName}" распарсен: ${parsedText.length} символов`)
                 
-                try {
-                  const taxAgent = new Agent({
-                    name: 'Tax Analyst',
-                    instructions: `Ты налоговый аналитик. Проанализируй прикрепленный файл налоговой отчетности.
-${txtFileId !== file.fileId ? 
-  'Файл предоставлен в текстовом формате (распарсен из PDF). Используй Code Interpreter, чтобы прочитать и разобрать всё содержимое.' :
-  'Файл предоставлен в формате PDF. Используй Code Interpreter для извлечения текста и анализа.'}
+                return {
+                  fileName: file.originalName,
+                  text: parsedText
+                }
+              }
+              
+              // Парсим все PDF файлы параллельно
+              const parseResults = await Promise.allSettled(
+                taxFiles.map(file => parseSingleTaxFile(file))
+              )
+              
+              // Проверяем результаты парсинга - все должны быть успешными
+              const parsedTexts = []
+              const parseErrors = []
+              
+              parseResults.forEach((result, index) => {
+                if (result.status === 'fulfilled') {
+                  parsedTexts.push(result.value)
+                } else {
+                  const file = taxFiles[index]
+                  const error = `Ошибка парсинга файла "${file.originalName}": ${result.reason?.message || 'Неизвестная ошибка'}`
+                  parseErrors.push(error)
+                  console.error(`❌ ${error}`)
+                }
+              })
+              
+              // Если есть ошибки парсинга - прерываем выполнение
+              if (parseErrors.length > 0) {
+                const errorMessage = `Не удалось распарсить некоторые PDF файлы:\n${parseErrors.join('\n')}`
+                await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = ? WHERE session_id = ?`).run(errorMessage, session)
+                console.error(`❌ ${errorMessage}`)
+                return
+              }
+              
+              if (parsedTexts.length === 0) {
+                const errorMessage = 'Нет файлов для анализа'
+                await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = ? WHERE session_id = ?`).run(errorMessage, session)
+                console.error(`❌ ${errorMessage}`)
+                return
+              }
+              
+              console.log(`✅ Все ${parsedTexts.length} PDF файлов успешно распарсены`)
+              
+              // ШАГ 3: Объединяем все распарсенные тексты в один файл
+              const combinedTextParts = []
+              parsedTexts.forEach((parsed, idx) => {
+                combinedTextParts.push(`\n${'='.repeat(80)}\n`)
+                combinedTextParts.push(`ФАЙЛ ${idx + 1} из ${parsedTexts.length}: ${parsed.fileName}\n`)
+                combinedTextParts.push(`${'='.repeat(80)}\n\n`)
+                combinedTextParts.push(parsed.text)
+                combinedTextParts.push(`\n\n`)
+              })
+              
+              const combinedText = combinedTextParts.join('')
+              console.log(`✅ Объединенный текст создан: ${combinedText.length} символов`)
+              
+              // ШАГ 4: Загружаем объединенный TXT файл в OpenAI
+              const combinedTxtFilename = `tax_reports_combined_${session}.txt`
+              let combinedTxtFileId = null
+              
+              try {
+                const txtFile = await openaiClient.files.create({
+                  file: await toFile(Buffer.from(combinedText, 'utf-8'), combinedTxtFilename, { type: 'text/plain' }),
+                  purpose: 'assistants',
+                })
+                combinedTxtFileId = txtFile.id
+                console.log(`✅ Объединенный TXT файл загружен в OpenAI (file_id: ${combinedTxtFileId})`)
+              } catch (uploadError) {
+                const errorMessage = `Не удалось загрузить объединенный TXT файл в OpenAI: ${uploadError.message}`
+                await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = ? WHERE session_id = ?`).run(errorMessage, session)
+                console.error(`❌ ${errorMessage}`)
+                return
+              }
+              
+              // ШАГ 5: Запускаем анализ объединенного TXT файла
+              const taxRequest = `Сделай анализ налоговой отчетности для всех прикрепленных файлов.
+              В файлах могут находиться несколько деклараций (формы 100/200/300/910). 
+              Пройди весь документ целиком, чтобы не пропустить ни одну форму.
+              
+              Файлы для анализа: ${parsedTexts.map(p => p.fileName).join(', ')}`
+              
+              const analysisTimeout = new Promise((_, reject) =>
+                setTimeout(() => reject(new Error(`Tax Analyst timeout (${TAX_TIMEOUT_MS/1000}s)`)), TAX_TIMEOUT_MS)
+              )
+              
+              try {
+                const taxAgent = new Agent({
+                  name: 'Tax Analyst',
+                  instructions: `Ты налоговый аналитик. Проанализируй прикрепленный файл налоговой отчетности.
+Файл предоставлен в текстовом формате (распарсен из PDF). Используй Code Interpreter, чтобы прочитать и разобрать всё содержимое.
 
 Алгоритм:
 1. Просканируй весь файл — в нём может быть несколько деклараций подряд. Для каждого обнаруженного блока определи тип формы (100/200/300/910).
@@ -1802,98 +1858,72 @@ ${txtFileId !== file.fileId ?
     910.00.003 Среднесписочная численность работников, в том числе: ...
 
 5. В конце добавь раздел "Краткий анализ по годам" с выводами по каждому году: итоги доходов/НДС, наличие доначислений или задолженности, существенные отклонения.`,
-                    model: 'gpt-5',
-                    tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [txtFileId] } })],
-                    modelSettings: { store: true }
-                  })
-                  const taxRunner = new Runner({})
-                  
-                  console.log(`⚙️ Запускаем анализ налогового файла "${file.originalName}" (${txtFileId !== file.fileId ? 'TXT' : 'PDF'})...`)
-                  
-                  const result = await Promise.race([
-                    taxRunner.run(taxAgent, [{ role: 'user', content: [{ type: 'input_text', text: taxRequest }] }]),
-                    analysisTimeout
-                  ])
-                  
-                  // Извлекаем отчет
-                  let taxText = ''
-                  for (let i = result.newItems.length - 1; i >= 0; i--) {
-                    const it = result.newItems[i]
-                    if (it.rawItem?.role === 'assistant') {
-                      const c = it.rawItem.content
-                      if (Array.isArray(c)) {
-                        const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
-                        taxText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
-                      } else if (typeof it.rawItem.content === 'string') {
-                        taxText = it.rawItem.content
-                      }
-                      if (taxText) break
+                  model: 'gpt-5',
+                  tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [combinedTxtFileId] } })],
+                  modelSettings: { store: true }
+                })
+                const taxRunner = new Runner({})
+                
+                console.log(`⚙️ Запускаем анализ объединенного TXT файла (${parsedTexts.length} файлов)...`)
+                
+                const result = await Promise.race([
+                  taxRunner.run(taxAgent, [{ role: 'user', content: [{ type: 'input_text', text: taxRequest }] }]),
+                  analysisTimeout
+                ])
+                
+                // Извлекаем отчет
+                let taxText = ''
+                for (let i = result.newItems.length - 1; i >= 0; i--) {
+                  const it = result.newItems[i]
+                  if (it.rawItem?.role === 'assistant') {
+                    const c = it.rawItem.content
+                    if (Array.isArray(c)) {
+                      const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
+                      taxText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
+                    } else if (typeof it.rawItem.content === 'string') {
+                      taxText = it.rawItem.content
                     }
-                  }
-                  
-                  if (!taxText) {
-                    taxText = `Анализ налоговой отчетности для файла "${file.originalName}" не удалось извлечь из ответа агента.`
-                  }
-                  
-                  const fileAnalysisTime = ((Date.now() - fileStartTime) / 1000).toFixed(2)
-                  console.log(`✅ Анализ налогового файла "${file.originalName}" завершен за ${fileAnalysisTime}s`)
-                  
-                  return {
-                    fileId: file.fileId,
-                    fileName: file.originalName,
-                    report: taxText
-                  }
-                } catch (error) {
-                  console.error(`❌ Ошибка анализа налогового файла "${file.originalName}":`, error.message)
-                  return {
-                    fileId: file.fileId,
-                    fileName: file.originalName,
-                    report: `Ошибка анализа файла "${file.originalName}": ${error.message}`
+                    if (taxText) break
                   }
                 }
-              }
-              
-              // Анализируем все файлы параллельно
-              console.log(`\n🚀 Запускаем анализ ${taxFiles.length} налоговых файлов параллельно...`)
-              const taxAnalysisPromises = taxFiles.map(file => analyzeSingleTaxFile(file))
-              const taxResults = await Promise.allSettled(taxAnalysisPromises)
-              
-              // Собираем успешные отчеты
-              taxResults.forEach((result, index) => {
-                if (result.status === 'fulfilled') {
-                  taxFileReports.push(result.value)
-                  console.log(`✅ Налоговый отчет ${index + 1}/${taxFiles.length} готов: ${result.value.fileName}`)
-                } else {
-                  const file = taxFiles[index]
-                  taxFileReports.push({
-                    fileId: file.fileId,
-                    fileName: file.originalName,
-                    report: `Ошибка анализа: ${result.reason?.message || 'Неизвестная ошибка'}`
-                  })
-                  console.error(`❌ Ошибка анализа налогового файла ${file.originalName}:`, result.reason)
+                
+                if (!taxText) {
+                  taxText = `Анализ налоговой отчетности не удалось извлечь из ответа агента.`
                 }
-              })
-              
-              // Объединяем все отчеты в один текст
-              const combinedTaxReport = taxFileReports.map((fr, idx) => {
-                return `\n\n${'='.repeat(80)}\nОТЧЕТ ${idx + 1} из ${taxFileReports.length}\nФайл: ${fr.fileName}\n${'='.repeat(80)}\n\n${fr.report}`
-              }).join('\n\n')
-              
-              // Сохраняем объединенный отчет в БД
-              console.log(`💾 Сохраняем ${taxFileReports.length} налоговых отчетов в БД...`)
-              try {
-                await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(combinedTaxReport, session)
-                console.log(`✅ Налоговые отчеты сгенерированы для всех ${taxFileReports.length} файлов`)
-              } catch (dbError) {
-                console.error(`❌ Ошибка сохранения налоговых отчетов в БД:`, dbError.message)
-                // Пробуем еще раз через небольшую задержку
-                await new Promise(resolve => setTimeout(resolve, 500))
+                
+                const combinedTaxReport = taxText
+                
+                console.log(`✅ Анализ налоговых файлов завершен`)
+                console.log(`📄 Размер отчета: ${combinedTaxReport.length} символов`)
+                if (combinedTaxReport.length > 0) {
+                  const preview = combinedTaxReport.substring(0, 200).replace(/\n/g, ' ')
+                  console.log(`📋 Превью отчета: ${preview}...`)
+                }
+                
+                // Сохраняем объединенный отчет в БД
+                console.log(`💾 Сохраняем налоговый отчет в БД...`)
                 try {
                   await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(combinedTaxReport, session)
-                  console.log(`✅ Налоговые отчеты сохранены после retry`)
-                } catch (retryError) {
-                  console.error(`❌ Ошибка сохранения после retry:`, retryError.message)
-                  // Продолжаем работу, отчет все равно будет доступен в памяти
+                  console.log(`✅ Налоговый отчет сохранен для ${parsedTexts.length} файлов`)
+                } catch (dbError) {
+                  console.error(`❌ Ошибка сохранения налогового отчета в БД:`, dbError.message)
+                  // Пробуем еще раз через небольшую задержку
+                  await new Promise(resolve => setTimeout(resolve, 500))
+                  try {
+                    await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(combinedTaxReport, session)
+                    console.log(`✅ Налоговый отчет сохранен после retry`)
+                  } catch (retryError) {
+                    console.error(`❌ Ошибка сохранения после retry:`, retryError.message)
+                    // Продолжаем работу, отчет все равно будет доступен в памяти
+                  }
+                }
+              } catch (error) {
+                console.error(`❌ Ошибка анализа налоговых файлов:`, error.message)
+                const errorMessage = `Ошибка анализа: ${error.message}`
+                try {
+                  await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = ? WHERE session_id = ?`).run(errorMessage, session)
+                } catch (dbError) {
+                  console.error(`❌ Ошибка сохранения статуса ошибки в БД:`, dbError.message)
                 }
               }
             } else {
