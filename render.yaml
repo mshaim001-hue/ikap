@@ -27,11 +27,9 @@ services:
       # Настройки парсера налоговых PDF
       - key: TAX_PDF_TO_PATH
         value: /opt/render/project/src/taxpdfto
-      # Опционально: использовать HTTP сервис для PDF конвертации
-      # - key: USE_PDF_SERVICE_HTTP
-      #   value: "true"
-      # - key: PDF_SERVICE_URL
-      #   value: http://localhost:8000
+      # Cloud Run OCR сервис для анализа финансовой отчетности (PDF)
+      - key: PDF_SERVICE_URL
+        value: https://pdf-ocr-469114228.europe-west1.run.app
       # URL фронтенда для CORS
       - key: FRONTEND_URL
         value: https://mshaim001-hue.github.io

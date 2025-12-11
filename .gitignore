@@ -16,3 +16,6 @@ yarn-error.log*
 
 # Temporary parsing directory
 temp_parsing/
+
+# Uploaded files storage
+server/uploads/

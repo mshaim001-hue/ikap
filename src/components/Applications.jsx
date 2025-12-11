@@ -575,24 +575,33 @@ const Applications = () => {
 
                 {/* Налоговая отчетность */}
                 {(() => {
-                  const isGenerating = selectedApplication.taxStatus === 'generating'
-                  const isCompleted = selectedApplication.taxStatus === 'completed' && !!selectedApplication.taxReportText
-                  const enabled = isCompleted
+                  const taxStatus = selectedApplication.taxStatus
+                  const taxReportText = selectedApplication.taxReportText
+                  const isGenerating = taxStatus === 'generating'
+                  const hasText = !!taxReportText
+                  // Кнопка активна, если анализ завершён УСПЕШНО или с ошибкой, но текст есть
+                  const enabled = (taxStatus === 'completed' || taxStatus === 'error') && hasText
+
+                  let title = 'Анализ налоговой отчетности еще не готов'
+                  if (isGenerating) {
+                    title = 'Анализ налоговой отчетности генерируется...'
+                  } else if (enabled && taxStatus === 'completed') {
+                    title = 'Открыть анализ налоговой отчетности'
+                  } else if (enabled && taxStatus === 'error') {
+                    title = 'Открыть сообщение об ошибке анализа налоговой отчетности'
+                  }
+
                   return (
                     <button
                       onClick={() => enabled && setShowTaxModal(true)}
                       className={`analysis-button ${enabled ? 'enabled' : 'disabled'}`}
                       disabled={!enabled}
-                      title={
-                        isGenerating 
-                          ? 'Анализ налоговой отчетности генерируется...' 
-                          : enabled 
-                            ? 'Открыть анализ налоговой отчетности' 
-                            : 'Анализ налоговой отчетности еще не готов'
-                      }
+                      title={title}
                     >
                       <FileText size={16} /> 
-                      {isGenerating ? 'Аналитика по налогам (генерируется...)' : 'Аналитика по налогам'}
+                      {isGenerating
+                        ? 'Аналитика по налогам (генерируется...)'
+                        : 'Аналитика по налогам'}
                     </button>
                   )
                 })()}

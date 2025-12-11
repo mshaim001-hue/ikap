@@ -6,6 +6,8 @@ const path = require('path')
 const fs = require('fs')
 const { randomUUID } = require('crypto')
 const { toFile } = require('openai/uploads')
+const axios = require('axios')
+const FormData = require('form-data')
 const { createDb } = require('./db')
 const { convertPdfsToJson } = require('./pdfConverter')
 const transactionProcessor = require('./transactionProcessor')
@@ -17,7 +19,16 @@ require('dotenv').config()
 const upload = multer({ 
   storage: multer.memoryStorage(),
   // Лимит для PDF файлов (выписки, налоговая и финансовая отчетность)
-  limits: { fileSize: 50 * 1024 * 1024 } // 50MB лимит на один файл
+  // 50MB на один файл, максимум 50 файлов за один запрос
+  limits: { 
+    fileSize: 50 * 1024 * 1024,
+    files: 50
+  },
+  // Игнорируем неожиданные поля (например, дополнительные поля от фронтенда)
+  fileFilter: (req, file, cb) => {
+    // Принимаем все файлы, которые приходят в поле 'files'
+    cb(null, true)
+  }
 })
 
 const MOJIBAKE_PATTERN = /[ÃÂÐÑ]/ // Распространенные символы "битой" кириллицы
@@ -47,12 +58,265 @@ const prepareUploadedFiles = (files = []) => {
   return files
 }
 
+/**
+ * Логирует, какие данные отправляются в конкретного агента.
+ * Чтобы не засорять логи, показываем только последние несколько сообщений и обрезаем текст.
+ * @param {string} agentName
+ * @param {string} sessionId
+ * @param {Array<{role:string, content:any}>} messages
+ * @param {object} extra Дополнительная информация (файлы, тип анализа и т.д.)
+ */
+function logAgentInput(agentName, sessionId, messages = [], extra = {}) {
+  try {
+    const MAX_MESSAGES = 5
+    const MAX_TEXT = 300
+
+    const tail = (messages || []).slice(-MAX_MESSAGES).map((msg, idx) => {
+      let text = ''
+      if (typeof msg.content === 'string') {
+        text = msg.content
+      } else if (Array.isArray(msg.content)) {
+        text = msg.content
+          .map((c) => (typeof c === 'string' ? c : (c.text || c.input_text || c.output_text || '')))
+          .filter(Boolean)
+          .join(' ')
+      } else if (msg.content && typeof msg.content.text === 'string') {
+        text = msg.content.text
+      }
+      const preview = text ? text.slice(0, MAX_TEXT).replace(/\s+/g, ' ') : ''
+      return {
+        index: messages.length - MAX_MESSAGES + idx + 1,
+        role: msg.role,
+        preview,
+      }
+    })
+
+    console.log(`🧾 Вход для агента "${agentName}" (session=${sessionId})`, {
+      messagesCount: messages?.length || 0,
+      lastMessages: tail,
+      ...extra,
+    })
+  } catch (err) {
+    console.error('⚠️ Не удалось залогировать вход агента:', err.message)
+  }
+}
+
 console.log('Loading Agents SDK...')
 const { codeInterpreterTool, Agent, Runner, MCPServerStdio } = require('@openai/agents')
 const { z } = require('zod')
 console.log('Agents SDK loaded successfully')
 
 const app = express()
+
+// Конфигурация Cloud Run OCR сервиса
+const PDF_SERVICE_URL = process.env.PDF_SERVICE_URL || ''
+const USE_PDF_SERVICE = !!PDF_SERVICE_URL
+
+if (USE_PDF_SERVICE) {
+  // Нормализуем URL для логирования (убираем trailing slash)
+  const normalizedUrl = PDF_SERVICE_URL.trim().replace(/\/+$/, '')
+  console.log(`📡 Cloud Run OCR сервис настроен: ${normalizedUrl}`)
+  console.log(`📡 Исходный URL (из env): ${PDF_SERVICE_URL}`)
+} else {
+  console.log(`⚠️ Cloud Run OCR сервис не настроен (PDF_SERVICE_URL не установлен)`)
+}
+
+/**
+ * Отправляет один батч PDF файлов на Cloud Run OCR сервис
+ * @param {Array<{buffer: Buffer, originalName: string}>} batch - Батч PDF файлов
+ * @param {string} serviceUrl - URL сервиса
+ * @param {number} timeout - Таймаут в миллисекундах
+ * @returns {Promise<Object>} JSON ответ от сервиса
+ */
+async function sendBatchToOcrService(batch, serviceUrl, timeout) {
+  const formData = new FormData()
+  
+  // Добавляем файлы батча в FormData
+  for (const file of batch) {
+    if (!file.buffer || !Buffer.isBuffer(file.buffer)) {
+      throw new Error(`Файл ${file.originalName} не содержит buffer`)
+    }
+    formData.append('files', file.buffer, {
+      filename: file.originalName,
+      contentType: 'application/pdf'
+    })
+  }
+
+  const batchSize = batch.reduce((sum, f) => sum + f.buffer.length, 0) / 1024 / 1024
+  console.log(`📤 Отправляем батч из ${batch.length} файл(ов) (${batchSize.toFixed(2)} MB) на OCR сервис`)
+
+  const response = await axios.post(serviceUrl, formData, {
+    headers: {
+      ...formData.getHeaders()
+    },
+    timeout: timeout,
+    maxContentLength: Infinity,
+    maxBodyLength: Infinity
+  })
+
+  if (response.status === 200 && response.data) {
+    console.log(`✅ Получен JSON ответ для батча из ${batch.length} файл(ов)`)
+    return response.data
+  } else {
+    throw new Error(`Неожиданный ответ от OCR сервиса: статус ${response.status}`)
+  }
+}
+
+/**
+ * Объединяет результаты нескольких батчей в один JSON (как process_multiple_pdfs_to_json в app.py)
+ * @param {Array<Object>} batchResults - Массив JSON результатов от каждого батча
+ * @returns {Object} Объединенный JSON
+ */
+function mergeBatchResults(batchResults) {
+  if (batchResults.length === 0) {
+    throw new Error('Нет результатов для объединения')
+  }
+
+  if (batchResults.length === 1) {
+    return batchResults[0]
+  }
+
+  // Объединяем все страницы и метаданные
+  const allPages = []
+  const allMetadata = {
+    total_files: 0,
+    total_pages: 0,
+    total_text_blocks: 0,
+    files: [],
+    average_confidence: 0.0,
+    description: 'Объединенный OCR результат нескольких PDF файлов. Используйте structured_table для анализа данных.'
+  }
+
+  const allConfidenceScores = []
+
+  for (const result of batchResults) {
+    if (result.pages && Array.isArray(result.pages)) {
+      allPages.push(...result.pages)
+    }
+
+    if (result.metadata) {
+      allMetadata.total_files += result.metadata.total_files || 0
+      allMetadata.total_pages += result.metadata.total_pages || 0
+      allMetadata.total_text_blocks += result.metadata.total_text_blocks || 0
+      
+      if (result.metadata.files && Array.isArray(result.metadata.files)) {
+        allMetadata.files.push(...result.metadata.files)
+      }
+
+      if (result.metadata.average_confidence) {
+        allConfidenceScores.push(result.metadata.average_confidence)
+      }
+    }
+  }
+
+  // Вычисляем среднюю уверенность
+  if (allConfidenceScores.length > 0) {
+    allMetadata.average_confidence = allConfidenceScores.reduce((a, b) => a + b, 0) / allConfidenceScores.length
+  }
+
+  return {
+    pages: allPages,
+    metadata: allMetadata
+  }
+}
+
+/**
+ * Отправляет PDF файлы на Cloud Run OCR сервис батчами и получает объединенный JSON ответ
+ * Cloud Run имеет лимит ~32MB на запрос, поэтому отправляем по 2-3 файла за раз
+ * @param {Array<{buffer: Buffer, originalName: string}>} pdfFiles - Массив PDF файлов с buffer
+ * @returns {Promise<Object>} Объединенный JSON ответ от сервиса
+ */
+async function sendPdfsToOcrService(pdfFiles) {
+  if (!USE_PDF_SERVICE) {
+    throw new Error('Cloud Run OCR сервис не настроен (PDF_SERVICE_URL не установлен)')
+  }
+
+  if (!pdfFiles || pdfFiles.length === 0) {
+    throw new Error('Нет файлов для отправки на OCR сервис')
+  }
+
+  // Нормализуем URL: убираем все trailing слэши и добавляем один
+  const baseUrl = PDF_SERVICE_URL.trim().replace(/\/+$/, '')
+  const serviceUrl = `${baseUrl}/process`
+  const timeout = 600000 // 10 минут таймаут
+
+  const totalSize = pdfFiles.reduce((sum, f) => sum + f.buffer.length, 0) / 1024 / 1024
+  console.log(`📤 Отправляем ${pdfFiles.length} PDF файл(ов) на OCR сервис: ${serviceUrl}`)
+  console.log(`📦 Общий размер файлов: ${totalSize.toFixed(2)} MB`)
+  console.log(`⏱️ Таймаут запроса: ${timeout / 1000} секунд`)
+
+  // Cloud Run имеет лимит ~32MB на запрос, поэтому разбиваем на батчи
+  // Каждый файл ~4-5MB, отправляем по 2 файла за раз (максимум ~10MB на батч)
+  const MAX_BATCH_SIZE_MB = 25 // Оставляем запас от лимита 32MB
+  const batches = []
+  let currentBatch = []
+  let currentBatchSize = 0
+
+  for (const file of pdfFiles) {
+    const fileSizeMB = file.buffer.length / 1024 / 1024
+    
+    // Если добавление этого файла превысит лимит, начинаем новый батч
+    if (currentBatchSize + fileSizeMB > MAX_BATCH_SIZE_MB && currentBatch.length > 0) {
+      batches.push(currentBatch)
+      currentBatch = [file]
+      currentBatchSize = fileSizeMB
+    } else {
+      currentBatch.push(file)
+      currentBatchSize += fileSizeMB
+    }
+  }
+
+  // Добавляем последний батч
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch)
+  }
+
+  console.log(`📦 Файлы разбиты на ${batches.length} батч(ей) для обхода лимита Cloud Run (32MB)`)
+
+  try {
+    // Отправляем батчи последовательно и собираем результаты
+    const batchResults = []
+    for (let i = 0; i < batches.length; i++) {
+      console.log(`🔄 Обработка батча ${i + 1}/${batches.length}...`)
+      try {
+        const batchResult = await sendBatchToOcrService(batches[i], serviceUrl, timeout)
+        batchResults.push(batchResult)
+      } catch (error) {
+        if (error.response) {
+          const errorMsg = error.response.data?.error || error.response.statusText || 'Неизвестная ошибка'
+          console.error(`❌ OCR сервис вернул ошибку для батча ${i + 1} (${error.response.status}): ${errorMsg}`)
+          throw new Error(`Ошибка OCR сервиса для батча ${i + 1} (${error.response.status}): ${errorMsg}`)
+        } else if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
+          console.error(`⏱️ Таймаут запроса к OCR сервису для батча ${i + 1} после ${timeout / 1000} секунд`)
+          throw new Error(`OCR сервис не ответил в течение ${timeout / 1000} секунд для батча ${i + 1}.`)
+        } else {
+          throw error
+        }
+      }
+    }
+
+    // Объединяем результаты всех батчей
+    console.log(`🔗 Объединяем результаты ${batchResults.length} батч(ей)...`)
+    const mergedResult = mergeBatchResults(batchResults)
+    console.log(`✅ Объединенный JSON создан: ${mergedResult.pages?.length || 0} страниц, ${mergedResult.metadata?.total_files || 0} файлов`)
+    
+    return mergedResult
+  } catch (error) {
+    if (error.request && !error.response) {
+      // Запрос был отправлен, но ответа не получено
+      console.error(`❌ OCR сервис не ответил: ${error.message}`)
+      console.error(`🔍 Проверьте доступность сервиса: ${baseUrl}/health`)
+      throw new Error(`OCR сервис не ответил: ${error.message}. Проверьте доступность сервиса.`)
+    } else if (!error.response && !error.request) {
+      // Ошибка при настройке запроса
+      console.error(`❌ Ошибка при отправке на OCR сервис: ${error.message}`)
+      throw new Error(`Ошибка при отправке на OCR сервис: ${error.message}`)
+    } else {
+      // Ошибка уже обработана выше
+      throw error
+    }
+  }
+}
 
 const resumePendingAnalyses = async () => {
   try {
@@ -245,11 +509,13 @@ async function initSchema() {
       CREATE TABLE IF NOT EXISTS files (
         id SERIAL PRIMARY KEY,
         session_id TEXT NOT NULL,
-        file_id TEXT NOT NULL,
+        file_id TEXT UNIQUE NOT NULL,
         original_name TEXT NOT NULL,
         file_size INTEGER,
         mime_type TEXT,
         category TEXT,
+        file_path TEXT,
+        file_data BYTEA,
         uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
 
@@ -269,6 +535,23 @@ async function initSchema() {
       ALTER TABLE reports ADD COLUMN IF NOT EXISTS openai_response_id TEXT;
       ALTER TABLE reports ADD COLUMN IF NOT EXISTS openai_status TEXT;
       ALTER TABLE reports ADD COLUMN IF NOT EXISTS report_structured TEXT;
+      
+      -- Добавляем колонку file_path в таблицу files, если её нет
+      ALTER TABLE files ADD COLUMN IF NOT EXISTS file_path TEXT;
+      -- Добавляем колонку file_data для хранения файлов в БД
+      ALTER TABLE files ADD COLUMN IF NOT EXISTS file_data BYTEA;
+      
+      -- Добавляем UNIQUE constraint на file_id, если его еще нет
+      DO $$
+      BEGIN
+          IF NOT EXISTS (
+              SELECT 1 FROM pg_constraint 
+              WHERE conname = 'files_file_id_key' 
+              AND conrelid = 'files'::regclass
+          ) THEN
+              ALTER TABLE files ADD CONSTRAINT files_file_id_key UNIQUE (file_id);
+          END IF;
+      END $$;
     `)
   } else {
     db.exec(`
@@ -303,11 +586,13 @@ async function initSchema() {
       CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         session_id TEXT NOT NULL,
-        file_id TEXT NOT NULL,
+        file_id TEXT UNIQUE NOT NULL,
         original_name TEXT NOT NULL,
         file_size INTEGER,
         mime_type TEXT,
         category TEXT,
+        file_path TEXT,
+        file_data BLOB,
         uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
 
@@ -442,13 +727,70 @@ const saveMessageToDB = async (sessionId, role, content, messageOrder) => {
   }
 }
 
-const saveFileToDB = async (sessionId, fileId, originalName, fileSize, mimeType, category) => {
+// Функция для сохранения файла в БД (вместо файловой системы)
+const saveFileToDatabase = async (buffer, sessionId, fileId, originalName, mimeType = null) => {
   try {
+    // Определяем mime_type по расширению файла, если не передан
+    if (!mimeType) {
+      mimeType = originalName.toLowerCase().endsWith('.pdf') 
+        ? 'application/pdf' 
+        : (originalName.toLowerCase().endsWith('.json') 
+          ? 'application/json' 
+          : 'application/octet-stream')
+    }
+    
+    // Сохраняем файл напрямую в БД
+    // PostgreSQL использует ON CONFLICT для обновления при дублировании file_id
     const insertFile = db.prepare(`
-      INSERT INTO files (session_id, file_id, original_name, file_size, mime_type, category)
+      INSERT INTO files (session_id, file_id, original_name, file_size, mime_type, file_data)
       VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT (file_id) DO UPDATE SET
+        file_data = EXCLUDED.file_data,
+        file_size = EXCLUDED.file_size,
+        mime_type = EXCLUDED.mime_type
     `)
-    await insertFile.run(sessionId, fileId, originalName, fileSize, mimeType, category || null)
+    
+    await insertFile.run(
+      sessionId, 
+      fileId, 
+      originalName, 
+      buffer.length, 
+      mimeType,
+      buffer // PostgreSQL BYTEA автоматически обработает Buffer
+    )
+    
+    console.log(`💾 Файл сохранен в БД: ${originalName} (${buffer.length} bytes)`)
+    return null // file_path больше не используется
+  } catch (error) {
+    console.error(`❌ Ошибка сохранения файла в БД:`, error)
+    throw error
+  }
+}
+
+const saveFileToDB = async (sessionId, fileId, originalName, fileSize, mimeType, category, fileData = null) => {
+  try {
+    // Если fileData передан, сохраняем его в БД
+    if (fileData) {
+      const insertFile = db.prepare(`
+        INSERT INTO files (session_id, file_id, original_name, file_size, mime_type, category, file_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (file_id) DO UPDATE SET
+          file_data = EXCLUDED.file_data,
+          file_size = EXCLUDED.file_size,
+          category = EXCLUDED.category
+      `)
+      await insertFile.run(sessionId, fileId, originalName, fileSize, mimeType, category || null, fileData)
+    } else {
+      // Если fileData не передан, обновляем только метаданные (для обработанных файлов)
+      const insertFile = db.prepare(`
+        INSERT INTO files (session_id, file_id, original_name, file_size, mime_type, category)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (file_id) DO UPDATE SET
+          file_size = EXCLUDED.file_size,
+          category = EXCLUDED.category
+      `)
+      await insertFile.run(sessionId, fileId, originalName, fileSize, mimeType, category || null)
+    }
   } catch (error) {
     // Проверяем, это ошибка разрыва соединения с БД
     if (error.code === 'XX000' || error.message?.includes('db_termination') || error.message?.includes('shutdown')) {
@@ -488,7 +830,7 @@ const categorizeUploadedFile = (originalName, mimeType) => {
   
   // Финансовая отчетность: Excel файлы, изображения, PDF с финансовыми маркерами, ZIP
   const isExcel = type.includes('excel') || type.includes('spreadsheet') || 
-                  name.endsWith('.xlsx') || name.endsWith('.xls')
+                  false // XLSX больше не поддерживается, только PDF
   const isImage = type.includes('image') || name.match(/\.(jpg|jpeg|png|gif|bmp|webp)$/)
   const isZip = type.includes('zip') || name.endsWith('.zip')
   const isFinancialPdf = type.includes('pdf') && 
@@ -499,7 +841,7 @@ const categorizeUploadedFile = (originalName, mimeType) => {
                           name.includes('oopu') || name.includes('pnl') || name.includes('опу'))
   
   if (isExcel || isImage || isZip || isFinancialPdf) {
-    // Финансовая отчетность: принимаем все форматы (но анализируем только XLSX)
+    // Финансовая отчетность: принимаем только PDF файлы
     return 'financial'
   }
   
@@ -754,7 +1096,7 @@ const investmentAgent = new Agent({
 - Повторяй этот вопрос до получения явного "нет"
 - ТОЛЬКО ПОСЛЕ получения "нет" про налоговую отчетность переходи к запросу финансовой отчетности
 
-- После получения "нет" про налоговую отчетность попроси: "Пожалуйста, предоставьте финансовую отчетность (баланс и отчет о прибылях и убытках) за текущий и предыдущий год. Рекомендуемый формат: Excel (XLSX). Также принимаем другие форматы."
+- После получения "нет" про налоговую отчетность попроси: "Пожалуйста, предоставьте финансовую отчетность (баланс и отчет о прибылях и убытках) за текущий и предыдущий год в формате PDF."
 
 ФИНАНСОВАЯ ОТЧЕТНОСТЬ:
 Когда пользователь прикрепляет финансовую отчетность:
@@ -773,7 +1115,7 @@ const investmentAgent = new Agent({
 РАБОТА С ФАЙЛАМИ:
 - Банковские выписки: ТОЛЬКО PDF файлы (mimetype application/pdf)
 - Налоговая отчетность: ТОЛЬКО PDF файлы
-- Финансовая отчетность: принимаем любые форматы (PDF, XLSX, XLS, изображения, ZIP), но автоматический анализ проводится только для XLSX
+- Финансовая отчетность: принимаем только PDF файлы для автоматического анализа
 - Все файлы принимаются без проверки формата
 
 КРИТИЧЕСКИЕ СЛУЧАИ:
@@ -844,7 +1186,56 @@ app.use('/api/agents/run', (req, res, next) => {
   }
 })
 
-app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
+// Middleware для обработки ошибок multer
+const handleMulterError = (err, req, res, next) => {
+  if (err) {
+    if (err instanceof multer.MulterError) {
+      console.error('❌ Multer Error:', err.code, err.message, err.field)
+      console.error('❌ Request body keys:', Object.keys(req.body || {}))
+      console.error('❌ Request files count:', req.files ? req.files.length : 0)
+      
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({
+          ok: false,
+          error: 'Размер файла превышает 50 МБ',
+          code: 'FILE_TOO_LARGE'
+        })
+      }
+      
+      if (err.code === 'LIMIT_FILE_COUNT') {
+        return res.status(400).json({
+          ok: false,
+          error: 'Превышено максимальное количество файлов (10)',
+          code: 'TOO_MANY_FILES'
+        })
+      }
+      
+      // Для ошибки "Unexpected field" - игнорируем и продолжаем с тем, что есть
+      if (err.code === 'LIMIT_UNEXPECTED_FILE' || err.message.includes('Unexpected field')) {
+        console.warn('⚠️ Multer: неожиданное поле, но продолжаем обработку:', err.field || err.message)
+        // Устанавливаем req.files если его нет, чтобы избежать ошибок дальше
+        if (!req.files) {
+          req.files = []
+        }
+        // Продолжаем обработку, игнорируя это поле
+        return next()
+      }
+      
+      // Для других ошибок multer - возвращаем ошибку
+      return res.status(400).json({
+        ok: false,
+        error: `Ошибка загрузки файлов: ${err.message}`,
+        code: 'MULTER_ERROR'
+      })
+    }
+    // Для других ошибок передаем дальше
+    return next(err)
+  }
+  next()
+}
+
+// Разрешаем до 50 файлов за один запрос от чата
+app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async (req, res) => {
   try {
     const { text, sessionId } = req.body
     const agentNameRaw = String(req.body.agent || '').toLowerCase()
@@ -901,10 +1292,11 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
     // Подготавливаем контент сообщения
     const messageContent = [{ type: 'input_text', text }]
     
-    // Если есть файлы, загружаем их через OpenAI API (без анализа)
+    // Если есть файлы, сохраняем их локально (БЕЗ загрузки в OpenAI для Investment Agent)
+    // Investment Agent не использует файлы напрямую - они обрабатываются локально,
+    // а обработанные данные (JSON, TXT) загружаются в OpenAI для анализаторов
     const uploadedFileIds = []
     if (agentName === 'investment' && files && files.length > 0) {
-      const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
       const fileNames = []
       
       for (const file of files) {
@@ -914,24 +1306,27 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             throw new Error(`Файл ${file.originalname} не содержит buffer или buffer не является Buffer`)
           }
           
-          // Создаем File объект для загрузки в OpenAI
-          const fileToUpload = await toFile(file.buffer, file.originalname, { type: file.mimetype })
+          // Генерируем локальный fileId (не загружаем в OpenAI)
+          const localFileId = `local-${randomUUID()}`
           
-          const uploadedFile = await openai.files.create({
-            file: fileToUpload,
-            purpose: 'assistants'
-          })
+          // Сохраняем файл в БД
+          try {
+            await saveFileToDatabase(file.buffer, session, localFileId, file.originalname, file.mimetype)
+            console.log(`💾 Файл сохранен в БД: ${file.originalname} (${localFileId})`)
+          } catch (dbError) {
+            console.error(`⚠️ Ошибка сохранения файла в БД ${file.originalname}:`, dbError.message)
+            throw dbError // Если не удалось сохранить в БД, это критично
+          }
           
-          uploadedFileIds.push(uploadedFile.id)
+          uploadedFileIds.push(localFileId)
           fileNames.push(file.originalname)
-          console.log(`✅ Файл загружен: ${file.originalname} (${uploadedFile.id})`)
           
           // Сохраняем файл в sessionFiles (в памяти) вместе с buffer для последующей обработки
           if (!sessionFiles.has(session)) {
             sessionFiles.set(session, [])
           }
           sessionFiles.get(session).push({
-            fileId: uploadedFile.id,
+            fileId: localFileId,
             originalName: file.originalname,
             size: file.size,
             uploadedAt: new Date().toISOString(),
@@ -939,23 +1334,23 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             mimetype: file.mimetype
           })
           
-          // Категоризируем и сохраняем метаданные файла в БД (с обработкой ошибок)
+          // Категоризируем и обновляем категорию файла в БД (файл уже сохранен с file_data)
           try {
             const category = categorizeUploadedFile(file.originalname, file.mimetype)
-            await saveFileToDB(session, uploadedFile.id, file.originalname, file.size, file.mimetype, category)
+            await saveFileToDB(session, localFileId, file.originalname, file.size, file.mimetype, category, null)
           } catch (dbError) {
             // Проверяем, это ошибка разрыва соединения с БД
             if (dbError.code === 'XX000' || dbError.message?.includes('db_termination') || dbError.message?.includes('shutdown')) {
-              console.error(`⚠️ БД соединение разорвано при сохранении файла ${file.originalname}. Продолжаем работу без сохранения в БД.`)
+              console.error(`⚠️ БД соединение разорвано при обновлении категории файла ${file.originalname}. Продолжаем работу.`)
             } else {
-              console.error(`⚠️ Ошибка сохранения файла ${file.originalname} в БД (продолжаем работу):`, dbError.message)
+              console.error(`⚠️ Ошибка обновления категории файла ${file.originalname} в БД (продолжаем работу):`, dbError.message)
             }
-            // Продолжаем работу даже если БД недоступна - файл уже загружен в OpenAI
+            // Продолжаем работу - файл уже сохранен в БД
           }
         } catch (error) {
-          console.error(`❌ Ошибка загрузки файла ${file.originalname}:`, error)
-          console.error(`❌ Стек ошибки загрузки файла:`, error.stack)
-          fileNames.push(`${file.originalname} (ошибка загрузки)`)
+          console.error(`❌ Ошибка обработки файла ${file.originalname}:`, error)
+          console.error(`❌ Стек ошибки обработки файла:`, error.stack)
+          fileNames.push(`${file.originalname} (ошибка обработки)`)
         }
       }
       
@@ -990,12 +1385,20 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
 
     console.log(`💰 Запуск Investment Agent...`)
     console.log(`📚 История для агента: ${history.length} сообщений`)
+    logAgentInput(agentName, session, history, {
+      filesInSession: (sessionFiles.get(session) || []).map(f => ({
+        name: f.originalName,
+        size: f.size,
+        mime: f.mimetype,
+      })),
+    })
       
       const startTime = Date.now()
       console.log(`⏱️ Начало выполнения агента: ${new Date().toLocaleTimeString()}`)
       
       // НЕ используем Code Interpreter для анализа файлов - агент просто принимает файлы
-      // Файлы уже загружены в OpenAI и сохранены, но агент их не анализирует при загрузке
+      // Файлы сохранены локально, но НЕ загружены в OpenAI (это избыточно для Investment Agent)
+      // Файлы будут обработаны локально, а обработанные данные (JSON, TXT) загрузятся в OpenAI для анализаторов
       const agentToRun = agentName === 'information' ? informationAgent : investmentAgent
       
       // Запускаем агента с таймаутом 30 минут (единый SLA)
@@ -1678,7 +2081,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
             )
             
             if (taxFileIds.length > 0) {
-              const TAX_TIMEOUT_MS = 30 * 60 * 1000 // 30 минут на анализ
+              const TAX_TIMEOUT_MS = 40 * 60 * 1000 // 40 минут на анализ
               
               // Получаем файлы из sessionFiles для парсинга
               const sessionFilesData = sessionFiles.get(session) || []
@@ -1702,19 +2105,60 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 
                 let pdfBuffer = null
                 
-                // ШАГ 1: Получаем PDF buffer из памяти или скачиваем
+                // ШАГ 1: Получаем PDF buffer из памяти, локального хранилища или скачиваем
                 if (file.buffer && Buffer.isBuffer(file.buffer)) {
                   pdfBuffer = file.buffer
                   console.log(`✅ Используем PDF buffer из памяти (${pdfBuffer.length} bytes)`)
                 } else {
-                  // Скачиваем из OpenAI
+                  // Пытаемся прочитать из БД (file_data)
+                  let foundInDB = false
                   try {
-                    console.log(`📥 Скачиваем PDF файл "${file.originalName}" из OpenAI...`)
-                    const pdfFileContent = await openaiClient.files.content(file.fileId)
-                    pdfBuffer = Buffer.from(await pdfFileContent.arrayBuffer())
-                    console.log(`✅ PDF файл скачан (${pdfBuffer.length} bytes)`)
-                  } catch (downloadError) {
-                    throw new Error(`Не удалось скачать файл из OpenAI: ${downloadError.message}`)
+                    const getFile = db.prepare(`
+                      SELECT file_data, file_path FROM files WHERE file_id = ?
+                    `)
+                    const fileInfo = await getFile.get(file.fileId)
+                    if (fileInfo && fileInfo.file_data) {
+                      // PostgreSQL BYTEA возвращается как Buffer или строка
+                      if (Buffer.isBuffer(fileInfo.file_data)) {
+                        pdfBuffer = fileInfo.file_data
+                      } else if (typeof fileInfo.file_data === 'string') {
+                        // Если это hex строка (начинается с \x)
+                        if (fileInfo.file_data.startsWith('\\x')) {
+                          pdfBuffer = Buffer.from(fileInfo.file_data.slice(2), 'hex')
+                        } else {
+                          pdfBuffer = Buffer.from(fileInfo.file_data, 'binary')
+                        }
+                      } else {
+                        pdfBuffer = Buffer.from(fileInfo.file_data)
+                      }
+                      console.log(`✅ PDF файл прочитан из БД (${pdfBuffer.length} bytes)`)
+                      foundInDB = true
+                    } else if (fileInfo && fileInfo.file_path) {
+                      // Fallback: пытаемся прочитать из файловой системы (для старых файлов)
+                      const filePath = path.join(__dirname, fileInfo.file_path)
+                      if (fs.existsSync(filePath)) {
+                        pdfBuffer = fs.readFileSync(filePath)
+                        console.log(`✅ PDF файл прочитан из файловой системы (fallback, ${pdfBuffer.length} bytes)`)
+                        foundInDB = true
+                      }
+                    }
+                  } catch (dbError) {
+                    console.log(`⚠️ Не удалось прочитать файл из БД:`, dbError.message)
+                  }
+                  
+                  // Если не нашли в БД, скачиваем из OpenAI (только для старых файлов)
+                  // Локальные файлы (fileId начинается с "local-") не загружаются в OpenAI
+                  if (!foundInDB && !file.fileId.startsWith('local-')) {
+                    try {
+                      console.log(`📥 Скачиваем PDF файл "${file.originalName}" из OpenAI...`)
+                      const pdfFileContent = await openaiClient.files.content(file.fileId)
+                      pdfBuffer = Buffer.from(await pdfFileContent.arrayBuffer())
+                      console.log(`✅ PDF файл скачан (${pdfBuffer.length} bytes)`)
+                    } catch (downloadError) {
+                      throw new Error(`Не удалось скачать файл из OpenAI: ${downloadError.message}`)
+                    }
+                  } else if (!foundInDB && file.fileId.startsWith('local-')) {
+                    throw new Error(`Файл не найден в БД для fileId: ${file.fileId}`)
                   }
                 }
                 
@@ -1737,7 +2181,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 taxFiles.map(file => parseSingleTaxFile(file))
               )
               
-              // Проверяем результаты парсинга - все должны быть успешными
+              // Проверяем результаты парсинга
               const parsedTexts = []
               const parseErrors = []
               
@@ -1752,14 +2196,6 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 }
               })
               
-              // Если есть ошибки парсинга - прерываем выполнение
-              if (parseErrors.length > 0) {
-                const errorMessage = `Не удалось распарсить некоторые PDF файлы:\n${parseErrors.join('\n')}`
-                await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = ? WHERE session_id = ?`).run(errorMessage, session)
-                console.error(`❌ ${errorMessage}`)
-                return
-              }
-              
               if (parsedTexts.length === 0) {
                 const errorMessage = 'Нет файлов для анализа'
                 await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = ? WHERE session_id = ?`).run(errorMessage, session)
@@ -1767,59 +2203,94 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
                 return
               }
               
-              console.log(`✅ Все ${parsedTexts.length} PDF файлов успешно распарсены`)
-              
-              // ШАГ 3: Объединяем все распарсенные тексты в один файл
-              const combinedTextParts = []
-              parsedTexts.forEach((parsed, idx) => {
-                combinedTextParts.push(`\n${'='.repeat(80)}\n`)
-                combinedTextParts.push(`ФАЙЛ ${idx + 1} из ${parsedTexts.length}: ${parsed.fileName}\n`)
-                combinedTextParts.push(`${'='.repeat(80)}\n\n`)
-                combinedTextParts.push(parsed.text)
-                combinedTextParts.push(`\n\n`)
-              })
-              
-              const combinedText = combinedTextParts.join('')
-              console.log(`✅ Объединенный текст создан: ${combinedText.length} символов`)
-              
-              // ШАГ 4: Загружаем объединенный TXT файл в OpenAI
-              const combinedTxtFilename = `tax_reports_combined_${session}.txt`
-              let combinedTxtFileId = null
-              
-              try {
-                const txtFile = await openaiClient.files.create({
-                  file: await toFile(Buffer.from(combinedText, 'utf-8'), combinedTxtFilename, { type: 'text/plain' }),
-                  purpose: 'assistants',
-                })
-                combinedTxtFileId = txtFile.id
-                console.log(`✅ Объединенный TXT файл загружен в OpenAI (file_id: ${combinedTxtFileId})`)
-              } catch (uploadError) {
-                const errorMessage = `Не удалось загрузить объединенный TXT файл в OpenAI: ${uploadError.message}`
-                await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = ? WHERE session_id = ?`).run(errorMessage, session)
-                console.error(`❌ ${errorMessage}`)
-                return
+              if (parseErrors.length > 0) {
+                const warningMessage = `Не удалось распарсить некоторые PDF файлы (анализ выполняется по успешно распарсенным):\n${parseErrors.join('\n')}`
+                console.warn(`⚠️ ${warningMessage}`)
               }
               
-              // ШАГ 5: Запускаем анализ объединенного TXT файла
-              const taxRequest = `Сделай анализ налоговой отчетности для всех прикрепленных файлов.
-              В файлах могут находиться несколько деклараций (формы 100/200/300/910). 
-              Пройди весь документ целиком, чтобы не пропустить ни одну форму.
-              
-              Файлы для анализа: ${parsedTexts.map(p => p.fileName).join(', ')}`
-              
-              const analysisTimeout = new Promise((_, reject) =>
-                setTimeout(() => reject(new Error(`Tax Analyst timeout (${TAX_TIMEOUT_MS/1000}s)`)), TAX_TIMEOUT_MS)
-              )
-              
-              try {
-                const taxAgent = new Agent({
-                  name: 'Tax Analyst',
-                  instructions: `Ты налоговый аналитик. Проанализируй прикрепленный файл налоговой отчетности.
+              console.log(`✅ Успешно распарсены ${parsedTexts.length} PDF файлов из ${taxFiles.length}`)
+
+              // ШАГ 3: Бьем распарсенные тексты на батчи, чтобы не превышать лимит по длине промпта
+              // По умолчанию используем более мелкий размер батча (~200k символов), чтобы снизить риск таймаутов
+              const MAX_TAX_CHARS = Number(process.env.TAX_CHUNK_MAX_CHARS || '200000')
+              const batches = []
+              let currentBatch = []
+              let currentChars = 0
+
+              for (const item of parsedTexts) {
+                const len = item.text.length
+                // Если добавление файла превышает лимит и в батче уже что-то есть – начинаем новый батч
+                if (currentBatch.length > 0 && currentChars + len > MAX_TAX_CHARS) {
+                  batches.push({ items: currentBatch, totalChars: currentChars })
+                  currentBatch = []
+                  currentChars = 0
+                }
+                currentBatch.push(item)
+                currentChars += len
+              }
+              if (currentBatch.length > 0) {
+                batches.push({ items: currentBatch, totalChars: currentChars })
+              }
+
+              console.log(`🧩 Налоговые файлы разбиты на ${batches.length} батч(ей) (лимит ~${MAX_TAX_CHARS} символов на батч)`)
+
+              // ШАГ 4–5: Для каждого батча формируем TXT, загружаем в OpenAI и запускаем анализ
+              let combinedTaxReport = ''
+              const analysisErrors = []
+
+              for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+                const batch = batches[batchIndex]
+                const batchFiles = batch.items.map((p) => p.fileName)
+
+                // 4.1 Формируем объединенный текст для батча
+                const parts = []
+                batch.items.forEach((parsed, idx) => {
+                  parts.push(`\n${'='.repeat(80)}\n`)
+                  parts.push(`ФАЙЛ ${idx + 1} из ${batch.items.length}: ${parsed.fileName}\n`)
+                  parts.push(`${'='.repeat(80)}\n\n`)
+                  parts.push(parsed.text)
+                  parts.push(`\n\n`)
+                })
+                const batchText = parts.join('')
+                console.log(`✅ Объединенный текст для батча ${batchIndex + 1}/${batches.length} создан: ${batchText.length} символов`)
+
+                // 4.2 Загружаем TXT батча в OpenAI
+                const batchFilename = `tax_reports_batch${batchIndex + 1}_${session}.txt`
+                let batchFileId = null
+                try {
+                  const txtFile = await openaiClient.files.create({
+                    file: await toFile(Buffer.from(batchText, 'utf-8'), batchFilename, { type: 'text/plain' }),
+                    purpose: 'assistants',
+                  })
+                  batchFileId = txtFile.id
+                  console.log(`✅ TXT батча ${batchIndex + 1}/${batches.length} загружен в OpenAI (file_id: ${batchFileId})`)
+                } catch (uploadError) {
+                  const errorMessage = `Не удалось загрузить TXT батча ${batchIndex + 1}/${batches.length} в OpenAI: ${uploadError.message}`
+                  console.error(`❌ ${errorMessage}`)
+                  analysisErrors.push(`Батч ${batchIndex + 1}/${batches.length} (${batchFiles.join(', ')}): ${uploadError.message}`)
+                  continue
+                }
+
+                // 5. Запускаем анализ TXT батча
+                const taxRequest = `Сделай анализ налоговой отчетности для всех прикрепленных файлов (батч ${batchIndex + 1} из ${batches.length}).
+В файлах могут находиться несколько деклараций (формы 100/200/300/910). 
+Пройди весь текст целиком, чтобы не пропустить ни одну форму.
+
+Файлы для анализа в этом батче: ${batchFiles.join(', ')}`
+
+                const analysisTimeout = new Promise((_, reject) =>
+                  setTimeout(() => reject(new Error(`Tax Analyst timeout (${TAX_TIMEOUT_MS/1000}s)`)), TAX_TIMEOUT_MS)
+                )
+
+                try {
+                  const taxAgent = new Agent({
+                    name: 'Tax Analyst',
+                    instructions: `Ты налоговый аналитик. Проанализируй прикрепленный файл налоговой отчетности.
 Файл предоставлен в текстовом формате (распарсен из PDF). Используй Code Interpreter, чтобы прочитать и разобрать всё содержимое.
 
 Алгоритм:
 1. Просканируй весь файл — в нём может быть несколько деклараций подряд. Для каждого обнаруженного блока определи тип формы (100/200/300/910).
-2. Для каждой формы заполни указанные ниже поля. Если значение не найдено, оставь поле пустым (например, \`БИН:\`).
+2. Для каждой формы заполни указанные ниже поля. ВАЖНО: Для каждого кода строки (например, "100.00.055") найди строку/абзац в тексте, где упоминается этот код. Извлеки числовое значение, которое находится в той же строке/абзаце рядом с кодом. НЕ ищи числа по всему файлу — только в контексте найденной строки с кодом. Замени "..." на реальное значение из текста. Если в строке с кодом нет числового значения, оставь поле пустым.
 3. После перечисления всех форм добавь раздел "Краткий анализ по годам" — сгруппируй выводы по налоговым периодам/годам, отметь динамику, задолженности и заметные изменения.
 4. Если в файле отсутствуют требуемые формы, явно укажи это.
 
@@ -1831,6 +2302,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
     Наименование налогоплательщика: ...
     100.00.015 СОВОКУПНЫЙ ГОДОВОЙ ДОХОД (сумма с 100.00.001 по 100.00.014): ...
     100.00.055 НАЛОГООБЛАГАЕМЫЙ ДОХОД С УЧЕТОМ ПЕРЕНЕСЕННЫХ УБЫТКОВ (100.00.053 - 100.00.054): ...
+    ВАЖНО: Замени "..." на реальное значение из текста. Например, если в тексте есть строка "100.00.055 НАЛОГООБЛАГАЕМЫЙ ДОХОД С УЧЕТОМ ПЕРЕНЕСЕННЫХ 21302759 УБЫТКОВ", то укажи: 100.00.055 НАЛОГООБЛАГАЕМЫЙ ДОХОД С УЧЕТОМ ПЕРЕНЕСЕННЫХ УБЫТКОВ (100.00.053 - 100.00.054): 21302759
 
   *\`Форма 300\`*: 
     БИН: ...
@@ -1840,6 +2312,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
     300.00.030 Исчисленная сумма НДС за налоговый период:
       I. сумма НДС, подлежащая уплате: ...
       II. Превышение суммы НДС, относимого в зачет, над суммой начисленного налога: ...
+    ВАЖНО: Замени "..." на реальное значение из текста. Найди строку с кодом (например, "300.00.006") и извлеки число из той же строки/абзаца.
 
   *\`Форма 200\`*: 
     БИН: ...
@@ -1847,6 +2320,7 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
     Наименование налогоплательщика: ...
     200.01.001 Итого за отчетный квартал: ...
     Общая численность работников: 3 мес.: ...
+    ВАЖНО: Замени "..." на реальное значение из текста. Найди строку с кодом (например, "200.01.001") и извлеки число из той же строки/абзаца.
 
   *\`Форма 910\`*: 
     БИН: ...
@@ -1856,74 +2330,104 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
     910.00.016 Начисление доходы. Итого за полугодие: ...
     910.00.005 Сумма начисленных налогов: ...
     910.00.003 Среднесписочная численность работников, в том числе: ...
+    ВАЖНО: Замени "..." на реальное значение из текста. Найди строку с кодом (например, "910.00.001") и извлеки число из той же строки/абзаца.
 
 5. В конце добавь раздел "Краткий анализ по годам" с выводами по каждому году: итоги доходов/НДС, наличие доначислений или задолженности, существенные отклонения.`,
-                  model: 'gpt-5',
-                  tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [combinedTxtFileId] } })],
-                  modelSettings: { store: true }
-                })
-                const taxRunner = new Runner({})
-                
-                console.log(`⚙️ Запускаем анализ объединенного TXT файла (${parsedTexts.length} файлов)...`)
-                
-                const result = await Promise.race([
-                  taxRunner.run(taxAgent, [{ role: 'user', content: [{ type: 'input_text', text: taxRequest }] }]),
-                  analysisTimeout
-                ])
-                
-                // Извлекаем отчет
-                let taxText = ''
-                for (let i = result.newItems.length - 1; i >= 0; i--) {
-                  const it = result.newItems[i]
-                  if (it.rawItem?.role === 'assistant') {
-                    const c = it.rawItem.content
-                    if (Array.isArray(c)) {
-                      const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
-                      taxText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
-                    } else if (typeof it.rawItem.content === 'string') {
-                      taxText = it.rawItem.content
+                    model: 'gpt-5',
+                    tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [batchFileId] } })],
+                    modelSettings: { store: true }
+                  })
+                  const taxRunner = new Runner({})
+
+                  const taxMessages = [{ role: 'user', content: [{ type: 'input_text', text: taxRequest }] }]
+                  logAgentInput('Tax Analyst', session, taxMessages, {
+                    batchFileId,
+                    taxFiles: batchFiles,
+                    taxRequestLength: taxRequest.length,
+                  })
+                  console.log(`⚙️ Запускаем анализ TXT батча ${batchIndex + 1}/${batches.length} (${batchFiles.length} файлов)...`)
+
+                  const result = await Promise.race([
+                    taxRunner.run(taxAgent, taxMessages),
+                    analysisTimeout,
+                  ])
+
+                  // Извлекаем отчет для батча
+                  let taxText = ''
+                  for (let i = result.newItems.length - 1; i >= 0; i -= 1) {
+                    const it = result.newItems[i]
+                    if (it.rawItem?.role === 'assistant') {
+                      const c = it.rawItem.content
+                      if (Array.isArray(c)) {
+                        const t = c.find((x) => x?.type === 'text' || x?.type === 'output_text')
+                        taxText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
+                      } else if (typeof it.rawItem.content === 'string') {
+                        taxText = it.rawItem.content
+                      }
+                      if (taxText) break
                     }
-                    if (taxText) break
                   }
-                }
-                
-                if (!taxText) {
-                  taxText = `Анализ налоговой отчетности не удалось извлечь из ответа агента.`
-                }
-                
-                const combinedTaxReport = taxText
-                
-                console.log(`✅ Анализ налоговых файлов завершен`)
-                console.log(`📄 Размер отчета: ${combinedTaxReport.length} символов`)
-                if (combinedTaxReport.length > 0) {
-                  const preview = combinedTaxReport.substring(0, 200).replace(/\n/g, ' ')
-                  console.log(`📋 Превью отчета: ${preview}...`)
-                }
-                
-                // Сохраняем объединенный отчет в БД
-                console.log(`💾 Сохраняем налоговый отчет в БД...`)
-                try {
-                  await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(combinedTaxReport, session)
-                  console.log(`✅ Налоговый отчет сохранен для ${parsedTexts.length} файлов`)
-                } catch (dbError) {
-                  console.error(`❌ Ошибка сохранения налогового отчета в БД:`, dbError.message)
-                  // Пробуем еще раз через небольшую задержку
-                  await new Promise(resolve => setTimeout(resolve, 500))
-                  try {
-                    await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(combinedTaxReport, session)
-                    console.log(`✅ Налоговый отчет сохранен после retry`)
-                  } catch (retryError) {
-                    console.error(`❌ Ошибка сохранения после retry:`, retryError.message)
-                    // Продолжаем работу, отчет все равно будет доступен в памяти
+
+                  if (!taxText) {
+                    taxText = `Анализ налоговой отчетности для батча ${batchIndex + 1}/${batches.length} не удалось извлечь из ответа агента.`
                   }
+
+                  // Добавляем результат батча в общий отчет с разделителем
+                  combinedTaxReport += `\n${'='.repeat(80)}\nОТЧЕТ ПО БАТЧУ ${batchIndex + 1} ИЗ ${batches.length}\nФайлы: ${batchFiles.join(', ')}\n${'='.repeat(80)}\n\n`
+                  combinedTaxReport += taxText.trim()
+                  combinedTaxReport += '\n\n'
+
+                  console.log(`✅ Анализ налоговых файлов для батча ${batchIndex + 1}/${batches.length} завершен`)
+                } catch (error) {
+                  console.error(`❌ Ошибка анализа налоговых файлов для батча ${batchIndex + 1}/${batches.length}:`, error.message)
+                  analysisErrors.push(`Батч ${batchIndex + 1}/${batches.length} (${batchFiles.join(', ')}): ${error.message}`)
                 }
-              } catch (error) {
-                console.error(`❌ Ошибка анализа налоговых файлов:`, error.message)
-                const errorMessage = `Ошибка анализа: ${error.message}`
+              }
+
+              if (!combinedTaxReport) {
+                const errorMessage = `Ошибка анализа: ни один из батчей не был успешно обработан. Ошибки: ${analysisErrors.join(' | ')}`
+                console.error(`❌ ${errorMessage}`)
                 try {
                   await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = ? WHERE session_id = ?`).run(errorMessage, session)
                 } catch (dbError) {
                   console.error(`❌ Ошибка сохранения статуса ошибки в БД:`, dbError.message)
+                }
+                return
+              }
+
+              // Если были ошибки парсинга или анализа отдельных батчей - добавляем их в конец отчета
+              if (parseErrors.length > 0 || analysisErrors.length > 0) {
+                combinedTaxReport += `\n\n${'='.repeat(80)}\n⚠️ ДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ\n${'='.repeat(80)}\n`
+                if (parseErrors.length > 0) {
+                  combinedTaxReport += `\nФАЙЛЫ С ОШИБКАМИ ПРИ ПАРСИНГЕ:\n${parseErrors.join('\n')}\n`
+                }
+                if (analysisErrors.length > 0) {
+                  combinedTaxReport += `\nБАТЧИ С ОШИБКАМИ ПРИ АНАЛИЗЕ:\n${analysisErrors.join('\n')}\n`
+                }
+              }
+
+              console.log(`✅ Анализ налоговых файлов завершен для всех батчей`)
+              console.log(`📄 Размер итогового отчета: ${combinedTaxReport.length} символов`)
+              if (combinedTaxReport.length > 0) {
+                const preview = combinedTaxReport.substring(0, 200).replace(/\n/g, ' ')
+                console.log(`📋 Превью отчета: ${preview}...`)
+              }
+
+              // Сохраняем объединенный отчет в БД
+              console.log(`💾 Сохраняем налоговый отчет в БД...`)
+              try {
+                await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(combinedTaxReport, session)
+                console.log(`✅ Налоговый отчет сохранен для ${parsedTexts.length} файлов`)
+              } catch (dbError) {
+                console.error(`❌ Ошибка сохранения налогового отчета в БД:`, dbError.message)
+                // Пробуем еще раз через небольшую задержку
+                await new Promise((resolve) => setTimeout(resolve, 500))
+                try {
+                  await db.prepare(`UPDATE reports SET tax_report_text = ?, tax_status = 'completed' WHERE session_id = ?`).run(combinedTaxReport, session)
+                  console.log(`✅ Налоговый отчет сохранен после retry`)
+                } catch (retryError) {
+                  console.error(`❌ Ошибка сохранения после retry:`, retryError.message)
+                  // Продолжаем работу, отчет все равно будет доступен в памяти
                 }
               }
             } else {
@@ -1971,139 +2475,225 @@ app.post('/api/agents/run', upload.array('files', 10), async (req, res) => {
               fsYearsMissing.length ? fsYearsMissing.join(',') : null, session
             )
             
-            // Фильтруем только XLSX файлы для анализа (остальные форматы не анализируем)
-            const xlsxFiles = fsFilesRowsWithNames.filter(f => f.normalized_name.toLowerCase().endsWith('.xlsx'))
-            const nonXlsxFiles = fsFilesRowsWithNames.filter(f => !f.normalized_name.toLowerCase().endsWith('.xlsx'))
+            // Фильтруем только PDF файлы (XLSX больше не поддерживаются)
+            const pdfFiles = fsFilesRowsWithNames.filter(f => {
+              const name = f.normalized_name.toLowerCase()
+              return name.endsWith('.pdf')
+            })
+            const nonPdfFiles = fsFilesRowsWithNames.filter(f => {
+              const name = f.normalized_name.toLowerCase()
+              return !name.endsWith('.pdf')
+            })
             
+            const fsFileReports = [] // Массив отчетов для всех файлов
             
-            if (xlsxFiles.length > 0) {
-              // ИЗМЕНЕНИЕ: Анализируем каждый файл отдельно
-              const FS_TIMEOUT_MS = 30 * 60 * 1000 // 30 минут на файл
-              const fsFileReports = [] // Массив отчетов для каждого файла
-              
-              // Преобразуем в удобный формат
-              const formattedFsFiles = xlsxFiles.map(r => ({
-                fileId: r.file_id,
-                originalName: r.normalized_name
-              }))
-              
-              // Функция для анализа одного файла финансовой отчетности
-              const analyzeSingleFsFile = async (file) => {
-                const fileStartTime = Date.now()
-                console.log(`\n📄 Анализируем финансовый файл: ${file.originalName} (${file.fileId})`)
+            // Обрабатываем PDF файлы через Cloud Run OCR сервис
+            if (pdfFiles.length > 0) {
+              if (!USE_PDF_SERVICE) {
+                console.error(`❌ Cloud Run OCR сервис не настроен, но найдены PDF файлы финансовой отчетности`)
+                // Добавляем ошибки для всех PDF файлов
+                pdfFiles.forEach(pdfFile => {
+                  fsFileReports.push({
+                    fileId: pdfFile.file_id,
+                    fileName: pdfFile.normalized_name,
+                    report: `Ошибка: Cloud Run OCR сервис не настроен. Установите переменную окружения PDF_SERVICE_URL.`
+                  })
+                })
+              } else {
+                console.log(`\n📄 Обрабатываем ${pdfFiles.length} PDF файл(ов) через Cloud Run OCR сервис...`)
                 
-                const fsRequest = `Сделай анализ финансовой отчетности для файла "${file.originalName}".
+                try {
+                  // Получаем buffer'ы файлов из sessionFiles
+                  const sessionFilesData = sessionFiles.get(session) || []
+                  const pdfFilesWithBuffers = []
+                  
+                  for (const pdfFile of pdfFiles) {
+                    const sessionFile = sessionFilesData.find(f => f.fileId === pdfFile.file_id)
+                    if (sessionFile && sessionFile.buffer) {
+                      pdfFilesWithBuffers.push({
+                        buffer: sessionFile.buffer,
+                        originalName: pdfFile.normalized_name,
+                        fileId: pdfFile.file_id
+                      })
+                    } else {
+                      console.warn(`⚠️ Buffer не найден для PDF файла ${pdfFile.normalized_name}, пропускаем`)
+                    }
+                  }
+                  
+                  if (pdfFilesWithBuffers.length > 0) {
+                  // Отправляем PDF файлы на OCR сервис
+                  const ocrJsonData = await sendPdfsToOcrService(pdfFilesWithBuffers)
+                  
+                  // Создаем временный JSON файл с результатами OCR
+                  const jsonFileName = `financial_ocr_${session}_${Date.now()}.json`
+                  const jsonBuffer = Buffer.from(JSON.stringify(ocrJsonData, null, 2), 'utf-8')
+                  
+                  // Загружаем JSON файл в OpenAI
+                  const jsonFile = await toFile(jsonBuffer, jsonFileName, { type: 'application/json' })
+                  const uploadedJsonFile = await openaiClient.files.create({
+                    file: jsonFile,
+                    purpose: 'assistants'
+                  })
+                  
+                  console.log(`✅ JSON файл с OCR результатами загружен в OpenAI: ${uploadedJsonFile.id}`)
+                  
+                  // Анализируем JSON через агента
+                  const pdfAnalysisPromises = pdfFilesWithBuffers.map(async (pdfFile) => {
+                    const fileStartTime = Date.now()
+                    console.log(`\n📄 Анализируем финансовый PDF файл: ${pdfFile.originalName}`)
+                    
+                    const fsRequest = `Сделай анализ финансовой отчетности для файла "${pdfFile.originalName}".
+Данные из файла уже обработаны через OCR и представлены в структурированном JSON формате.
 Требования:
 - Сфокусируйся на текущем и предыдущем годах
 - Если какого-то года нет, явно укажи об этом и сделай анализ по имеющимся данным
 - Дай ключевые метрики: выручка, валовая прибыль/маржа, операционная прибыль, чистая прибыль, активы/обязательства
 - Выведи краткий вывод о динамике и рисках.
-Файл прикреплен.`
-                
-                const analysisTimeout = new Promise((_, reject) =>
-                  setTimeout(() => reject(new Error(`Financial Statements Analyst timeout для ${file.originalName} (${FS_TIMEOUT_MS/1000}s)`)), FS_TIMEOUT_MS)
-                )
-                
-                try {
-                  const fsAgent = new Agent({
-                    name: 'Financial Statements Analyst',
-                    instructions: `Ты аналитик финансовой отчетности. Проанализируй Баланс и ОПУ (P&L) в прикрепленном файле.
-                    Требования:
-                    - Сфокусируйся на текущем и предыдущем годах
-                    - Если какого-то года нет, явно укажи об этом и сделай анализ по имеющимся данным
-                    - Дай ключевые метрики: выручка, валовая прибыль/маржа, операционная прибыль, чистая прибыль, активы/обязательства
-                    - Выведи краткий вывод о динамике и рисках.`,
-                    model: 'gpt-5',
-                    tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [file.fileId] } })],
-                    modelSettings: { store: true }
-                  })
-                  const fsRunner = new Runner({})
-                  
-                  console.log(`⚙️ Запускаем анализ финансового файла "${file.originalName}"...`)
-                  
-                  const result = await Promise.race([
-                    fsRunner.run(fsAgent, [{ role: 'user', content: [{ type: 'input_text', text: fsRequest }] }]),
-                    analysisTimeout
-                  ])
-                  
-                  // Извлекаем отчет
-                  let fsText = ''
-                  for (let i = result.newItems.length - 1; i >= 0; i--) {
-                    const it = result.newItems[i]
-                    if (it.rawItem?.role === 'assistant') {
-                      const c = it.rawItem.content
-                      if (Array.isArray(c)) {
-                        const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
-                        fsText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
-                      } else if (typeof it.rawItem.content === 'string') {
-                        fsText = it.rawItem.content
+- Используй структурированные таблицы из JSON (structured_table или structured_table_array) для анализа данных.
+JSON файл с OCR результатами прикреплен.`
+                    
+                    const FS_TIMEOUT_MS = 30 * 60 * 1000 // 30 минут
+                    const analysisTimeout = new Promise((_, reject) =>
+                      setTimeout(() => reject(new Error(`Financial Statements Analyst timeout для ${pdfFile.originalName} (${FS_TIMEOUT_MS/1000}s)`)), FS_TIMEOUT_MS)
+                    )
+                    
+                    try {
+                      const fsAgent = new Agent({
+                        name: 'Financial Statements Analyst',
+                        instructions: `Ты аналитик финансовой отчетности. Проанализируй Баланс и ОПУ (P&L) используя структурированные данные из JSON файла с OCR результатами.
+                        Требования:
+                        - Сфокусируйся на текущем и предыдущем годах
+                        - Если какого-то года нет, явно укажи об этом и сделай анализ по имеющимся данным
+                        - Дай ключевые метрики: выручка, валовая прибыль/маржа, операционная прибыль, чистая прибыль, активы/обязательства
+                        - Выведи краткий вывод о динамике и рисках.
+                        - Используй структурированные таблицы из JSON (structured_table или structured_table_array) для анализа данных.`,
+                        model: 'gpt-5',
+                        tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [uploadedJsonFile.id] } })],
+                        modelSettings: { store: true }
+                      })
+                      const fsRunner = new Runner({})
+                      
+                      console.log(`⚙️ Запускаем анализ финансового PDF файла "${pdfFile.originalName}"...`)
+                      
+                      const result = await Promise.race([
+                        fsRunner.run(fsAgent, [{ role: 'user', content: [{ type: 'input_text', text: fsRequest }] }]),
+                        analysisTimeout
+                      ])
+                      
+                      // Извлекаем отчет
+                      let fsText = ''
+                      for (let i = result.newItems.length - 1; i >= 0; i--) {
+                        const it = result.newItems[i]
+                        if (it.rawItem?.role === 'assistant') {
+                          const c = it.rawItem.content
+                          if (Array.isArray(c)) {
+                            const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
+                            fsText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
+                          } else if (typeof it.rawItem.content === 'string') {
+                            fsText = it.rawItem.content
+                          }
+                          if (fsText) break
+                        }
                       }
-                      if (fsText) break
+                      
+                      if (!fsText) {
+                        fsText = `Анализ финансовой отчетности для файла "${pdfFile.originalName}" не удалось извлечь из ответа агента.`
+                      }
+                      
+                      const fileAnalysisTime = ((Date.now() - fileStartTime) / 1000).toFixed(2)
+                      console.log(`✅ Анализ финансового PDF файла "${pdfFile.originalName}" завершен за ${fileAnalysisTime}s`)
+                      
+                      return {
+                        fileId: pdfFile.fileId,
+                        fileName: pdfFile.originalName,
+                        report: fsText
+                      }
+                    } catch (error) {
+                      console.error(`❌ Ошибка анализа финансового PDF файла "${pdfFile.originalName}":`, error.message)
+                      return {
+                        fileId: pdfFile.fileId,
+                        fileName: pdfFile.originalName,
+                        report: `Ошибка анализа файла "${pdfFile.originalName}": ${error.message}`
+                      }
                     }
-                  }
+                  })
                   
-                  if (!fsText) {
-                    fsText = `Анализ финансовой отчетности для файла "${file.originalName}" не удалось извлечь из ответа агента.`
-                  }
-                  
-                  const fileAnalysisTime = ((Date.now() - fileStartTime) / 1000).toFixed(2)
-                  console.log(`✅ Анализ финансового файла "${file.originalName}" завершен за ${fileAnalysisTime}s`)
-                  
-                  return {
-                    fileId: file.fileId,
-                    fileName: file.originalName,
-                    report: fsText
+                  const pdfResults = await Promise.allSettled(pdfAnalysisPromises)
+                  pdfResults.forEach((result, index) => {
+                    if (result.status === 'fulfilled') {
+                      fsFileReports.push(result.value)
+                      console.log(`✅ Финансовый PDF отчет ${index + 1}/${pdfFilesWithBuffers.length} готов: ${result.value.fileName}`)
+                    } else {
+                      const file = pdfFilesWithBuffers[index]
+                      fsFileReports.push({
+                        fileId: file.fileId,
+                        fileName: file.originalName,
+                        report: `Ошибка анализа: ${result.reason?.message || 'Неизвестная ошибка'}`
+                      })
+                      console.error(`❌ Ошибка анализа финансового PDF файла ${file.originalName}:`, result.reason)
+                    }
+                  })
+                  } else {
+                    console.warn(`⚠️ Не найдено buffer'ов для PDF файлов, пропускаем обработку через OCR сервис`)
+                    // Добавляем ошибки для файлов без buffer
+                    pdfFiles.forEach(pdfFile => {
+                      const sessionFile = sessionFiles.get(session)?.find(f => f.fileId === pdfFile.file_id)
+                      if (!sessionFile || !sessionFile.buffer) {
+                        fsFileReports.push({
+                          fileId: pdfFile.file_id,
+                          fileName: pdfFile.normalized_name,
+                          report: `Ошибка: не найден buffer файла для обработки через OCR сервис`
+                        })
+                      }
+                    })
                   }
                 } catch (error) {
-                  console.error(`❌ Ошибка анализа финансового файла "${file.originalName}":`, error.message)
-                  return {
-                    fileId: file.fileId,
-                    fileName: file.originalName,
-                    report: `Ошибка анализа файла "${file.originalName}": ${error.message}`
-                  }
+                  console.error(`❌ Ошибка обработки PDF файлов через OCR сервис:`, error.message)
+                  console.error(`❌ Стек ошибки:`, error.stack)
+                  // Добавляем ошибки для всех PDF файлов
+                  pdfFiles.forEach(pdfFile => {
+                    fsFileReports.push({
+                      fileId: pdfFile.file_id,
+                      fileName: pdfFile.normalized_name,
+                      report: `Ошибка обработки через OCR сервис: ${error.message}`
+                    })
+                  })
                 }
               }
-              
-              // Анализируем все файлы параллельно
-              console.log(`\n🚀 Запускаем анализ ${formattedFsFiles.length} финансовых файлов параллельно...`)
-              const fsAnalysisPromises = formattedFsFiles.map(file => analyzeSingleFsFile(file))
-              const fsResults = await Promise.allSettled(fsAnalysisPromises)
-              
-              // Собираем успешные отчеты
-              fsResults.forEach((result, index) => {
-                if (result.status === 'fulfilled') {
-                  fsFileReports.push(result.value)
-                  console.log(`✅ Финансовый отчет ${index + 1}/${formattedFsFiles.length} готов: ${result.value.fileName}`)
-                } else {
-                  const file = formattedFsFiles[index]
-                  fsFileReports.push({
-                    fileId: file.fileId,
-                    fileName: file.originalName,
-                    report: `Ошибка анализа: ${result.reason?.message || 'Неизвестная ошибка'}`
-                  })
-                  console.error(`❌ Ошибка анализа финансового файла ${file.originalName}:`, result.reason)
-                }
-              })
-              
-              // Добавляем информацию о некорректных форматах
+            }
+            
+            // Сохраняем объединенный отчет (только PDF)
+            if (fsFileReports.length > 0) {
               let combinedFsReport = fsFileReports.map((fr, idx) => {
                 return `\n\n${'='.repeat(80)}\nОТЧЕТ ${idx + 1} из ${fsFileReports.length}\nФайл: ${fr.fileName}\n${'='.repeat(80)}\n\n${fr.report}`
               }).join('\n\n')
               
-              if (nonXlsxFiles.length > 0) {
-                const nonXlsxNames = nonXlsxFiles.map(f => f.original_name).join(', ')
-                combinedFsReport += `\n\n⚠️ Файлы некорректного формата (не проанализированы): ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX.`
+              if (nonPdfFiles.length > 0) {
+                const nonPdfNames = nonPdfFiles.map(f => f.normalized_name).join(', ')
+                combinedFsReport += `\n\n⚠️ Файлы некорректного формата (не проанализированы): ${nonPdfNames}. Для автоматического анализа требуется формат PDF.`
               }
               
               // Сохраняем объединенный отчет в БД
               console.log(`💾 Сохраняем ${fsFileReports.length} финансовых отчетов в БД...`)
               await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'completed' WHERE session_id = ?`).run(combinedFsReport, session)
               console.log(`✅ Финансовые отчеты сгенерированы для всех ${fsFileReports.length} файлов`)
-            } else if (fsFileIds.length > 0 && xlsxFiles.length === 0) {
-              // Есть файлы, но все некорректного формата
-              const nonXlsxNames = fsFilesRowsWithNames.map(f => f.normalized_name).join(', ')
+            } else if (fsFileIds.length > 0) {
+              // Есть файлы, но не удалось их обработать
+              const allFileNames = fsFilesRowsWithNames.map(f => f.normalized_name).join(', ')
+              const pdfFileNames = pdfFiles.map(f => f.normalized_name).join(', ')
+              const nonPdfFileNames = nonPdfFiles.map(f => f.normalized_name).join(', ')
+              
+              let errorMessage = ''
+              if (pdfFiles.length > 0 && nonPdfFiles.length > 0) {
+                errorMessage = `Не удалось обработать PDF файлы: ${pdfFileNames}. Также найдены файлы некорректного формата: ${nonPdfFileNames}. Для автоматического анализа требуется формат PDF.`
+              } else if (pdfFiles.length > 0) {
+                errorMessage = `Не удалось обработать файлы финансовой отчетности: ${pdfFileNames}. Проверьте формат файлов (требуется PDF).`
+              } else {
+                errorMessage = `Файлы некорректного формата: ${nonPdfFileNames}. Для автоматического анализа требуется формат PDF.`
+              }
+              
               await db.prepare(`UPDATE reports SET fs_status = 'error', fs_report_text = ? WHERE session_id = ?`).run(
-                `Файлы некорректного формата: ${nonXlsxNames}. Для автоматического анализа требуется формат XLSX (Excel).`,
+                errorMessage,
                 session
               )
             } else {
@@ -2225,7 +2815,7 @@ const upsertReport = async (sessionId, payload) => {
   }
 }
 
-app.post('/api/analysis', upload.array('files'), async (req, res) => {
+app.post('/api/analysis', upload.array('files'), handleMulterError, async (req, res) => {
   const startedAt = new Date()
   const incomingSession = req.body?.sessionId
   const sessionId = incomingSession || randomUUID()
@@ -2385,6 +2975,15 @@ app.post('/api/analysis', upload.array('files'), async (req, res) => {
               transactions: allTransactions.length,
             })
 
+            // Сохраняем JSON файл в БД
+            try {
+              await saveFileToDatabase(jsonBuffer, sessionId, jsonFileId, jsonFilename, 'application/json')
+              console.log(`💾 JSON файл сохранен в БД: ${jsonFilename}`)
+            } catch (dbError) {
+              console.error('⚠️ Не удалось сохранить JSON файл в БД, продолжаем работу', dbError)
+            }
+
+            // Обновляем категорию файла
             try {
               await saveFileToDB(
                 sessionId,
@@ -2392,10 +2991,11 @@ app.post('/api/analysis', upload.array('files'), async (req, res) => {
                 jsonFilename,
                 jsonBuffer.length,
                 'application/json',
-                'converted_statement'
+                'converted_statement',
+                null
               )
             } catch (error) {
-              console.error('⚠️ Не удалось сохранить JSON файл в БД, продолжаем работу', error)
+              console.error('⚠️ Не удалось обновить категорию JSON файла в БД, продолжаем работу', error)
             }
 
             attachments.push({
@@ -2446,6 +3046,14 @@ app.post('/api/analysis', upload.array('files'), async (req, res) => {
         purpose: uploadedFile.purpose,
       })
 
+      // Сохраняем файл в БД
+      try {
+        await saveFileToDatabase(file.buffer, sessionId, uploadedFile.id, file.originalname, file.mimetype)
+        console.log(`💾 Файл сохранен в БД: ${file.originalname}`)
+      } catch (dbError) {
+        console.error('⚠️ Не удалось сохранить файл в БД, продолжаем работу', dbError)
+      }
+
       const category = categorizeUploadedFile(file.originalname, file.mimetype)
       try {
         await saveFileToDB(
@@ -2454,10 +3062,11 @@ app.post('/api/analysis', upload.array('files'), async (req, res) => {
           file.originalname,
           file.size,
           file.mimetype,
-          category
+          category,
+          null
         )
       } catch (error) {
-        console.error('⚠️ Не удалось сохранить файл в БД, продолжаем работу', error)
+        console.error('⚠️ Не удалось обновить категорию файла в БД, продолжаем работу', error)
       }
 
       attachments.push({
@@ -2998,15 +3607,15 @@ app.get('/api/sessions/:sessionId/files', async (req, res) => {
   }
 })
 
-// Эндпоинт для скачивания файла из OpenAI
+// Эндпоинт для скачивания файла из локального хранилища
 app.get('/api/files/:fileId/download', async (req, res) => {
   const { fileId } = req.params
   console.log(`📥 Запрос скачивания файла: ${fileId}`)
   
   try {
-    // Получаем информацию о файле из БД
+    // Получаем файл из БД (включая file_data)
     const getFile = db.prepare(`
-      SELECT file_id, original_name, mime_type
+      SELECT file_id, original_name, mime_type, file_data, file_path
       FROM files 
       WHERE file_id = ?
     `)
@@ -3020,9 +3629,69 @@ app.get('/api/files/:fileId/download', async (req, res) => {
       })
     }
     
-    // Загружаем файл из OpenAI
-    const fileContent = await openaiClient.files.content(fileId)
-    const buffer = Buffer.from(await fileContent.arrayBuffer())
+    // Пытаемся прочитать файл из БД (file_data)
+    let buffer = null
+    if (file.file_data) {
+      try {
+        // PostgreSQL BYTEA возвращается как Buffer или строка в hex формате
+        if (Buffer.isBuffer(file.file_data)) {
+          buffer = file.file_data
+        } else if (typeof file.file_data === 'string') {
+          // Если это hex строка (начинается с \x)
+          if (file.file_data.startsWith('\\x')) {
+            buffer = Buffer.from(file.file_data.slice(2), 'hex')
+          } else {
+            buffer = Buffer.from(file.file_data, 'binary')
+          }
+        } else {
+          buffer = Buffer.from(file.file_data)
+        }
+        console.log(`✅ Файл прочитан из БД: ${file.original_name} (${buffer.length} bytes)`)
+      } catch (readError) {
+        console.error(`⚠️ Ошибка чтения файла из БД:`, readError.message)
+      }
+    }
+    
+    // Fallback: пытаемся прочитать из файловой системы (для старых файлов)
+    if (!buffer && file.file_path) {
+      const filePath = path.join(__dirname, file.file_path)
+      if (fs.existsSync(filePath)) {
+        try {
+          buffer = fs.readFileSync(filePath)
+          console.log(`✅ Файл прочитан из файловой системы (fallback): ${filePath}`)
+        } catch (readError) {
+          console.error(`⚠️ Ошибка чтения файла из файловой системы:`, readError.message)
+        }
+      }
+    }
+    
+    // Fallback: пытаемся загрузить из OpenAI (только для старых файлов с OpenAI fileId)
+    // Локальные файлы (fileId начинается с "local-") не загружаются в OpenAI
+    if (!buffer && !fileId.startsWith('local-')) {
+      try {
+        console.log(`⚠️ Пытаемся загрузить файл из OpenAI как fallback...`)
+        const fileContent = await openaiClient.files.content(fileId)
+        buffer = Buffer.from(await fileContent.arrayBuffer())
+        console.log(`✅ Файл загружен из OpenAI (fallback)`)
+      } catch (openaiError) {
+        console.error(`❌ Ошибка загрузки файла из OpenAI:`, openaiError.message)
+        // Если это ошибка о purpose 'assistants', сообщаем об этом
+        if (openaiError.message?.includes('Not allowed to download files of purpose: assistants')) {
+          return res.status(500).json({
+            ok: false,
+            message: 'Файл недоступен для скачивания. Файл не найден в БД.'
+          })
+        }
+        throw openaiError
+      }
+    }
+    
+    if (!buffer) {
+      return res.status(404).json({
+        ok: false,
+        message: 'Файл не найден в БД, файловой системе или OpenAI'
+      })
+    }
     
     // Устанавливаем заголовки для скачивания
     const downloadName = normalizeFileName(file.original_name) || 'file.pdf'
@@ -3114,6 +3783,7 @@ app.listen(PORT, () => {
   console.log(`[server] NODE_ENV: ${process.env.NODE_ENV || 'development'}`)
   console.log(`[server] API key present: ${!!process.env.OPENAI_API_KEY}`)
   console.log(`[server] Database: ${process.env.DATABASE_URL ? 'configured' : 'missing'}`)
+  console.log(`[server] PDF_SERVICE_URL: ${process.env.PDF_SERVICE_URL ? 'configured' : 'missing'}`)
 })
 
 // Keep server alive

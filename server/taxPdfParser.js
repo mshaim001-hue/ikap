@@ -1,6 +1,9 @@
 /**
  * Модуль для парсинга PDF налоговых деклараций в текстовый формат
- * Использует Python скрипт из папки taxpdfto
+ *
+ * Режимы работы:
+ * 1) HTTP (Cloud Run): если задан TAX_PDF_SERVICE_URL – отправляем PDF на внешний сервис и получаем текст
+ * 2) Локальный Python: по умолчанию используем taxpdfto/app.py через subprocess
  */
 
 const { spawn } = require('child_process')
@@ -8,18 +11,28 @@ const path = require('path')
 const fs = require('fs')
 const { promisify } = require('util')
 const { randomUUID } = require('crypto')
+const axios = require('axios')
+const FormData = require('form-data')
 
 const writeFile = promisify(fs.writeFile)
 const unlink = promisify(fs.unlink)
 const mkdir = promisify(fs.mkdir)
 const readFile = promisify(fs.readFile)
 
-// Путь к папке taxpdfto
+// Путь к папке taxpdfto (для локального Python режима)
 const TAX_PDF_TO_PATH = process.env.TAX_PDF_TO_PATH || 
   path.join(__dirname, '..', 'taxpdfto')
 
-// Путь к app.py
-const APP_PY_PATH = path.join(TAX_PDF_TO_PATH, 'app.py')
+// URL Cloud Run сервиса для налоговых PDF
+const TAX_PDF_SERVICE_URL = process.env.TAX_PDF_SERVICE_URL || ''
+const USE_TAX_PDF_SERVICE_HTTP = !!TAX_PDF_SERVICE_URL
+
+// Логируем режим работы сразу при загрузке модуля
+if (USE_TAX_PDF_SERVICE_HTTP) {
+  console.log(`📡 Tax OCR (Cloud Run) включен: ${TAX_PDF_SERVICE_URL}`)
+} else {
+  console.log('🐍 Tax OCR: используется локальный Python (TAX_PDF_SERVICE_URL не задан)')
+}
 
 /**
  * Парсит PDF файл в текстовый формат используя Python скрипт
@@ -28,6 +41,12 @@ const APP_PY_PATH = path.join(TAX_PDF_TO_PATH, 'app.py')
  * @returns {Promise<string>} Распарсенный текст
  */
 async function parseTaxPdfToText(pdfBuffer, filename) {
+  // Если настроен внешний HTTP сервис (Cloud Run) – используем его
+  if (USE_TAX_PDF_SERVICE_HTTP) {
+    return parseTaxPdfToTextViaHttp(pdfBuffer, filename)
+  }
+
+  // Иначе используем локальный Python скрипт
   const tempDir = path.join(__dirname, '..', 'temp_parsing')
   const tempPdfPath = path.join(tempDir, `${randomUUID()}_${filename}`)
   const tempOutputPath = path.join(tempDir, `${randomUUID()}_output.txt`)
@@ -57,6 +76,90 @@ async function parseTaxPdfToText(pdfBuffer, filename) {
       }
     } catch (cleanupError) {
       console.warn(`⚠️ Не удалось удалить временные файлы:`, cleanupError)
+    }
+  }
+}
+
+/**
+ * Парсит PDF через HTTP сервис (Cloud Run tax-ocr-service)
+ * Ожидаемый формат ответа:
+ * {
+ *   "files": [
+ *     {"filename": "...", "text": "..."},
+ *     ...
+ *   ]
+ * }
+ */
+async function parseTaxPdfToTextViaHttp(pdfBuffer, filename) {
+  if (!TAX_PDF_SERVICE_URL) {
+    throw new Error('TAX_PDF_SERVICE_URL не задан, не могу использовать HTTP режим для налогового парсера')
+  }
+
+  const formData = new FormData()
+  formData.append('files', pdfBuffer, {
+    filename,
+    contentType: 'application/pdf'
+  })
+
+  // Нормализуем URL (убираем трейлинг слэши)
+  const baseUrl = TAX_PDF_SERVICE_URL.trim().replace(/\/+$/, '')
+  const serviceUrl = `${baseUrl}/process`
+
+  // Даем достаточно времени, так как PDF могут быть большими
+  const TIMEOUT_MS = 600000 // 10 минут
+
+  try {
+    const response = await axios.post(serviceUrl, formData, {
+      headers: formData.getHeaders(),
+      timeout: TIMEOUT_MS,
+      maxContentLength: Infinity,
+      maxBodyLength: Infinity
+    })
+
+    if (response.status !== 200) {
+      throw new Error(`Неожиданный статус ответа от tax-ocr-service: ${response.status}`)
+    }
+
+    const data = response.data || {}
+    const files = Array.isArray(data.files) ? data.files : []
+
+    if (!files.length) {
+      throw new Error('tax-ocr-service вернул пустой результат (нет файлов)')
+    }
+
+    // Ищем текст по имени файла, если совпадает
+    const normalizedName = filename.toLowerCase()
+    let fileEntry = files.find(f => (f.filename || '').toLowerCase() === normalizedName)
+
+    if (!fileEntry) {
+      // Если точного совпадения нет – берём первый файл
+      fileEntry = files[0]
+    }
+
+    if (!fileEntry || !fileEntry.text) {
+      throw new Error('tax-ocr-service вернул результат без текста')
+    }
+
+    const text = String(fileEntry.text || '').trim()
+    if (!text) {
+      throw new Error('tax-ocr-service вернул пустой текст')
+    }
+
+    return text
+  } catch (error) {
+    if (error.response) {
+      const errMsg = error.response.data?.error || error.response.statusText || error.message
+      console.error('❌ Ошибка tax-ocr-service (HTTP):', error.response.status, errMsg)
+      throw new Error(`Ошибка tax-ocr-service (${error.response.status}): ${errMsg}`)
+    } else if (error.code === 'ECONNABORTED' || `${error.message}`.includes('timeout')) {
+      console.error(`⏱️ Таймаут запроса к tax-ocr-service после ${TIMEOUT_MS / 1000} секунд`)
+      throw new Error(`tax-ocr-service не ответил в течение ${TIMEOUT_MS / 1000} секунд`)
+    } else if (error.request) {
+      console.error('❌ tax-ocr-service не ответил:', error.message)
+      throw new Error(`tax-ocr-service не ответил: ${error.message}`)
+    } else {
+      console.error('❌ Ошибка при вызове tax-ocr-service:', error.message)
+      throw new Error(`Ошибка при вызове tax-ocr-service: ${error.message}`)
     }
   }
 }
