@@ -541,18 +541,36 @@ async function initSchema() {
       -- Добавляем колонку file_data для хранения файлов в БД
       ALTER TABLE files ADD COLUMN IF NOT EXISTS file_data BYTEA;
       
-      -- Добавляем UNIQUE constraint на file_id, если его еще нет
-      DO $$
-      BEGIN
-          IF NOT EXISTS (
-              SELECT 1 FROM pg_constraint 
-              WHERE conname = 'files_file_id_key' 
-              AND conrelid = 'files'::regclass
-          ) THEN
-              ALTER TABLE files ADD CONSTRAINT files_file_id_key UNIQUE (file_id);
-          END IF;
-      END $$;
+      -- Таблица для хранения настроек агентов
+      CREATE TABLE IF NOT EXISTS agent_settings (
+        id SERIAL PRIMARY KEY,
+        agent_name TEXT UNIQUE NOT NULL,
+        instructions TEXT NOT NULL,
+        mcp_config JSONB,
+        model TEXT DEFAULT 'gpt-5-mini',
+        model_settings JSONB,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      
+      -- Создаем индекс для быстрого поиска по agent_name
+      CREATE INDEX IF NOT EXISTS idx_agent_settings_name ON agent_settings(agent_name);
     `)
+    
+    // Добавляем UNIQUE constraint на file_id отдельным запросом (если его еще нет)
+    try {
+      await db.prepare(`
+        ALTER TABLE files ADD CONSTRAINT files_file_id_key UNIQUE (file_id)
+      `).run()
+      console.log('✅ UNIQUE constraint на file_id добавлен')
+    } catch (error) {
+      // Игнорируем ошибку, если constraint уже существует
+      if (error.code === '23505' || error.message?.includes('already exists') || error.message?.includes('duplicate')) {
+        console.log('ℹ️ UNIQUE constraint на file_id уже существует')
+      } else {
+        console.error('⚠️ Ошибка добавления UNIQUE constraint на file_id:', error.message)
+      }
+    }
   } else {
     db.exec(`
       CREATE TABLE IF NOT EXISTS reports (
@@ -1150,9 +1168,26 @@ const investmentAgent = new Agent({
   modelSettings: { store: true }
 })
 
-const informationAgent = new Agent({
-  name: 'Information Agent',
-  instructions: `Ты информационный агент краудфандинговой платформы iKapitalist.
+// Функция для получения настроек агента из БД
+const getAgentSettings = async (agentName) => {
+  try {
+    const getSettings = db.prepare(`
+      SELECT instructions, mcp_config, model, model_settings
+      FROM agent_settings 
+      WHERE agent_name = ?
+    `)
+    const settings = await getSettings.get(agentName)
+    return settings
+  } catch (error) {
+    console.error(`❌ Ошибка получения настроек агента ${agentName}:`, error)
+    return null
+  }
+}
+
+// Функция для инициализации настроек по умолчанию
+const initDefaultAgentSettings = async () => {
+  try {
+    const defaultInstructions = `Ты информационный агент краудфандинговой платформы iKapitalist.
 
 Твоя цель — через короткий диалог помочь человеку понять возможности платформы и мягко подвести к подаче заявки, чтобы затем подключить инвестиционного агента. Общайся на русском языке, поддерживай живой диалог вопрос–ответ и опирайся на данные MCP.
 
@@ -1170,10 +1205,95 @@ const informationAgent = new Agent({
 - Каждое сообщение — максимум 3 коротких предложения или 3 пункта. Избегай длинных блоков текста.
 - Всегда заканчивай сообщение вопросом или предложением следующего шага.
 - Не придумывай фактов; приводи цифры строго из MCP. Если данных нет, так и скажи.
-- Если пользователь отклоняет подачу заявки, уважай решение и предложи вернуться позже.`,
-  model: 'gpt-5-mini',
-  modelSettings: { store: true },
-  mcpServers: ikapInfoMcpServer ? [ikapInfoMcpServer] : []
+- Если пользователь отклоняет подачу заявки, уважай решение и предложи вернуться позже.`
+
+    const insertSettings = db.prepare(`
+      INSERT INTO agent_settings (agent_name, instructions, model, model_settings)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT (agent_name) DO NOTHING
+    `)
+    await insertSettings.run(
+      'Information Agent',
+      defaultInstructions,
+      'gpt-5-mini',
+      JSON.stringify({ store: true })
+    )
+    console.log('✅ Настройки по умолчанию для Information Agent инициализированы')
+  } catch (error) {
+    console.error('❌ Ошибка инициализации настроек по умолчанию:', error)
+  }
+}
+
+// Инициализируем настройки по умолчанию при старте
+initDefaultAgentSettings().catch(err => {
+  console.error('❌ Ошибка при инициализации настроек:', err)
+})
+
+// Создаем Information Agent с настройками из БД
+let informationAgent = null
+let agentSettingsCache = null
+let agentCacheTimestamp = 0
+const CACHE_TTL = 60000 // 1 минута кэш
+
+const createInformationAgent = async () => {
+  const settings = await getAgentSettings('Information Agent')
+  const instructions = settings?.instructions || `Ты информационный агент краудфандинговой платформы iKapitalist.
+
+Твоя цель — через короткий диалог помочь человеку понять возможности платформы и мягко подвести к подаче заявки, чтобы затем подключить инвестиционного агента. Общайся на русском языке, поддерживай живой диалог вопрос–ответ и опирайся на данные MCP.`
+  const model = settings?.model || 'gpt-5-mini'
+  
+  // Безопасный парсинг model_settings
+  let modelSettings = { store: true }
+  if (settings?.model_settings) {
+    try {
+      if (typeof settings.model_settings === 'string') {
+        modelSettings = JSON.parse(settings.model_settings)
+      } else if (typeof settings.model_settings === 'object') {
+        modelSettings = settings.model_settings
+      }
+    } catch (error) {
+      console.error('⚠️ Ошибка парсинга model_settings, используем значения по умолчанию:', error)
+      modelSettings = { store: true }
+    }
+  }
+  
+  return new Agent({
+    name: 'Information Agent',
+    instructions,
+    model,
+    modelSettings,
+    mcpServers: ikapInfoMcpServer ? [ikapInfoMcpServer] : []
+  })
+}
+
+// Получаем или создаем агента с кэшированием
+const getInformationAgent = async () => {
+  const now = Date.now()
+  if (!informationAgent || (now - agentCacheTimestamp) > CACHE_TTL) {
+    informationAgent = await createInformationAgent()
+    agentCacheTimestamp = now
+    console.log('✅ Information Agent обновлен из БД')
+  }
+  return informationAgent
+}
+
+// Инициализируем агента при старте асинхронно
+setImmediate(async () => {
+  try {
+    informationAgent = await createInformationAgent()
+    agentCacheTimestamp = Date.now()
+    console.log('✅ Information Agent инициализирован')
+  } catch (error) {
+    console.error('❌ Ошибка инициализации Information Agent:', error)
+    // Создаем агента с дефолтными настройками
+    informationAgent = new Agent({
+      name: 'Information Agent',
+      instructions: 'Ты информационный агент краудфандинговой платформы iKapitalist.',
+      model: 'gpt-5-mini',
+      modelSettings: { store: true },
+      mcpServers: ikapInfoMcpServer ? [ikapInfoMcpServer] : []
+    })
+  }
 })
 
 // Middleware для логирования полей запроса перед multer
@@ -1399,7 +1519,7 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
       // НЕ используем Code Interpreter для анализа файлов - агент просто принимает файлы
       // Файлы сохранены локально, но НЕ загружены в OpenAI (это избыточно для Investment Agent)
       // Файлы будут обработаны локально, а обработанные данные (JSON, TXT) загрузятся в OpenAI для анализаторов
-      const agentToRun = agentName === 'information' ? informationAgent : investmentAgent
+      const agentToRun = agentName === 'information' ? await getInformationAgent() : investmentAgent
       
       // Запускаем агента с таймаутом 30 минут (единый SLA)
       // Передаем всю историю - не можем обрезать из-за reasoning items в gpt-5
@@ -3763,6 +3883,121 @@ app.get('/api/reports', async (req, res) => {
     return res.status(500).json({
       ok: false,
       message: 'Не удалось получить отчёты.'
+    })
+  }
+})
+
+// API endpoints для настроек агента
+app.get('/api/agent-settings/:agentName', async (req, res) => {
+  const { agentName } = req.params
+  console.log(`📋 Запрос настроек агента: ${agentName}`)
+  
+  try {
+    const settings = await getAgentSettings(agentName)
+    
+    if (!settings) {
+      return res.status(404).json({
+        ok: false,
+        message: 'Настройки агента не найдены'
+      })
+    }
+    
+    // Безопасный парсинг JSON полей
+    let mcpConfig = null
+    if (settings.mcp_config) {
+      try {
+        if (typeof settings.mcp_config === 'string') {
+          mcpConfig = JSON.parse(settings.mcp_config)
+        } else if (typeof settings.mcp_config === 'object') {
+          mcpConfig = settings.mcp_config
+        }
+      } catch (e) {
+        console.error('⚠️ Ошибка парсинга mcp_config:', e)
+      }
+    }
+    
+    let modelSettings = null
+    if (settings.model_settings) {
+      try {
+        if (typeof settings.model_settings === 'string') {
+          modelSettings = JSON.parse(settings.model_settings)
+        } else if (typeof settings.model_settings === 'object') {
+          modelSettings = settings.model_settings
+        }
+      } catch (e) {
+        console.error('⚠️ Ошибка парсинга model_settings:', e)
+      }
+    }
+    
+    return res.json({
+      ok: true,
+      settings: {
+        agentName,
+        instructions: settings.instructions,
+        mcpConfig,
+        model: settings.model,
+        modelSettings
+      }
+    })
+  } catch (error) {
+    console.error('❌ Ошибка получения настроек агента:', error)
+    return res.status(500).json({
+      ok: false,
+      message: 'Ошибка сервера при получении настроек'
+    })
+  }
+})
+
+app.put('/api/agent-settings/:agentName', async (req, res) => {
+  const { agentName } = req.params
+  const { instructions, mcpConfig, model, modelSettings } = req.body
+  console.log(`💾 Обновление настроек агента: ${agentName}`)
+  
+  try {
+    // Валидация
+    if (!instructions || typeof instructions !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        message: 'Поле instructions обязательно и должно быть строкой'
+      })
+    }
+    
+    const updateSettings = db.prepare(`
+      INSERT INTO agent_settings (agent_name, instructions, mcp_config, model, model_settings, updated_at)
+      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT (agent_name) DO UPDATE SET
+        instructions = EXCLUDED.instructions,
+        mcp_config = EXCLUDED.mcp_config,
+        model = EXCLUDED.model,
+        model_settings = EXCLUDED.model_settings,
+        updated_at = CURRENT_TIMESTAMP
+    `)
+    
+    await updateSettings.run(
+      agentName,
+      instructions,
+      mcpConfig ? JSON.stringify(mcpConfig) : null,
+      model || 'gpt-5-mini',
+      modelSettings ? JSON.stringify(modelSettings) : JSON.stringify({ store: true })
+    )
+    
+    // Сбрасываем кэш агента, чтобы он пересоздался с новыми настройками
+    if (agentName === 'Information Agent') {
+      informationAgent = null
+      agentCacheTimestamp = 0
+      console.log('🔄 Кэш Information Agent сброшен, будет пересоздан при следующем использовании')
+    }
+    
+    console.log(`✅ Настройки агента ${agentName} обновлены`)
+    return res.json({
+      ok: true,
+      message: 'Настройки успешно обновлены'
+    })
+  } catch (error) {
+    console.error('❌ Ошибка обновления настроек агента:', error)
+    return res.status(500).json({
+      ok: false,
+      message: 'Ошибка сервера при обновлении настроек'
     })
   }
 })

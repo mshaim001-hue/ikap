@@ -10,7 +10,8 @@ import {
   Bell, 
   MessageCircle, 
   Coins,
-  ClipboardList
+  ClipboardList,
+  Settings
 } from 'lucide-react'
 import { getApiUrl } from '../utils/api'
 import './Sidebar.css'
@@ -46,6 +47,8 @@ const Sidebar = ({ onViewChange, activeView }) => {
       onViewChange('applications')
     } else if (label === 'Владелец бизнеса') {
       onViewChange('chat')
+    } else if (label === 'Настройки') {
+      onViewChange('settings')
     }
     // Для других пунктов можно добавить логику позже
   }
@@ -59,6 +62,7 @@ const Sidebar = ({ onViewChange, activeView }) => {
     { icon: FileText, label: 'Договоры', active: false },
     { icon: CreditCard, label: 'Платежи', active: false },
     { icon: ClipboardList, label: 'Заявки', active: activeView === 'applications', badge: newApplicationsCount > 0 ? newApplicationsCount : null },
+    { icon: Settings, label: 'Настройки', active: activeView === 'settings' },
     { icon: Bell, label: 'Уведомления', active: false, badge: 5 },
     { icon: MessageCircle, label: 'Обращения', active: false },
     { icon: Coins, label: 'Дискуссии', active: false },
