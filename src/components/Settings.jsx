@@ -14,6 +14,10 @@ const Settings = () => {
   const [mcpServerLoading, setMcpServerLoading] = useState(false)
   const [mcpServerSaving, setMcpServerSaving] = useState(false)
   const [activeTab, setActiveTab] = useState('general') // 'general' или 'mcp'
+  const [mcpSections, setMcpSections] = useState([])
+  const [newSectionTitle, setNewSectionTitle] = useState('')
+  const [newSectionContent, setNewSectionContent] = useState('')
+  const [addingSection, setAddingSection] = useState(false)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState({ type: '', text: '' })
@@ -21,6 +25,7 @@ const Settings = () => {
   useEffect(() => {
     loadSettings()
     loadMcpServer()
+    loadMcpSections()
   }, [])
 
   const loadSettings = async () => {
@@ -137,6 +142,93 @@ const Settings = () => {
       setMessage({ type: 'error', text: 'Ошибка сохранения настроек' })
     } finally {
       setSaving(false)
+    }
+  }
+
+  const loadMcpSections = async () => {
+    try {
+      const response = await fetch(getApiUrl('/api/mcp-sections'))
+      if (response.ok) {
+        const data = await response.json()
+        if (data.ok && data.sections) {
+          setMcpSections(data.sections)
+        }
+      }
+    } catch (error) {
+      console.error('Ошибка загрузки разделов MCP:', error)
+    }
+  }
+
+  const handleAddSection = async () => {
+    if (!newSectionTitle.trim() || !newSectionContent.trim()) {
+      setMessage({ type: 'error', text: 'Заполните заголовок и содержимое раздела' })
+      return
+    }
+
+    try {
+      setAddingSection(true)
+      setMessage({ type: '', text: '' })
+
+      const response = await fetch(getApiUrl('/api/mcp-sections'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          title: newSectionTitle.trim(),
+          content: newSectionContent.trim()
+        })
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        if (data.ok) {
+          setMessage({ type: 'success', text: 'Раздел успешно добавлен на MCP сервер' })
+          setTimeout(() => setMessage({ type: '', text: '' }), 3000)
+          setNewSectionTitle('')
+          setNewSectionContent('')
+          await loadMcpSections()
+        } else {
+          setMessage({ type: 'error', text: data.message || 'Ошибка добавления раздела' })
+        }
+      } else {
+        const data = await response.json()
+        setMessage({ type: 'error', text: data.message || 'Ошибка добавления раздела' })
+      }
+    } catch (error) {
+      console.error('Ошибка добавления раздела:', error)
+      setMessage({ type: 'error', text: 'Ошибка добавления раздела' })
+    } finally {
+      setAddingSection(false)
+    }
+  }
+
+  const handleDeleteSection = async (sectionId) => {
+    if (!confirm(`Вы уверены, что хотите удалить раздел "${sectionId}"?`)) {
+      return
+    }
+
+    try {
+      const response = await fetch(getApiUrl(`/api/mcp-sections/${sectionId}`), {
+        method: 'DELETE'
+      })
+
+      if (response.ok) {
+        const data = await response.json()
+        if (data.ok) {
+          setMessage({ type: 'success', text: 'Раздел успешно удален' })
+          setTimeout(() => setMessage({ type: '', text: '' }), 3000)
+          await loadMcpSections()
+        } else {
+          setMessage({ type: 'error', text: data.message || 'Ошибка удаления раздела' })
+        }
+      } else {
+        const data = await response.json()
+        setMessage({ type: 'error', text: data.message || 'Ошибка удаления раздела' })
+      }
+    } catch (error) {
+      console.error('Ошибка удаления раздела:', error)
+      setMessage({ type: 'error', text: 'Ошибка удаления раздела' })
     }
   }
 
@@ -344,54 +436,175 @@ const Settings = () => {
 
       {activeTab === 'mcp' && (
         <div className="settings-content">
+          {/* Секция добавления нового раздела */}
           <div className="settings-section">
-            <label htmlFor="mcpServer">Код MCP сервера (ikap-info-server.js)</label>
-            {mcpServerLoading ? (
-              <div className="settings-loading-inline">
-                <RefreshCw className="spinner" size={16} />
-                <span>Загрузка MCP сервера...</span>
-              </div>
-            ) : (
-              <textarea
-                id="mcpServer"
-                value={mcpServerContent}
-                onChange={(e) => setMcpServerContent(e.target.value)}
-                className="settings-textarea settings-code"
-                rows={30}
-                placeholder="Код MCP сервера..."
+            <h3 style={{ marginBottom: '16px', fontSize: '18px', fontWeight: '600' }}>
+              Добавить новый раздел на MCP сервер
+            </h3>
+            <div className="settings-section">
+              <label htmlFor="newSectionTitle">Заголовок раздела</label>
+              <input
+                id="newSectionTitle"
+                type="text"
+                value={newSectionTitle}
+                onChange={(e) => setNewSectionTitle(e.target.value)}
+                className="settings-input"
+                placeholder="Например: Новости платформы"
               />
-            )}
-            <div className="settings-hint">
-              Редактирование кода MCP сервера. Будьте осторожны при изменении - это может повлиять на работу агента.
+              <div className="settings-hint">
+                Заголовок будет автоматически преобразован в идентификатор раздела (section_id)
+              </div>
+            </div>
+            <div className="settings-section" style={{ marginTop: '16px' }}>
+              <label htmlFor="newSectionContent">Содержимое раздела</label>
+              <textarea
+                id="newSectionContent"
+                value={newSectionContent}
+                onChange={(e) => setNewSectionContent(e.target.value)}
+                className="settings-textarea"
+                rows={10}
+                placeholder="Введите текст статьи или информации, которую нужно добавить на MCP сервер..."
+              />
+              <div className="settings-hint">
+                Поддерживается Markdown форматирование. Текст будет доступен агенту через инструмент ikapitalist_get_section
+              </div>
+            </div>
+            <div className="settings-actions" style={{ marginTop: '16px' }}>
+              <button
+                onClick={handleAddSection}
+                disabled={addingSection || !newSectionTitle.trim() || !newSectionContent.trim()}
+                className="settings-save-btn"
+              >
+                {addingSection ? (
+                  <>
+                    <RefreshCw className="spinner" size={16} />
+                    Добавление...
+                  </>
+                ) : (
+                  <>
+                    <Save size={16} />
+                    Добавить на MCP сервер
+                  </>
+                )}
+              </button>
             </div>
           </div>
 
-          <div className="settings-actions">
-            <button
-              onClick={handleSaveMcpServer}
-              disabled={mcpServerSaving || mcpServerLoading}
-              className="settings-save-btn"
-            >
-              {mcpServerSaving ? (
-                <>
-                  <RefreshCw className="spinner" size={16} />
-                  Сохранение...
-                </>
-              ) : (
-                <>
-                  <Save size={16} />
-                  Сохранить MCP сервер
-                </>
-              )}
-            </button>
-            <button
-              onClick={loadMcpServer}
-              disabled={mcpServerLoading || mcpServerSaving}
-              className="settings-reload-btn"
-            >
-              <RefreshCw size={16} />
-              Обновить
-            </button>
+          {/* Список существующих разделов */}
+          <div className="settings-section" style={{ marginTop: '32px' }}>
+            <h3 style={{ marginBottom: '16px', fontSize: '18px', fontWeight: '600' }}>
+              Существующие разделы ({mcpSections.length})
+            </h3>
+            {mcpSections.length === 0 ? (
+              <div className="settings-hint">Разделы не найдены</div>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                {mcpSections.map((section) => (
+                  <div
+                    key={section.id}
+                    style={{
+                      border: '1px solid #e0e0e0',
+                      borderRadius: '8px',
+                      padding: '16px',
+                      backgroundColor: '#fafafa'
+                    }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'start', marginBottom: '8px' }}>
+                      <div>
+                        <strong style={{ fontSize: '16px' }}>{section.title}</strong>
+                        <div style={{ fontSize: '12px', color: '#666', marginTop: '4px' }}>
+                          ID: {section.sectionId}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => handleDeleteSection(section.sectionId)}
+                        style={{
+                          padding: '4px 8px',
+                          fontSize: '12px',
+                          backgroundColor: '#ff4444',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        Удалить
+                      </button>
+                    </div>
+                    <div
+                      style={{
+                        fontSize: '14px',
+                        color: '#333',
+                        maxHeight: '100px',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis'
+                      }}
+                    >
+                      {section.content.substring(0, 200)}
+                      {section.content.length > 200 ? '...' : ''}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Редактирование кода MCP сервера (скрыто по умолчанию, можно развернуть) */}
+          <div className="settings-section" style={{ marginTop: '32px', borderTop: '1px solid #e0e0e0', paddingTop: '24px' }}>
+            <details>
+              <summary style={{ cursor: 'pointer', fontSize: '16px', fontWeight: '600', marginBottom: '16px' }}>
+                Редактирование кода MCP сервера (продвинутый режим)
+              </summary>
+              <div className="settings-section">
+                <label htmlFor="mcpServer">Код MCP сервера (ikap-info-server.js)</label>
+                {mcpServerLoading ? (
+                  <div className="settings-loading-inline">
+                    <RefreshCw className="spinner" size={16} />
+                    <span>Загрузка MCP сервера...</span>
+                  </div>
+                ) : (
+                  <textarea
+                    id="mcpServer"
+                    value={mcpServerContent}
+                    onChange={(e) => setMcpServerContent(e.target.value)}
+                    className="settings-textarea settings-code"
+                    rows={30}
+                    placeholder="Код MCP сервера..."
+                  />
+                )}
+                <div className="settings-hint">
+                  Редактирование кода MCP сервера. Будьте осторожны при изменении - это может повлиять на работу агента.
+                </div>
+              </div>
+
+              <div className="settings-actions">
+                <button
+                  onClick={handleSaveMcpServer}
+                  disabled={mcpServerSaving || mcpServerLoading}
+                  className="settings-save-btn"
+                >
+                  {mcpServerSaving ? (
+                    <>
+                      <RefreshCw className="spinner" size={16} />
+                      Сохранение...
+                    </>
+                  ) : (
+                    <>
+                      <Save size={16} />
+                      Сохранить MCP сервер
+                    </>
+                  )}
+                </button>
+                <button
+                  onClick={loadMcpServer}
+                  disabled={mcpServerLoading || mcpServerSaving}
+                  className="settings-reload-btn"
+                >
+                  <RefreshCw size={16} />
+                  Обновить
+                </button>
+              </div>
+            </details>
           </div>
         </div>
       )}

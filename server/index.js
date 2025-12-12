@@ -427,37 +427,87 @@ app.use(express.json({ limit: '10mb' }))
 let ikapInfoMcpServer = null
 let tempMcpServerPath = null
 
+// Функция для генерации кода MCP сервера с разделами из БД
+const generateMcpServerCode = async () => {
+  try {
+    // Загружаем разделы из БД
+    const sectionsQuery = db.prepare(`
+      SELECT section_id, title, content 
+      FROM mcp_sections 
+      ORDER BY section_id
+    `)
+    const dbSections = await sectionsQuery.all()
+    
+    // Загружаем базовый шаблон MCP сервера
+    const fallbackPath = path.join(__dirname, 'mcp', 'ikap-info-server.js')
+    let baseCode = ''
+    if (fs.existsSync(fallbackPath)) {
+      baseCode = fs.readFileSync(fallbackPath, 'utf8')
+    } else {
+      throw new Error('Базовый файл MCP сервера не найден')
+    }
+    
+    // Если разделов в БД нет, используем базовый код
+    if (dbSections.length === 0) {
+      console.log('📄 Разделов в БД нет, используем базовый код')
+      return baseCode
+    }
+    
+    // Генерируем объект sections из БД
+    const sectionsCode = dbSections
+      .map((section) => {
+        // Экранируем обратные кавычки и ${ в контенте для template literal
+        const escapedContent = section.content
+          .replace(/\\/g, '\\\\')
+          .replace(/`/g, '\\`')
+          .replace(/\${/g, '\\${')
+        return `  ${section.section_id}: \`${escapedContent}\``
+      })
+      .join(',\n')
+    
+    // Генерируем массив sectionIds
+    const sectionIds = dbSections.map(s => s.section_id)
+    const sectionIdsCode = sectionIds.map(id => `'${id}'`).join(', ')
+    
+    // Находим начало и конец объекта sections в базовом коде
+    const sectionsStart = baseCode.indexOf('const sections = {')
+    const sectionsEnd = baseCode.indexOf('};', sectionsStart) + 2
+    
+    if (sectionsStart === -1 || sectionsEnd === 1) {
+      console.warn('⚠️ Не удалось найти объект sections в базовом коде, используем базовый код')
+      return baseCode
+    }
+    
+    // Заменяем объект sections
+    const beforeSections = baseCode.substring(0, sectionsStart)
+    const afterSections = baseCode.substring(sectionsEnd)
+    const newSectionsCode = `const sections = {\n${sectionsCode}\n}`
+    
+    // Заменяем sectionIds
+    const sectionIdsPattern = /const sectionIds = Object\.keys\(sections\)/
+    const newSectionIdsCode = `const sectionIds = [${sectionIdsCode}]`
+    
+    let generatedCode = beforeSections + newSectionsCode + afterSections
+    generatedCode = generatedCode.replace(sectionIdsPattern, newSectionIdsCode)
+    
+    console.log(`✅ Сгенерирован код MCP сервера с ${dbSections.length} разделами из БД`)
+    return generatedCode
+  } catch (error) {
+    console.error('❌ Ошибка генерации кода MCP сервера:', error)
+    // В случае ошибки возвращаем базовый код
+    const fallbackPath = path.join(__dirname, 'mcp', 'ikap-info-server.js')
+    if (fs.existsSync(fallbackPath)) {
+      return fs.readFileSync(fallbackPath, 'utf8')
+    }
+    throw error
+  }
+}
+
 // Функция для создания MCP сервера из кода в БД
 const initMcpServerFromDb = async () => {
   try {
-    const settings = await getAgentSettings('Information Agent')
-    let mcpServerCode = settings?.mcp_server_code
-    
-    // Если кода нет в БД, пробуем загрузить из файла (для обратной совместимости)
-    if (!mcpServerCode) {
-      const fallbackPath = path.join(__dirname, 'mcp', 'ikap-info-server.js')
-      if (fs.existsSync(fallbackPath)) {
-        console.log('📄 Загружаем MCP сервер из файла (код в БД отсутствует)')
-        mcpServerCode = fs.readFileSync(fallbackPath, 'utf8')
-        // Сохраняем в БД для будущего использования
-        try {
-          const updateMcpCode = db.prepare(`
-            UPDATE agent_settings 
-            SET mcp_server_code = ? 
-            WHERE agent_name = 'Information Agent'
-          `)
-          await updateMcpCode.run(mcpServerCode)
-          console.log('✅ Код MCP сервера сохранен в БД из файла')
-        } catch (e) {
-          console.warn('⚠️ Не удалось сохранить код MCP сервера в БД:', e.message)
-        }
-      }
-    }
-    
-    if (!mcpServerCode) {
-      console.warn('⚠️ Код MCP сервера не найден ни в БД, ни в файле')
-      return null
-    }
+    // Генерируем код MCP сервера с разделами из БД
+    let mcpServerCode = await generateMcpServerCode()
     
     // Создаем временный файл из кода в БД
     const tempDir = path.join(__dirname, 'mcp', 'temp')
@@ -489,8 +539,92 @@ const initMcpServerFromDb = async () => {
   }
 }
 
+// Функция для инициализации базовых разделов MCP
+const initDefaultMcpSections = async () => {
+  try {
+    // Проверяем, есть ли уже разделы в БД
+    const countQuery = db.prepare('SELECT COUNT(*) as count FROM mcp_sections')
+    const countResult = await countQuery.get()
+    const count = countResult?.count || 0
+    
+    if (count > 0) {
+      console.log(`✅ Разделы MCP уже инициализированы (${count} разделов)`)
+      return
+    }
+    
+    // Базовые разделы из файла ikap-info-server.js
+    const defaultSections = [
+      {
+        section_id: 'overview',
+        title: 'Обзор iKapitalist',
+        content: `# Обзор iKapitalist
+
+iKapitalist — лицензированная инвестиционная и заёмная краудфандинговая платформа, работающая с 2019 года.
+Платформа помогает малому и среднему бизнесу привлекать финансирование от инвесторов на прозрачных условиях.
+Инвесторы могут выдавать займы или покупать доли в компаниях, получая доходность от 24% годовых.
+
+**Ключевые факты:**
+- Запуск: 2019 год
+- Лицензия AFSA-А-LA-2023-0005 (Астана, МФЦА)
+- Управление инвестиционной и заёмной краудфандинговой платформой
+- Возможность прямого общения инвесторов с собственниками бизнеса`
+      },
+      {
+        section_id: 'licensing',
+        title: 'Лицензирование и регулирование',
+        content: `# Лицензирование и регулирование
+
+Платформа iKapitalist.kz зарегистрирована в юрисдикции Международного финансового центра «Астана» (МФЦА) и регулируется Управлением по финансовым услугам AFSA.
+
+**Лицензия:**
+- Номер: AFSA-A-LA-2023-0005
+- Дата выдачи: 27.04.2023
+- Статус: активна
+- Деятельность: управление инвестиционной и заёмной краудфандинговой платформой и платформой заемного финансирования`
+      },
+      {
+        section_id: 'contacts',
+        title: 'Контакты iKapitalist',
+        content: `# Контакты iKapitalist
+
+Адрес: Мангилик Ел, 55/21, блок С4.2, офис 265, Астана, Казахстан
+Телефон: +7 700 178 00 18
+Электронная почта: claims@ikapitalist.kz
+
+Регулятор AFSA:
+- Адрес: ул. Мангилик Ел 55/17, блок C3.2, Астана, Казахстан
+- Телефон: +7 (7172) 64 73 71
+- Email: apd@afsa.kz`
+      }
+    ]
+    
+    const insertSection = db.prepare(`
+      INSERT INTO mcp_sections (section_id, title, content)
+      VALUES (?, ?, ?)
+      ON CONFLICT (section_id) DO NOTHING
+    `)
+    
+    let inserted = 0
+    for (const section of defaultSections) {
+      try {
+        await insertSection.run(section.section_id, section.title, section.content)
+        inserted++
+      } catch (e) {
+        // Игнорируем ошибки при конфликте (раздел уже существует)
+      }
+    }
+    
+    if (inserted > 0) {
+      console.log(`✅ Инициализировано ${inserted} базовых разделов MCP`)
+    }
+  } catch (error) {
+    console.error('❌ Ошибка инициализации базовых разделов MCP:', error)
+  }
+}
+
 // Инициализируем MCP сервер асинхронно после инициализации БД
 setImmediate(async () => {
+  await initDefaultMcpSections()
   await initMcpServerFromDb()
 })
 
@@ -610,6 +744,18 @@ async function initSchema() {
       
       -- Создаем индекс для быстрого поиска по agent_name
       CREATE INDEX IF NOT EXISTS idx_agent_settings_name ON agent_settings(agent_name);
+      
+      -- Таблица для хранения разделов MCP сервера
+      CREATE TABLE IF NOT EXISTS mcp_sections (
+        id SERIAL PRIMARY KEY,
+        section_id TEXT UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_mcp_sections_id ON mcp_sections(section_id);
     `)
     
     // Добавляем UNIQUE constraint на file_id отдельным запросом (если его еще нет)
@@ -672,6 +818,18 @@ async function initSchema() {
       CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
       CREATE INDEX IF NOT EXISTS idx_files_session ON files(session_id);
       CREATE INDEX IF NOT EXISTS idx_reports_created ON reports(created_at);
+      
+      -- Таблица для хранения разделов MCP сервера
+      CREATE TABLE IF NOT EXISTS mcp_sections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        section_id TEXT UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      );
+      
+      CREATE INDEX IF NOT EXISTS idx_mcp_sections_id ON mcp_sections(section_id);
     `)
   }
   console.log('✅ Database initialized with all tables')
@@ -4210,6 +4368,166 @@ app.put('/api/agent-settings/:agentName', async (req, res) => {
     return res.status(500).json({
       ok: false,
       message: 'Ошибка сервера при обновлении настроек'
+    })
+  }
+})
+
+// API endpoints для управления разделами MCP сервера
+app.get('/api/mcp-sections', async (req, res) => {
+  try {
+    const sectionsQuery = db.prepare(`
+      SELECT id, section_id, title, content, created_at, updated_at
+      FROM mcp_sections
+      ORDER BY section_id
+    `)
+    const sections = await sectionsQuery.all()
+    
+    return res.json({
+      ok: true,
+      sections: sections.map(s => ({
+        id: s.id,
+        sectionId: s.section_id,
+        title: s.title,
+        content: s.content,
+        createdAt: s.created_at,
+        updatedAt: s.updated_at
+      }))
+    })
+  } catch (error) {
+    console.error('❌ Ошибка получения разделов MCP:', error)
+    return res.status(500).json({
+      ok: false,
+      message: `Ошибка сервера при получении разделов: ${error.message}`
+    })
+  }
+})
+
+app.post('/api/mcp-sections', async (req, res) => {
+  try {
+    const { title, content } = req.body
+    
+    if (!title || !content) {
+      return res.status(400).json({
+        ok: false,
+        message: 'Поля title и content обязательны'
+      })
+    }
+    
+    // Генерируем section_id из title (транслитерация и нормализация)
+    const sectionId = title
+      .toLowerCase()
+      .replace(/[^a-zа-яё0-9\s]/g, '') // Удаляем спецсимволы
+      .replace(/\s+/g, '_') // Пробелы в подчеркивания
+      .replace(/_+/g, '_') // Множественные подчеркивания в одно
+      .replace(/^_|_$/g, '') // Удаляем подчеркивания в начале и конце
+      .substring(0, 50) // Ограничиваем длину
+    
+    if (!sectionId) {
+      return res.status(400).json({
+        ok: false,
+        message: 'Не удалось сгенерировать section_id из title'
+      })
+    }
+    
+    // Проверяем, не существует ли уже раздел с таким section_id
+    const checkQuery = db.prepare('SELECT id FROM mcp_sections WHERE section_id = ?')
+    const existing = await checkQuery.get(sectionId)
+    
+    if (existing) {
+      return res.status(409).json({
+        ok: false,
+        message: `Раздел с идентификатором "${sectionId}" уже существует`
+      })
+    }
+    
+    // Добавляем раздел
+    const insertSection = db.prepare(`
+      INSERT INTO mcp_sections (section_id, title, content)
+      VALUES (?, ?, ?)
+    `)
+    await insertSection.run(sectionId, title, content)
+    
+    console.log(`✅ Добавлен новый раздел MCP: ${sectionId} (${title})`)
+    
+    // Перегенерируем MCP сервер с новым разделом
+    try {
+      // Закрываем старый MCP сервер
+      if (ikapInfoMcpServer?.close) {
+        await ikapInfoMcpServer.close()
+      }
+      // Удаляем старый временный файл
+      if (tempMcpServerPath && fs.existsSync(tempMcpServerPath)) {
+        fs.unlinkSync(tempMcpServerPath)
+      }
+      // Инициализируем заново
+      await initMcpServerFromDb()
+      // Сбрасываем кэш агента
+      informationAgent = null
+      agentCacheTimestamp = 0
+      console.log('🔄 MCP сервер перезапущен с новым разделом')
+    } catch (e) {
+      console.warn('⚠️ Не удалось перезапустить MCP сервер:', e.message)
+    }
+    
+    return res.json({
+      ok: true,
+      message: 'Раздел успешно добавлен',
+      section: {
+        sectionId,
+        title,
+        content
+      }
+    })
+  } catch (error) {
+    console.error('❌ Ошибка добавления раздела MCP:', error)
+    return res.status(500).json({
+      ok: false,
+      message: `Ошибка сервера при добавлении раздела: ${error.message}`
+    })
+  }
+})
+
+app.delete('/api/mcp-sections/:sectionId', async (req, res) => {
+  try {
+    const { sectionId } = req.params
+    
+    const deleteSection = db.prepare('DELETE FROM mcp_sections WHERE section_id = ?')
+    const result = await deleteSection.run(sectionId)
+    
+    if (result.changes === 0) {
+      return res.status(404).json({
+        ok: false,
+        message: 'Раздел не найден'
+      })
+    }
+    
+    console.log(`✅ Удален раздел MCP: ${sectionId}`)
+    
+    // Перегенерируем MCP сервер
+    try {
+      if (ikapInfoMcpServer?.close) {
+        await ikapInfoMcpServer.close()
+      }
+      if (tempMcpServerPath && fs.existsSync(tempMcpServerPath)) {
+        fs.unlinkSync(tempMcpServerPath)
+      }
+      await initMcpServerFromDb()
+      informationAgent = null
+      agentCacheTimestamp = 0
+      console.log('🔄 MCP сервер перезапущен после удаления раздела')
+    } catch (e) {
+      console.warn('⚠️ Не удалось перезапустить MCP сервер:', e.message)
+    }
+    
+    return res.json({
+      ok: true,
+      message: 'Раздел успешно удален'
+    })
+  } catch (error) {
+    console.error('❌ Ошибка удаления раздела MCP:', error)
+    return res.status(500).json({
+      ok: false,
+      message: `Ошибка сервера при удалении раздела: ${error.message}`
     })
   }
 })
