@@ -3944,134 +3944,17 @@ app.get('/api/reports', async (req, res) => {
   }
 })
 
-// API endpoints для настроек агента
-app.get('/api/agent-settings/:agentName', async (req, res) => {
-  const { agentName } = req.params
-  console.log(`📋 Запрос настроек агента: ${agentName}`)
-  
-  try {
-    const settings = await getAgentSettings(agentName)
-    
-    if (!settings) {
-      return res.status(404).json({
-        ok: false,
-        message: 'Настройки агента не найдены'
-      })
-    }
-    
-    // Безопасный парсинг JSON полей
-    let mcpConfig = null
-    if (settings.mcp_config) {
-      try {
-        if (typeof settings.mcp_config === 'string') {
-          mcpConfig = JSON.parse(settings.mcp_config)
-        } else if (typeof settings.mcp_config === 'object') {
-          mcpConfig = settings.mcp_config
-        }
-      } catch (e) {
-        console.error('⚠️ Ошибка парсинга mcp_config:', e)
-      }
-    }
-    
-    let modelSettings = null
-    if (settings.model_settings) {
-      try {
-        if (typeof settings.model_settings === 'string') {
-          modelSettings = JSON.parse(settings.model_settings)
-        } else if (typeof settings.model_settings === 'object') {
-          modelSettings = settings.model_settings
-        }
-      } catch (e) {
-        console.error('⚠️ Ошибка парсинга model_settings:', e)
-      }
-    }
-    
-    return res.json({
-      ok: true,
-      settings: {
-        agentName,
-        instructions: settings.instructions,
-        role: settings.role || 'Информационный консультант',
-        functionality: settings.functionality || 'Отвечает на вопросы о платформе iKapitalist',
-        mcpConfig,
-        mcpServerCode: settings.mcp_server_code || null,
-        model: settings.model,
-        modelSettings
-      }
-    })
-  } catch (error) {
-    console.error('❌ Ошибка получения настроек агента:', error)
-    return res.status(500).json({
-      ok: false,
-      message: 'Ошибка сервера при получении настроек'
-    })
-  }
-})
-
-app.put('/api/agent-settings/:agentName', async (req, res) => {
-  const { agentName } = req.params
-  const { instructions, role, functionality, mcpConfig, model, modelSettings } = req.body
-  console.log(`💾 Обновление настроек агента: ${agentName}`)
-  
-  try {
-    // Валидация
-    if (!instructions || typeof instructions !== 'string') {
-      return res.status(400).json({
-        ok: false,
-        message: 'Поле instructions обязательно и должно быть строкой'
-      })
-    }
-    
-    const updateSettings = db.prepare(`
-      INSERT INTO agent_settings (agent_name, instructions, role, functionality, mcp_config, model, model_settings, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-      ON CONFLICT (agent_name) DO UPDATE SET
-        instructions = EXCLUDED.instructions,
-        role = EXCLUDED.role,
-        functionality = EXCLUDED.functionality,
-        mcp_config = EXCLUDED.mcp_config,
-        model = EXCLUDED.model,
-        model_settings = EXCLUDED.model_settings,
-        updated_at = CURRENT_TIMESTAMP
-    `)
-    
-    await updateSettings.run(
-      agentName,
-      instructions,
-      role || null,
-      functionality || null,
-      mcpConfig ? JSON.stringify(mcpConfig) : null,
-      model || 'gpt-5-mini',
-      modelSettings ? JSON.stringify(modelSettings) : JSON.stringify({ store: true })
-    )
-    
-    // Сбрасываем кэш агента, чтобы он пересоздался с новыми настройками
-    if (agentName === 'Information Agent') {
-      informationAgent = null
-      agentCacheTimestamp = 0
-      console.log('🔄 Кэш Information Agent сброшен, будет пересоздан при следующем использовании')
-    }
-    
-    console.log(`✅ Настройки агента ${agentName} обновлены`)
-    return res.json({
-      ok: true,
-      message: 'Настройки успешно обновлены'
-    })
-  } catch (error) {
-    console.error('❌ Ошибка обновления настроек агента:', error)
-    return res.status(500).json({
-      ok: false,
-      message: 'Ошибка сервера при обновлении настроек'
-    })
-  }
-})
-
 // API endpoints для работы с MCP сервером (код из БД)
 // Поддерживаем как полное название, так и slug (information-agent)
+// ВАЖНО: Эти маршруты должны быть определены ПЕРЕД /api/agent-settings/:agentName
+// чтобы Express правильно сопоставил более специфичные маршруты
 app.get('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
   try {
     // Получаем agentName из URL (может быть slug или полное название)
     let agentName = req.params.agentName
+    
+    console.log(`🔍 [MCP Route] Получен запрос, agentName из params: "${agentName}"`)
+    console.log(`🔍 [MCP Route] Полный URL: ${req.originalUrl || req.url}`)
     
     // Пробуем декодировать, если не получается - используем как есть
     try {
@@ -4205,6 +4088,128 @@ app.put('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
     return res.status(500).json({
       ok: false,
       message: `Ошибка сервера при сохранении MCP сервера: ${error.message}`
+    })
+  }
+})
+
+// API endpoints для настроек агента
+app.get('/api/agent-settings/:agentName', async (req, res) => {
+  const { agentName } = req.params
+  console.log(`📋 Запрос настроек агента: ${agentName}`)
+  
+  try {
+    const settings = await getAgentSettings(agentName)
+    
+    if (!settings) {
+      return res.status(404).json({
+        ok: false,
+        message: 'Настройки агента не найдены'
+      })
+    }
+    
+    // Безопасный парсинг JSON полей
+    let mcpConfig = null
+    if (settings.mcp_config) {
+      try {
+        if (typeof settings.mcp_config === 'string') {
+          mcpConfig = JSON.parse(settings.mcp_config)
+        } else if (typeof settings.mcp_config === 'object') {
+          mcpConfig = settings.mcp_config
+        }
+      } catch (e) {
+        console.error('⚠️ Ошибка парсинга mcp_config:', e)
+      }
+    }
+    
+    let modelSettings = null
+    if (settings.model_settings) {
+      try {
+        if (typeof settings.model_settings === 'string') {
+          modelSettings = JSON.parse(settings.model_settings)
+        } else if (typeof settings.model_settings === 'object') {
+          modelSettings = settings.model_settings
+        }
+      } catch (e) {
+        console.error('⚠️ Ошибка парсинга model_settings:', e)
+      }
+    }
+    
+    return res.json({
+      ok: true,
+      settings: {
+        agentName,
+        instructions: settings.instructions,
+        role: settings.role || 'Информационный консультант',
+        functionality: settings.functionality || 'Отвечает на вопросы о платформе iKapitalist',
+        mcpConfig,
+        mcpServerCode: settings.mcp_server_code || null,
+        model: settings.model,
+        modelSettings
+      }
+    })
+  } catch (error) {
+    console.error('❌ Ошибка получения настроек агента:', error)
+    return res.status(500).json({
+      ok: false,
+      message: 'Ошибка сервера при получении настроек'
+    })
+  }
+})
+
+app.put('/api/agent-settings/:agentName', async (req, res) => {
+  const { agentName } = req.params
+  const { instructions, role, functionality, mcpConfig, model, modelSettings } = req.body
+  console.log(`💾 Обновление настроек агента: ${agentName}`)
+  
+  try {
+    // Валидация
+    if (!instructions || typeof instructions !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        message: 'Поле instructions обязательно и должно быть строкой'
+      })
+    }
+    
+    const updateSettings = db.prepare(`
+      INSERT INTO agent_settings (agent_name, instructions, role, functionality, mcp_config, model, model_settings, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT (agent_name) DO UPDATE SET
+        instructions = EXCLUDED.instructions,
+        role = EXCLUDED.role,
+        functionality = EXCLUDED.functionality,
+        mcp_config = EXCLUDED.mcp_config,
+        model = EXCLUDED.model,
+        model_settings = EXCLUDED.model_settings,
+        updated_at = CURRENT_TIMESTAMP
+    `)
+    
+    await updateSettings.run(
+      agentName,
+      instructions,
+      role || null,
+      functionality || null,
+      mcpConfig ? JSON.stringify(mcpConfig) : null,
+      model || 'gpt-5-mini',
+      modelSettings ? JSON.stringify(modelSettings) : JSON.stringify({ store: true })
+    )
+    
+    // Сбрасываем кэш агента, чтобы он пересоздался с новыми настройками
+    if (agentName === 'Information Agent') {
+      informationAgent = null
+      agentCacheTimestamp = 0
+      console.log('🔄 Кэш Information Agent сброшен, будет пересоздан при следующем использовании')
+    }
+    
+    console.log(`✅ Настройки агента ${agentName} обновлены`)
+    return res.json({
+      ok: true,
+      message: 'Настройки успешно обновлены'
+    })
+  } catch (error) {
+    console.error('❌ Ошибка обновления настроек агента:', error)
+    return res.status(500).json({
+      ok: false,
+      message: 'Ошибка сервера при обновлении настроек'
     })
   }
 })
