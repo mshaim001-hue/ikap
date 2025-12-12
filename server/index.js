@@ -4017,14 +4017,30 @@ app.put('/api/agent-settings/:agentName', async (req, res) => {
 })
 
 // API endpoints для работы с MCP сервером (файлом)
+// Поддерживаем как полное название, так и slug (information-agent)
 app.get('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
-  // Декодируем agentName из URL
-  const agentName = decodeURIComponent(req.params.agentName)
-  console.log(`📄 Запрос MCP сервера для агента: ${agentName}`)
-  
   try {
+    // Получаем agentName из URL (может быть slug или полное название)
+    let agentName = req.params.agentName
+    
+    // Пробуем декодировать, если не получается - используем как есть
+    try {
+      agentName = decodeURIComponent(agentName)
+    } catch (e) {
+      // Если декодирование не удалось, используем как есть
+      console.warn('⚠️ Не удалось декодировать agentName, используем как есть:', agentName)
+    }
+    
+    // Преобразуем slug обратно в полное название, если нужно
+    if (agentName === 'information-agent') {
+      agentName = 'Information Agent'
+    }
+    
+    console.log(`📄 Запрос MCP сервера для агента: "${agentName}" (raw: "${req.params.agentName}")`)
+    
     // Пока поддерживаем только Information Agent
     if (agentName !== 'Information Agent') {
+      console.warn(`⚠️ Неподдерживаемый агент: "${agentName}"`)
       return res.status(404).json({
         ok: false,
         message: 'MCP сервер доступен только для Information Agent'
@@ -4032,15 +4048,32 @@ app.get('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
     }
     
     const mcpServerPath = path.join(__dirname, 'mcp', 'ikap-info-server.js')
+    console.log(`📂 Путь к MCP серверу: ${mcpServerPath}`)
+    console.log(`📂 __dirname: ${__dirname}`)
+    console.log(`📂 Файл существует: ${fs.existsSync(mcpServerPath)}`)
     
     if (!fs.existsSync(mcpServerPath)) {
+      console.error(`❌ Файл MCP сервера не найден по пути: ${mcpServerPath}`)
+      // Пробуем альтернативный путь
+      const altPath = path.join(process.cwd(), 'server', 'mcp', 'ikap-info-server.js')
+      console.log(`📂 Пробуем альтернативный путь: ${altPath}`)
+      if (fs.existsSync(altPath)) {
+        console.log(`✅ Файл найден по альтернативному пути`)
+        const mcpServerContent = fs.readFileSync(altPath, 'utf8')
+        return res.json({
+          ok: true,
+          content: mcpServerContent,
+          filename: 'ikap-info-server.js'
+        })
+      }
       return res.status(404).json({
         ok: false,
-        message: 'Файл MCP сервера не найден'
+        message: `Файл MCP сервера не найден. Проверенные пути: ${mcpServerPath}, ${altPath}`
       })
     }
     
     const mcpServerContent = fs.readFileSync(mcpServerPath, 'utf8')
+    console.log(`✅ MCP сервер загружен, размер: ${mcpServerContent.length} символов`)
     
     return res.json({
       ok: true,
@@ -4049,20 +4082,35 @@ app.get('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
     })
   } catch (error) {
     console.error('❌ Ошибка получения MCP сервера:', error)
+    console.error('Stack:', error.stack)
     return res.status(500).json({
       ok: false,
-      message: 'Ошибка сервера при получении MCP сервера'
+      message: `Ошибка сервера при получении MCP сервера: ${error.message}`
     })
   }
 })
 
 app.put('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
-  // Декодируем agentName из URL
-  const agentName = decodeURIComponent(req.params.agentName)
-  const { content } = req.body
-  console.log(`💾 Сохранение MCP сервера для агента: ${agentName}`)
-  
   try {
+    // Получаем agentName из URL (может быть slug или полное название)
+    let agentName = req.params.agentName
+    
+    // Пробуем декодировать, если не получается - используем как есть
+    try {
+      agentName = decodeURIComponent(agentName)
+    } catch (e) {
+      // Если декодирование не удалось, используем как есть
+      console.warn('⚠️ Не удалось декодировать agentName, используем как есть:', agentName)
+    }
+    
+    // Преобразуем slug обратно в полное название, если нужно
+    if (agentName === 'information-agent') {
+      agentName = 'Information Agent'
+    }
+    
+    const { content } = req.body
+    console.log(`💾 Сохранение MCP сервера для агента: "${agentName}" (raw: "${req.params.agentName}")`)
+    
     // Пока поддерживаем только Information Agent
     if (agentName !== 'Information Agent') {
       return res.status(404).json({
@@ -4083,11 +4131,13 @@ app.put('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
     
     // Создаем директорию, если её нет
     if (!fs.existsSync(mcpServerDir)) {
+      console.log(`📁 Создаем директорию: ${mcpServerDir}`)
       fs.mkdirSync(mcpServerDir, { recursive: true })
     }
     
     // Сохраняем файл
     fs.writeFileSync(mcpServerPath, content, 'utf8')
+    console.log(`✅ Файл сохранен: ${mcpServerPath}`)
     
     // Сбрасываем кэш агента, чтобы он пересоздался с новым MCP сервером
     if (agentName === 'Information Agent') {
@@ -4103,9 +4153,10 @@ app.put('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
     })
   } catch (error) {
     console.error('❌ Ошибка сохранения MCP сервера:', error)
+    console.error('Stack:', error.stack)
     return res.status(500).json({
       ok: false,
-      message: 'Ошибка сервера при сохранении MCP сервера'
+      message: `Ошибка сервера при сохранении MCP сервера: ${error.message}`
     })
   }
 })

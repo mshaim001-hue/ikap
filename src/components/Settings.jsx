@@ -55,24 +55,30 @@ const Settings = () => {
   const loadMcpServer = async () => {
     try {
       setMcpServerLoading(true)
-      // URL encode для пробелов в названии агента
-      const encodedAgentName = encodeURIComponent(agentName)
-      const response = await fetch(getApiUrl(`/api/agent-settings/${encodedAgentName}/mcp-server`))
+      setMessage({ type: '', text: '' })
+      
+      // Используем slug вместо полного названия для избежания проблем с пробелами
+      // Information Agent -> information-agent
+      const agentSlug = agentName.toLowerCase().replace(/\s+/g, '-')
+      const response = await fetch(getApiUrl(`/api/agent-settings/${agentSlug}/mcp-server`))
+      
       if (response.ok) {
         const data = await response.json()
         if (data.ok && data.content) {
           setMcpServerContent(data.content)
+          console.log('✅ MCP сервер успешно загружен')
         } else {
           console.warn('MCP сервер не найден или пуст:', data)
-          setMessage({ type: 'error', text: 'Не удалось загрузить MCP сервер' })
+          setMessage({ type: 'error', text: data.message || 'Не удалось загрузить MCP сервер' })
         }
       } else {
         const errorData = await response.json().catch(() => ({}))
-        console.warn('Не удалось загрузить MCP сервер:', response.status, errorData)
-        setMessage({ type: 'error', text: errorData.message || 'Не удалось загрузить MCP сервер' })
+        console.error('❌ Ошибка загрузки MCP сервера:', response.status, errorData)
+        const errorMessage = errorData.message || `Ошибка ${response.status}: Не удалось загрузить MCP сервер`
+        setMessage({ type: 'error', text: errorMessage })
       }
     } catch (error) {
-      console.error('Ошибка загрузки MCP сервера:', error)
+      console.error('❌ Ошибка загрузки MCP сервера:', error)
       setMessage({ type: 'error', text: 'Ошибка загрузки MCP сервера: ' + error.message })
     } finally {
       setMcpServerLoading(false)
@@ -135,9 +141,9 @@ const Settings = () => {
       setMcpServerSaving(true)
       setMessage({ type: '', text: '' })
 
-      // URL encode для пробелов в названии агента
-      const encodedAgentName = encodeURIComponent(agentName)
-      const response = await fetch(getApiUrl(`/api/agent-settings/${encodedAgentName}/mcp-server`), {
+      // Используем slug вместо полного названия для избежания проблем с пробелами
+      const agentSlug = agentName.toLowerCase().replace(/\s+/g, '-')
+      const response = await fetch(getApiUrl(`/api/agent-settings/${agentSlug}/mcp-server`), {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json'
