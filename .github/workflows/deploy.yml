@@ -9,10 +9,14 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pages: write
+      id-token: write
     
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Полная история для правильной работы с git
       
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -36,3 +40,4 @@ jobs:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         publish_dir: ./dist
         cname: false
+        force_orphan: true
