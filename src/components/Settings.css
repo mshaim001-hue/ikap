@@ -1,9 +1,12 @@
 .settings-container {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
   padding: 24px;
-  max-width: 1200px;
-  margin: 0 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   background: #fff;
-  min-height: calc(100vh - 80px);
+  box-sizing: border-box;
 }
 
 .settings-header {

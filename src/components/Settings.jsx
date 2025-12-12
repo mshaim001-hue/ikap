@@ -5,8 +5,8 @@ import './Settings.css'
 
 const Settings = () => {
   const [agentName, setAgentName] = useState('Information Agent')
-  const [role, setRole] = useState('')
-  const [functionality, setFunctionality] = useState('')
+  const [role, setRole] = useState('Информационный консультант')
+  const [functionality, setFunctionality] = useState('Отвечает на вопросы о платформе iKapitalist, помогает пользователям понять возможности платформы и подводит к подаче заявки')
   const [instructions, setInstructions] = useState('')
   const [model, setModel] = useState('gpt-5-mini')
   const [mcpConfig, setMcpConfig] = useState('')
@@ -31,10 +31,15 @@ const Settings = () => {
         const data = await response.json()
         if (data.ok && data.settings) {
           setInstructions(data.settings.instructions || '')
-          setRole(data.settings.role || '')
-          setFunctionality(data.settings.functionality || '')
+          // Используем значения из БД, если они есть, иначе дефолтные
+          setRole(data.settings.role || 'Информационный консультант')
+          setFunctionality(data.settings.functionality || 'Отвечает на вопросы о платформе iKapitalist, помогает пользователям понять возможности платформы и подводит к подаче заявки')
           setModel(data.settings.model || 'gpt-5-mini')
           setMcpConfig(data.settings.mcpConfig ? JSON.stringify(data.settings.mcpConfig, null, 2) : '')
+        } else {
+          // Если настройки не найдены, используем дефолтные значения
+          setRole('Информационный консультант')
+          setFunctionality('Отвечает на вопросы о платформе iKapitalist, помогает пользователям понять возможности платформы и подводит к подаче заявки')
         }
       } else {
         setMessage({ type: 'error', text: 'Не удалось загрузить настройки' })
@@ -50,17 +55,25 @@ const Settings = () => {
   const loadMcpServer = async () => {
     try {
       setMcpServerLoading(true)
-      const response = await fetch(getApiUrl(`/api/agent-settings/${agentName}/mcp-server`))
+      // URL encode для пробелов в названии агента
+      const encodedAgentName = encodeURIComponent(agentName)
+      const response = await fetch(getApiUrl(`/api/agent-settings/${encodedAgentName}/mcp-server`))
       if (response.ok) {
         const data = await response.json()
         if (data.ok && data.content) {
           setMcpServerContent(data.content)
+        } else {
+          console.warn('MCP сервер не найден или пуст:', data)
+          setMessage({ type: 'error', text: 'Не удалось загрузить MCP сервер' })
         }
       } else {
-        console.warn('Не удалось загрузить MCP сервер')
+        const errorData = await response.json().catch(() => ({}))
+        console.warn('Не удалось загрузить MCP сервер:', response.status, errorData)
+        setMessage({ type: 'error', text: errorData.message || 'Не удалось загрузить MCP сервер' })
       }
     } catch (error) {
       console.error('Ошибка загрузки MCP сервера:', error)
+      setMessage({ type: 'error', text: 'Ошибка загрузки MCP сервера: ' + error.message })
     } finally {
       setMcpServerLoading(false)
     }
@@ -122,7 +135,9 @@ const Settings = () => {
       setMcpServerSaving(true)
       setMessage({ type: '', text: '' })
 
-      const response = await fetch(getApiUrl(`/api/agent-settings/${agentName}/mcp-server`), {
+      // URL encode для пробелов в названии агента
+      const encodedAgentName = encodeURIComponent(agentName)
+      const response = await fetch(getApiUrl(`/api/agent-settings/${encodedAgentName}/mcp-server`), {
         method: 'PUT',
         headers: {
           'Content-Type': 'application/json'

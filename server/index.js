@@ -4018,7 +4018,8 @@ app.put('/api/agent-settings/:agentName', async (req, res) => {
 
 // API endpoints для работы с MCP сервером (файлом)
 app.get('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
-  const { agentName } = req.params
+  // Декодируем agentName из URL
+  const agentName = decodeURIComponent(req.params.agentName)
   console.log(`📄 Запрос MCP сервера для агента: ${agentName}`)
   
   try {
@@ -4056,7 +4057,8 @@ app.get('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
 })
 
 app.put('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
-  const { agentName } = req.params
+  // Декодируем agentName из URL
+  const agentName = decodeURIComponent(req.params.agentName)
   const { content } = req.body
   console.log(`💾 Сохранение MCP сервера для агента: ${agentName}`)
   
