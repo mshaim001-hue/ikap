@@ -546,12 +546,18 @@ async function initSchema() {
         id SERIAL PRIMARY KEY,
         agent_name TEXT UNIQUE NOT NULL,
         instructions TEXT NOT NULL,
+        role TEXT,
+        functionality TEXT,
         mcp_config JSONB,
         model TEXT DEFAULT 'gpt-5-mini',
         model_settings JSONB,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+      
+      -- Добавляем колонки role и functionality, если их еще нет
+      ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS role TEXT;
+      ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS functionality TEXT;
       
       -- Создаем индекс для быстрого поиска по agent_name
       CREATE INDEX IF NOT EXISTS idx_agent_settings_name ON agent_settings(agent_name);
@@ -1208,13 +1214,15 @@ const initDefaultAgentSettings = async () => {
 - Если пользователь отклоняет подачу заявки, уважай решение и предложи вернуться позже.`
 
     const insertSettings = db.prepare(`
-      INSERT INTO agent_settings (agent_name, instructions, model, model_settings)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO agent_settings (agent_name, instructions, role, functionality, model, model_settings)
+      VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT (agent_name) DO NOTHING
     `)
     await insertSettings.run(
       'Information Agent',
       defaultInstructions,
+      'Информационный консультант',
+      'Отвечает на вопросы о платформе iKapitalist, помогает пользователям понять возможности платформы и подводит к подаче заявки',
       'gpt-5-mini',
       JSON.stringify({ store: true })
     )
@@ -3934,6 +3942,8 @@ app.get('/api/agent-settings/:agentName', async (req, res) => {
       settings: {
         agentName,
         instructions: settings.instructions,
+        role: settings.role || 'Информационный консультант',
+        functionality: settings.functionality || 'Отвечает на вопросы о платформе iKapitalist',
         mcpConfig,
         model: settings.model,
         modelSettings
@@ -3950,7 +3960,7 @@ app.get('/api/agent-settings/:agentName', async (req, res) => {
 
 app.put('/api/agent-settings/:agentName', async (req, res) => {
   const { agentName } = req.params
-  const { instructions, mcpConfig, model, modelSettings } = req.body
+  const { instructions, role, functionality, mcpConfig, model, modelSettings } = req.body
   console.log(`💾 Обновление настроек агента: ${agentName}`)
   
   try {
@@ -3963,10 +3973,12 @@ app.put('/api/agent-settings/:agentName', async (req, res) => {
     }
     
     const updateSettings = db.prepare(`
-      INSERT INTO agent_settings (agent_name, instructions, mcp_config, model, model_settings, updated_at)
-      VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      INSERT INTO agent_settings (agent_name, instructions, role, functionality, mcp_config, model, model_settings, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT (agent_name) DO UPDATE SET
         instructions = EXCLUDED.instructions,
+        role = EXCLUDED.role,
+        functionality = EXCLUDED.functionality,
         mcp_config = EXCLUDED.mcp_config,
         model = EXCLUDED.model,
         model_settings = EXCLUDED.model_settings,
@@ -3976,6 +3988,8 @@ app.put('/api/agent-settings/:agentName', async (req, res) => {
     await updateSettings.run(
       agentName,
       instructions,
+      role || null,
+      functionality || null,
       mcpConfig ? JSON.stringify(mcpConfig) : null,
       model || 'gpt-5-mini',
       modelSettings ? JSON.stringify(modelSettings) : JSON.stringify({ store: true })
@@ -3998,6 +4012,98 @@ app.put('/api/agent-settings/:agentName', async (req, res) => {
     return res.status(500).json({
       ok: false,
       message: 'Ошибка сервера при обновлении настроек'
+    })
+  }
+})
+
+// API endpoints для работы с MCP сервером (файлом)
+app.get('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
+  const { agentName } = req.params
+  console.log(`📄 Запрос MCP сервера для агента: ${agentName}`)
+  
+  try {
+    // Пока поддерживаем только Information Agent
+    if (agentName !== 'Information Agent') {
+      return res.status(404).json({
+        ok: false,
+        message: 'MCP сервер доступен только для Information Agent'
+      })
+    }
+    
+    const mcpServerPath = path.join(__dirname, 'mcp', 'ikap-info-server.js')
+    
+    if (!fs.existsSync(mcpServerPath)) {
+      return res.status(404).json({
+        ok: false,
+        message: 'Файл MCP сервера не найден'
+      })
+    }
+    
+    const mcpServerContent = fs.readFileSync(mcpServerPath, 'utf8')
+    
+    return res.json({
+      ok: true,
+      content: mcpServerContent,
+      filename: 'ikap-info-server.js'
+    })
+  } catch (error) {
+    console.error('❌ Ошибка получения MCP сервера:', error)
+    return res.status(500).json({
+      ok: false,
+      message: 'Ошибка сервера при получении MCP сервера'
+    })
+  }
+})
+
+app.put('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
+  const { agentName } = req.params
+  const { content } = req.body
+  console.log(`💾 Сохранение MCP сервера для агента: ${agentName}`)
+  
+  try {
+    // Пока поддерживаем только Information Agent
+    if (agentName !== 'Information Agent') {
+      return res.status(404).json({
+        ok: false,
+        message: 'MCP сервер доступен только для Information Agent'
+      })
+    }
+    
+    if (!content || typeof content !== 'string') {
+      return res.status(400).json({
+        ok: false,
+        message: 'Поле content обязательно и должно быть строкой'
+      })
+    }
+    
+    const mcpServerPath = path.join(__dirname, 'mcp', 'ikap-info-server.js')
+    const mcpServerDir = path.dirname(mcpServerPath)
+    
+    // Создаем директорию, если её нет
+    if (!fs.existsSync(mcpServerDir)) {
+      fs.mkdirSync(mcpServerDir, { recursive: true })
+    }
+    
+    // Сохраняем файл
+    fs.writeFileSync(mcpServerPath, content, 'utf8')
+    
+    // Сбрасываем кэш агента, чтобы он пересоздался с новым MCP сервером
+    if (agentName === 'Information Agent') {
+      informationAgent = null
+      agentCacheTimestamp = 0
+      console.log('🔄 Кэш Information Agent сброшен, MCP сервер обновлен')
+    }
+    
+    console.log(`✅ MCP сервер для ${agentName} успешно сохранен`)
+    return res.json({
+      ok: true,
+      message: 'MCP сервер успешно сохранен'
+    })
+  } catch (error) {
+    console.error('❌ Ошибка сохранения MCP сервера:', error)
+    return res.status(500).json({
+      ok: false,
+      message: 'Ошибка сервера при сохранении MCP сервера'
     })
   }
 })
