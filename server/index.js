@@ -425,42 +425,89 @@ app.use(express.json({ limit: '10mb' }))
 
 // Инициализация MCP сервера со справочной информацией iKapitalist
 let ikapInfoMcpServer = null
-const ikapInfoServerPath = path.join(__dirname, 'mcp', 'ikap-info-server.js')
+let tempMcpServerPath = null
 
-if (fs.existsSync(ikapInfoServerPath)) {
+// Функция для создания MCP сервера из кода в БД
+const initMcpServerFromDb = async () => {
   try {
+    const settings = await getAgentSettings('Information Agent')
+    let mcpServerCode = settings?.mcp_server_code
+    
+    // Если кода нет в БД, пробуем загрузить из файла (для обратной совместимости)
+    if (!mcpServerCode) {
+      const fallbackPath = path.join(__dirname, 'mcp', 'ikap-info-server.js')
+      if (fs.existsSync(fallbackPath)) {
+        console.log('📄 Загружаем MCP сервер из файла (код в БД отсутствует)')
+        mcpServerCode = fs.readFileSync(fallbackPath, 'utf8')
+        // Сохраняем в БД для будущего использования
+        try {
+          const updateMcpCode = db.prepare(`
+            UPDATE agent_settings 
+            SET mcp_server_code = ? 
+            WHERE agent_name = 'Information Agent'
+          `)
+          await updateMcpCode.run(mcpServerCode)
+          console.log('✅ Код MCP сервера сохранен в БД из файла')
+        } catch (e) {
+          console.warn('⚠️ Не удалось сохранить код MCP сервера в БД:', e.message)
+        }
+      }
+    }
+    
+    if (!mcpServerCode) {
+      console.warn('⚠️ Код MCP сервера не найден ни в БД, ни в файле')
+      return null
+    }
+    
+    // Создаем временный файл из кода в БД
+    const tempDir = path.join(__dirname, 'mcp', 'temp')
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true })
+    }
+    tempMcpServerPath = path.join(tempDir, 'ikap-info-server.js')
+    fs.writeFileSync(tempMcpServerPath, mcpServerCode, 'utf8')
+    console.log(`✅ Временный файл MCP сервера создан: ${tempMcpServerPath}`)
+    
+    // Создаем MCP сервер из временного файла
     ikapInfoMcpServer = new MCPServerStdio({
       command: process.execPath,
-      args: [ikapInfoServerPath],
-      cwd: path.join(__dirname, 'mcp'),
+      args: [tempMcpServerPath],
+      cwd: path.dirname(tempMcpServerPath),
       env: {
         ...process.env
       },
       cacheToolsList: true
     })
 
-    ikapInfoMcpServer
-      .connect()
-      .then(() => {
-        console.log('✅ MCP сервер информации iKapitalist запущен')
-      })
-      .catch((error) => {
-        console.error('❌ Не удалось подключить MCP сервер информации iKapitalist:', error)
-        ikapInfoMcpServer = null
-      })
+    await ikapInfoMcpServer.connect()
+    console.log('✅ MCP сервер информации iKapitalist запущен из БД')
+    return ikapInfoMcpServer
   } catch (error) {
-    console.error('❌ Ошибка инициализации MCP сервера информации iKapitalist:', error)
+    console.error('❌ Ошибка инициализации MCP сервера из БД:', error)
     ikapInfoMcpServer = null
+    return null
   }
-} else {
-  console.warn(`⚠️ MCP сервер информации отсутствует по пути ${ikapInfoServerPath}`)
 }
+
+// Инициализируем MCP сервер асинхронно после инициализации БД
+setImmediate(async () => {
+  await initMcpServerFromDb()
+})
 
 process.on('exit', () => {
   if (ikapInfoMcpServer?.close) {
     ikapInfoMcpServer.close().catch((error) => {
       console.error('⚠️ Ошибка закрытия MCP сервера информации:', error)
     })
+  }
+  // Удаляем временный файл при выходе
+  if (tempMcpServerPath && fs.existsSync(tempMcpServerPath)) {
+    try {
+      fs.unlinkSync(tempMcpServerPath)
+      console.log('🗑️ Временный файл MCP сервера удален')
+    } catch (e) {
+      console.warn('⚠️ Не удалось удалить временный файл:', e.message)
+    }
   }
 })
 
@@ -558,6 +605,8 @@ async function initSchema() {
       -- Добавляем колонки role и functionality, если их еще нет
       ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS role TEXT;
       ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS functionality TEXT;
+      -- Добавляем колонку для хранения кода MCP сервера
+      ALTER TABLE agent_settings ADD COLUMN IF NOT EXISTS mcp_server_code TEXT;
       
       -- Создаем индекс для быстрого поиска по agent_name
       CREATE INDEX IF NOT EXISTS idx_agent_settings_name ON agent_settings(agent_name);
@@ -1178,7 +1227,7 @@ const investmentAgent = new Agent({
 const getAgentSettings = async (agentName) => {
   try {
     const getSettings = db.prepare(`
-      SELECT instructions, mcp_config, model, model_settings
+      SELECT instructions, mcp_config, model, model_settings, mcp_server_code
       FROM agent_settings 
       WHERE agent_name = ?
     `)
@@ -3945,6 +3994,7 @@ app.get('/api/agent-settings/:agentName', async (req, res) => {
         role: settings.role || 'Информационный консультант',
         functionality: settings.functionality || 'Отвечает на вопросы о платформе iKapitalist',
         mcpConfig,
+        mcpServerCode: settings.mcp_server_code || null,
         model: settings.model,
         modelSettings
       }
@@ -4016,7 +4066,7 @@ app.put('/api/agent-settings/:agentName', async (req, res) => {
   }
 })
 
-// API endpoints для работы с MCP сервером (файлом)
+// API endpoints для работы с MCP сервером (код из БД)
 // Поддерживаем как полное название, так и slug (information-agent)
 app.get('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
   try {
@@ -4027,7 +4077,6 @@ app.get('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
     try {
       agentName = decodeURIComponent(agentName)
     } catch (e) {
-      // Если декодирование не удалось, используем как есть
       console.warn('⚠️ Не удалось декодировать agentName, используем как есть:', agentName)
     }
     
@@ -4036,30 +4085,25 @@ app.get('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
       agentName = 'Information Agent'
     }
     
-    console.log(`📄 Запрос MCP сервера для агента: "${agentName}" (raw: "${req.params.agentName}")`)
+    console.log(`📄 Запрос кода MCP сервера для агента: "${agentName}"`)
     
     // Пока поддерживаем только Information Agent
     if (agentName !== 'Information Agent') {
-      console.warn(`⚠️ Неподдерживаемый агент: "${agentName}"`)
       return res.status(404).json({
         ok: false,
         message: 'MCP сервер доступен только для Information Agent'
       })
     }
     
-    const mcpServerPath = path.join(__dirname, 'mcp', 'ikap-info-server.js')
-    console.log(`📂 Путь к MCP серверу: ${mcpServerPath}`)
-    console.log(`📂 __dirname: ${__dirname}`)
-    console.log(`📂 Файл существует: ${fs.existsSync(mcpServerPath)}`)
+    // Получаем код из БД
+    const settings = await getAgentSettings(agentName)
     
-    if (!fs.existsSync(mcpServerPath)) {
-      console.error(`❌ Файл MCP сервера не найден по пути: ${mcpServerPath}`)
-      // Пробуем альтернативный путь
-      const altPath = path.join(process.cwd(), 'server', 'mcp', 'ikap-info-server.js')
-      console.log(`📂 Пробуем альтернативный путь: ${altPath}`)
-      if (fs.existsSync(altPath)) {
-        console.log(`✅ Файл найден по альтернативному пути`)
-        const mcpServerContent = fs.readFileSync(altPath, 'utf8')
+    if (!settings || !settings.mcp_server_code) {
+      // Если кода нет в БД, пробуем загрузить из файла (для обратной совместимости)
+      const fallbackPath = path.join(__dirname, 'mcp', 'ikap-info-server.js')
+      if (fs.existsSync(fallbackPath)) {
+        console.log('📄 Загружаем MCP сервер из файла (код в БД отсутствует)')
+        const mcpServerContent = fs.readFileSync(fallbackPath, 'utf8')
         return res.json({
           ok: true,
           content: mcpServerContent,
@@ -4068,21 +4112,19 @@ app.get('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
       }
       return res.status(404).json({
         ok: false,
-        message: `Файл MCP сервера не найден. Проверенные пути: ${mcpServerPath}, ${altPath}`
+        message: 'Код MCP сервера не найден в БД'
       })
     }
     
-    const mcpServerContent = fs.readFileSync(mcpServerPath, 'utf8')
-    console.log(`✅ MCP сервер загружен, размер: ${mcpServerContent.length} символов`)
+    console.log(`✅ Код MCP сервера загружен из БД, размер: ${settings.mcp_server_code.length} символов`)
     
     return res.json({
       ok: true,
-      content: mcpServerContent,
+      content: settings.mcp_server_code,
       filename: 'ikap-info-server.js'
     })
   } catch (error) {
     console.error('❌ Ошибка получения MCP сервера:', error)
-    console.error('Stack:', error.stack)
     return res.status(500).json({
       ok: false,
       message: `Ошибка сервера при получении MCP сервера: ${error.message}`
@@ -4099,7 +4141,6 @@ app.put('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
     try {
       agentName = decodeURIComponent(agentName)
     } catch (e) {
-      // Если декодирование не удалось, используем как есть
       console.warn('⚠️ Не удалось декодировать agentName, используем как есть:', agentName)
     }
     
@@ -4109,7 +4150,7 @@ app.put('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
     }
     
     const { content } = req.body
-    console.log(`💾 Сохранение MCP сервера для агента: "${agentName}" (raw: "${req.params.agentName}")`)
+    console.log(`💾 Сохранение кода MCP сервера для агента: "${agentName}"`)
     
     // Пока поддерживаем только Information Agent
     if (agentName !== 'Information Agent') {
@@ -4126,34 +4167,41 @@ app.put('/api/agent-settings/:agentName/mcp-server', async (req, res) => {
       })
     }
     
-    const mcpServerPath = path.join(__dirname, 'mcp', 'ikap-info-server.js')
-    const mcpServerDir = path.dirname(mcpServerPath)
+    // Сохраняем код в БД
+    const updateMcpCode = db.prepare(`
+      UPDATE agent_settings 
+      SET mcp_server_code = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE agent_name = ?
+    `)
+    await updateMcpCode.run(content, agentName)
+    console.log(`✅ Код MCP сервера сохранен в БД, размер: ${content.length} символов`)
     
-    // Создаем директорию, если её нет
-    if (!fs.existsSync(mcpServerDir)) {
-      console.log(`📁 Создаем директорию: ${mcpServerDir}`)
-      fs.mkdirSync(mcpServerDir, { recursive: true })
+    // Перезапускаем MCP сервер с новым кодом
+    try {
+      if (ikapInfoMcpServer?.close) {
+        await ikapInfoMcpServer.close()
+      }
+      // Удаляем старый временный файл
+      if (tempMcpServerPath && fs.existsSync(tempMcpServerPath)) {
+        fs.unlinkSync(tempMcpServerPath)
+      }
+      // Инициализируем заново
+      await initMcpServerFromDb()
+    } catch (e) {
+      console.warn('⚠️ Не удалось перезапустить MCP сервер, будет перезапущен при следующем использовании:', e.message)
     }
-    
-    // Сохраняем файл
-    fs.writeFileSync(mcpServerPath, content, 'utf8')
-    console.log(`✅ Файл сохранен: ${mcpServerPath}`)
     
     // Сбрасываем кэш агента, чтобы он пересоздался с новым MCP сервером
-    if (agentName === 'Information Agent') {
-      informationAgent = null
-      agentCacheTimestamp = 0
-      console.log('🔄 Кэш Information Agent сброшен, MCP сервер обновлен')
-    }
+    informationAgent = null
+    agentCacheTimestamp = 0
+    console.log('🔄 Кэш Information Agent сброшен, MCP сервер обновлен')
     
-    console.log(`✅ MCP сервер для ${agentName} успешно сохранен`)
     return res.json({
       ok: true,
-      message: 'MCP сервер успешно сохранен'
+      message: 'Код MCP сервера успешно сохранен в БД'
     })
   } catch (error) {
     console.error('❌ Ошибка сохранения MCP сервера:', error)
-    console.error('Stack:', error.stack)
     return res.status(500).json({
       ok: false,
       message: `Ошибка сервера при сохранении MCP сервера: ${error.message}`

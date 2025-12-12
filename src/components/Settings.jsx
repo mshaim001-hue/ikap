@@ -36,6 +36,10 @@ const Settings = () => {
           setFunctionality(data.settings.functionality || 'Отвечает на вопросы о платформе iKapitalist, помогает пользователям понять возможности платформы и подводит к подаче заявки')
           setModel(data.settings.model || 'gpt-5-mini')
           setMcpConfig(data.settings.mcpConfig ? JSON.stringify(data.settings.mcpConfig, null, 2) : '')
+          // Загружаем код MCP сервера из настроек, если он есть
+          if (data.settings.mcpServerCode) {
+            setMcpServerContent(data.settings.mcpServerCode)
+          }
         } else {
           // Если настройки не найдены, используем дефолтные значения
           setRole('Информационный консультант')
