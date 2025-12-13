@@ -11,6 +11,7 @@ const Settings = () => {
   const [model, setModel] = useState('gpt-5-mini')
   const [mcpConfig, setMcpConfig] = useState('')
   const [mcpServerContent, setMcpServerContent] = useState('')
+  const [defaultAnnualRate, setDefaultAnnualRate] = useState(0.3)
   const [mcpServerLoading, setMcpServerLoading] = useState(false)
   const [mcpServerSaving, setMcpServerSaving] = useState(false)
   const [activeTab, setActiveTab] = useState('general') // 'general' или 'mcp'
@@ -121,7 +122,8 @@ const Settings = () => {
           functionality,
           mcpConfig: parsedMcpConfig,
           model,
-          modelSettings: { store: true }
+          modelSettings: { store: true },
+          defaultAnnualRate: defaultAnnualRate
         })
       })
 
@@ -371,6 +373,29 @@ const Settings = () => {
             </select>
             <div className="settings-hint">
               Модель OpenAI, используемая агентом
+            </div>
+          </div>
+
+          <div className="settings-section">
+            <label htmlFor="defaultAnnualRate">Годовая ставка по умолчанию (%)</label>
+            <input
+              id="defaultAnnualRate"
+              type="number"
+              min="0"
+              max="100"
+              step="0.1"
+              value={(defaultAnnualRate * 100).toFixed(1)}
+              onChange={(e) => {
+                const value = parseFloat(e.target.value)
+                if (!isNaN(value) && value >= 0 && value <= 100) {
+                  setDefaultAnnualRate(value / 100)
+                }
+              }}
+              className="settings-input"
+              placeholder="30.0"
+            />
+            <div className="settings-hint">
+              Годовая процентная ставка по умолчанию для расчета займов (например, 30.0 для 30%). Используется, если пользователь не указал ставку при расчете.
             </div>
           </div>
 

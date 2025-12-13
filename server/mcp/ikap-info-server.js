@@ -9,7 +9,10 @@ const server = new McpServer({
   version: '1.1.0'
 })
 
-const DEFAULT_ANNUAL_RATE = 0.3
+// Годовая ставка по умолчанию - берется из переменной окружения или 0.3 (30%)
+const DEFAULT_ANNUAL_RATE = process.env.DEFAULT_ANNUAL_RATE 
+  ? parseFloat(process.env.DEFAULT_ANNUAL_RATE) 
+  : 0.3
 
 /** @type {Record<string, string>} */
 const sections = {

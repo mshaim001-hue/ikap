@@ -281,7 +281,24 @@ const AgentsChat = ({ onProgressChange }) => {
     
     // Обработка состояний диалога
     if (dialogState === 'greeting') {
-      setUserName(messageText)
+      // Извлекаем имя из ответа, убирая приветствия
+      const extractName = (text) => {
+        // Убираем приветствия (привет, здравствуй, hi, hello и т.п.)
+        const cleaned = text
+          .replace(/^(привет|здравствуй|здравствуйте|hi|hello)[,\s]*/i, '')
+          .replace(/^[,\s]*/, '')
+          .trim()
+        
+        // Берем первое слово или первые два слова (имя и фамилия)
+        const parts = cleaned.split(/[\s,]+/)
+        if (parts.length > 1) {
+          return parts.slice(0, 2).join(' ')
+        }
+        return parts[0] || text
+      }
+      
+      const extractedName = extractName(messageText)
+      setUserName(extractedName)
       setDialogState('name_collected')
       setCurrentAgent('investment')
       
@@ -290,7 +307,7 @@ const AgentsChat = ({ onProgressChange }) => {
       
       setTimeout(() => {
         const botMessage = createBotMessage(
-          `Здравствуйте, ${messageText}! Наша платформа помогает бизнесу привлекать финансирование от 10 млн до 1 млрд ₸ от 2,5% в месяц. Срок займа — 4–36 месяцев. Быстрое одобрение, прозрачные условия, инвесторы, готовые поддержать ваш проект. Примите условия платформы, чтобы продолжить.`,
+          `Здравствуйте, ${extractedName}! Наша платформа помогает бизнесу привлекать финансирование от 10 млн до 1 млрд ₸ от 2,5% в месяц. Срок займа — 4–36 месяцев. Быстрое одобрение, прозрачные условия, инвесторы, готовые поддержать ваш проект. Примите условия платформы, чтобы продолжить.`,
           { showTermsButton: true }
         )
         
@@ -383,8 +400,7 @@ const AgentsChat = ({ onProgressChange }) => {
         return
       }
 
-      const presetText = 'Пожалуйста, расскажите подробнее о платформе iKapitalist.'
-      const userMessage = createUserMessage(presetText)
+      const userMessage = createUserMessage('Узнать подробнее о платформе')
       setMessages(prev => [...prev, userMessage])
 
       setCurrentAgent('information')
@@ -403,7 +419,8 @@ const AgentsChat = ({ onProgressChange }) => {
         setApplyPromptShown(true)
       }
 
-      await sendToAgent(presetText, [], { agent: 'information' })
+      // Отправляем нейтральное сообщение, которое не будет воспринято как новое начало диалога
+      await sendToAgent('Что вы хотите узнать о платформе?', [], { agent: 'information' })
       return
     }
 
