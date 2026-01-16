@@ -61,7 +61,9 @@ const AgentsChat = ({ onProgressChange }) => {
   }
 
   // Обработка клика на вариант режима налогообложения
-  const handleTaxRegimeClick = async (regimeText) => {
+  const handleTaxRegimeClick = async (e, regimeText) => {
+    e.preventDefault()
+    e.stopPropagation()
     if (isLoading) return
     
     // Создаем сообщение пользователя с выбранным режимом
@@ -74,7 +76,7 @@ const AgentsChat = ({ onProgressChange }) => {
 
   // Форматирование текста сообщения с кликабельными ссылками для режимов налогообложения
   const formatMessageWithClickableTaxRegimes = (text) => {
-    if (!text || typeof text !== 'string') return text
+    if (!text || typeof text !== 'string') return formatNumbersForDisplay(text)
     
     // Проверяем, содержит ли сообщение вопрос про налогообложение
     const isTaxRegimeQuestion = text.includes('Выберите какое налогообложение использует ваша компания')
@@ -84,7 +86,7 @@ const AgentsChat = ({ onProgressChange }) => {
       return formatNumbersForDisplay(text)
     }
     
-    // Варианты режимов налогообложения
+    // Варианты режимов налогообложения - точные совпадения
     const taxRegimes = [
       'Общеустановленный режим (ФНО 100.00 + 300.00)',
       'Упрощенная декларация (ФНО 910.00)',
@@ -96,17 +98,22 @@ const AgentsChat = ({ onProgressChange }) => {
     const lines = text.split('\n')
     
     return lines.map((line, lineIndex) => {
-      const trimmedLine = line.trim()
+      // Нормализуем пробелы (заменяем множественные пробелы на одинарные)
+      const trimmedLine = line.trim().replace(/\s+/g, ' ')
       
-      // Проверяем, является ли строка одним из вариантов режима налогообложения
-      const matchingRegime = taxRegimes.find(regime => trimmedLine === regime || trimmedLine.includes(regime))
+      // Проверяем точное совпадение с вариантами режима налогообложения
+      const matchingRegime = taxRegimes.find(regime => {
+        const normalizedRegime = regime.replace(/\s+/g, ' ')
+        return trimmedLine === normalizedRegime
+      })
       
-      if (matchingRegime && trimmedLine) {
-        // Это кликабельный вариант
+      if (matchingRegime) {
+        // Это кликабельный вариант - точное совпадение
         return (
           <React.Fragment key={lineIndex}>
             <span
-              onClick={() => handleTaxRegimeClick(matchingRegime)}
+              onClick={(e) => handleTaxRegimeClick(e, matchingRegime)}
+              onMouseDown={(e) => e.preventDefault()}
               className="tax-regime-clickable"
             >
               {trimmedLine}
@@ -115,7 +122,7 @@ const AgentsChat = ({ onProgressChange }) => {
           </React.Fragment>
         )
       } else {
-        // Обычный текст
+        // Обычный текст (включая вопрос и пустые строки)
         return (
           <React.Fragment key={lineIndex}>
             {formatNumbersForDisplay(line)}

@@ -599,16 +599,18 @@
 
 /* Стили для кликабельных вариантов режима налогообложения */
 .tax-regime-clickable {
-  color: #667eea;
+  color: #667eea !important;
   cursor: pointer;
   font-weight: 500;
   transition: all 0.2s ease;
   text-decoration: underline;
   text-decoration-color: rgba(102, 126, 234, 0.3);
+  display: inline-block;
+  user-select: none;
 }
 
 .tax-regime-clickable:hover {
-  color: #764ba2;
+  color: #764ba2 !important;
   text-decoration-color: #764ba2;
   background-color: rgba(102, 126, 234, 0.05);
   padding: 2px 4px;
@@ -617,6 +619,16 @@
 }
 
 .tax-regime-clickable:active {
-  color: #5a67d8;
+  color: #5a67d8 !important;
   transform: scale(0.98);
+}
+
+/* Убеждаемся, что обычный текст в .message-text остается черным */
+.message-text {
+  color: #2d3748 !important;
+}
+
+/* Кликабельные элементы должны переопределять цвет родителя */
+.message-text .tax-regime-clickable {
+  color: #667eea !important;
 }
