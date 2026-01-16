@@ -173,17 +173,6 @@ const AgentsChat = ({ onProgressChange }) => {
       }
       
       const botMessage = createBotMessage(result.message)
-      
-      // Если нужно показать кнопки выбора режима налогообложения
-      if (result.showTaxRegimeButtons) {
-        botMessage.taxRegimeButtons = [
-          { label: 'Общеустановленный режим (ФНО 100.00 + 300.00)', value: 'general' },
-          { label: 'Упрощенная декларация (ФНО 910.00)', value: 'simplified' },
-          { label: 'Сельхозпроизводитель (ФНО 920.00)', value: 'agricultural' },
-          { label: 'Другое', value: 'other' }
-        ]
-      }
-      
       setMessages(prev => [...prev, botMessage])
 
       // Обновляем прогресс по факту файлов из ответа сервера (если пришел)
@@ -390,43 +379,6 @@ const AgentsChat = ({ onProgressChange }) => {
     setMessages(prev => [...prev, botMessage])
   }
 
-  const handleTaxRegimeSelection = async (regime) => {
-    if (isLoading) return
-
-    // Убираем кнопки из сообщения
-    setMessages(prev => prev.map(msg => {
-      if (!msg.taxRegimeButtons) return msg
-      const { taxRegimeButtons, ...rest } = msg
-      return rest
-    }))
-
-    // Определяем текст ответа в зависимости от выбранного режима
-    let regimeText = ''
-    switch (regime) {
-      case 'general':
-        regimeText = 'Общеустановленный режим (ФНО 100.00 + 300.00)'
-        break
-      case 'simplified':
-        regimeText = 'Упрощенная декларация (ФНО 910.00)'
-        break
-      case 'agricultural':
-        regimeText = 'Сельхозпроизводитель (ФНО 920.00)'
-        break
-      case 'other':
-        regimeText = 'Другое'
-        break
-      default:
-        regimeText = 'Другое'
-    }
-
-    // Создаем сообщение пользователя с выбранным режимом
-    const userMessage = createUserMessage(regimeText)
-    setMessages(prev => [...prev, userMessage])
-
-    // Отправляем выбор агенту
-    await sendToAgent(regimeText, [], { agent: 'investment' })
-  }
-
   const handleChoiceSelection = async (choice) => {
     if (isLoading) return
 
@@ -585,28 +537,6 @@ const AgentsChat = ({ onProgressChange }) => {
                       {button.label}
                     </button>
                   ))}
-                </div>
-              )}
-              {message.taxRegimeButtons && (
-                <div className="message-actions">
-                  <div style={{ marginBottom: '12px', fontSize: '14px', color: '#666' }}>
-                    Какое налогообложение использует ваша компания?
-                  </div>
-                  <div className="tax-regime-options">
-                    {message.taxRegimeButtons.map((button, index) => (
-                      <React.Fragment key={button.value}>
-                        <span
-                          onClick={() => handleTaxRegimeSelection(button.value)}
-                          className="tax-regime-option"
-                        >
-                          {button.label}
-                        </span>
-                        {index < message.taxRegimeButtons.length - 1 && (
-                          <span className="tax-regime-separator"> | </span>
-                        )}
-                      </React.Fragment>
-                    ))}
-                  </div>
                 </div>
               )}
               <div className="message-time">
