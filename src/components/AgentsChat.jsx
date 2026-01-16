@@ -60,6 +60,72 @@ const AgentsChat = ({ onProgressChange }) => {
     return text.replace(/\b\d{4,}\b/g, (num) => num.replace(/\B(?=(\d{3})+(?!\d))/g, ' '))
   }
 
+  // Обработка клика на вариант режима налогообложения
+  const handleTaxRegimeClick = async (regimeText) => {
+    if (isLoading) return
+    
+    // Создаем сообщение пользователя с выбранным режимом
+    const userMessage = createUserMessage(regimeText)
+    setMessages(prev => [...prev, userMessage])
+    
+    // Отправляем выбор агенту
+    await sendToAgent(regimeText, [], { agent: 'investment' })
+  }
+
+  // Форматирование текста сообщения с кликабельными ссылками для режимов налогообложения
+  const formatMessageWithClickableTaxRegimes = (text) => {
+    if (!text || typeof text !== 'string') return text
+    
+    // Проверяем, содержит ли сообщение вопрос про налогообложение
+    const isTaxRegimeQuestion = text.includes('Выберите какое налогообложение использует ваша компания')
+    
+    if (!isTaxRegimeQuestion) {
+      // Если это не вопрос про налогообложение, просто форматируем числа
+      return formatNumbersForDisplay(text)
+    }
+    
+    // Варианты режимов налогообложения
+    const taxRegimes = [
+      'Общеустановленный режим (ФНО 100.00 + 300.00)',
+      'Упрощенная декларация (ФНО 910.00)',
+      'Сельхозпроизводитель (ФНО 920.00)',
+      'Другое'
+    ]
+    
+    // Разбиваем текст на строки
+    const lines = text.split('\n')
+    
+    return lines.map((line, lineIndex) => {
+      const trimmedLine = line.trim()
+      
+      // Проверяем, является ли строка одним из вариантов режима налогообложения
+      const matchingRegime = taxRegimes.find(regime => trimmedLine === regime || trimmedLine.includes(regime))
+      
+      if (matchingRegime && trimmedLine) {
+        // Это кликабельный вариант
+        return (
+          <React.Fragment key={lineIndex}>
+            <span
+              onClick={() => handleTaxRegimeClick(matchingRegime)}
+              className="tax-regime-clickable"
+            >
+              {trimmedLine}
+            </span>
+            {lineIndex < lines.length - 1 && <br />}
+          </React.Fragment>
+        )
+      } else {
+        // Обычный текст
+        return (
+          <React.Fragment key={lineIndex}>
+            {formatNumbersForDisplay(line)}
+            {lineIndex < lines.length - 1 && <br />}
+          </React.Fragment>
+        )
+      }
+    })
+  }
+
   // Форматирование чисел для поля ввода (убираем пробелы перед отправкой)
   const formatInputNumbers = (text) => {
     if (!text || typeof text !== 'string') return text
@@ -515,7 +581,9 @@ const AgentsChat = ({ onProgressChange }) => {
               {message.sender === 'bot' ? <AIIcon size={22} /> : <User size={20} />}
             </div>
             <div className="message-content">
-              <div className="message-text">{formatNumbersForDisplay(message.text)}</div>
+              <div className="message-text" style={{ whiteSpace: 'pre-line' }}>
+                {formatMessageWithClickableTaxRegimes(message.text)}
+              </div>
               {message.showTermsButton && (
                 <div className="message-actions">
                   <button 

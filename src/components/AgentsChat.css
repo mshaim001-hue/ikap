@@ -596,3 +596,27 @@
   margin-left: 24px;
   margin-bottom: 14px;
 }
+
+/* Стили для кликабельных вариантов режима налогообложения */
+.tax-regime-clickable {
+  color: #667eea;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.2s ease;
+  text-decoration: underline;
+  text-decoration-color: rgba(102, 126, 234, 0.3);
+}
+
+.tax-regime-clickable:hover {
+  color: #764ba2;
+  text-decoration-color: #764ba2;
+  background-color: rgba(102, 126, 234, 0.05);
+  padding: 2px 4px;
+  border-radius: 4px;
+  margin: -2px -4px;
+}
+
+.tax-regime-clickable:active {
+  color: #5a67d8;
+  transform: scale(0.98);
+}
