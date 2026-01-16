@@ -1321,6 +1321,7 @@ const investmentAgent = new Agent({
 6. После получения выписки - спроси есть ли еще выписки с этого или другихбанков за тот же период (повторяй до получения явного "нет")
 7. ТОЛЬКО ПОСЛЕ ответа пользователя "нет" по другим банкам:
    7.1. Попроси загрузить НАЛОГОВУЮ отчетность за текущий и предыдущий год в формате PDF. Четко укажи: формат PDF.
+   ПРИМЕЧАНИЕ: Режим налогообложения будет запрошен через специальный интерфейс, а не в чате. Если пользователь указывает режим налогообложения в сообщении (например, "Общеустановленный режим", "ФНО 100.00", "ФНО 910.00", "ФНО 920.00" и т.д.), просто подтверди получение этой информации и продолжай с запросом налоговой отчетности.
    7.1.1. После получения налоговой отчетности спроси: "Есть ли у вас еще файлы налоговой отчетности для загрузки? Если да, прикрепите их. Если нет, напишите 'нет'."
    7.1.2. Повторяй вопрос 7.1.1 до получения явного "нет"
    7.2. ТОЛЬКО ПОСЛЕ получения "нет" про налоговую отчетность — Попроси загрузить ФИНАНСОВУЮ отчетность (баланс, ОПУ) за текущий и предыдущий год в формате PDF.
@@ -1356,7 +1357,8 @@ const investmentAgent = new Agent({
 - Спроси: "Есть ли у вас еще счета в других банках? Если да, прикрепите выписки за 12 месяцев. Если нет, напишите 'нет'."
 
 ТОЛЬКО ПОСЛЕ "нет" про другие банки:
-- Сначала попроси: "Пожалуйста, предоставьте налоговую отчетность за текущий и предыдущий год в формате PDF"
+- Немедленно попроси: "Пожалуйста, предоставьте налоговую отчетность за текущий и предыдущий год в формате PDF"
+- ПРИМЕЧАНИЕ: Режим налогообложения запрашивается через специальный интерфейс (кнопки). Если пользователь указывает режим налогообложения в текстовом сообщении, просто подтверди и продолжай с запросом налоговой отчетности.
 
 НАЛОГОВАЯ ОТЧЕТНОСТЬ:
 Когда пользователь прикрепляет налоговую отчетность:
@@ -1877,6 +1879,58 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
       
       console.log(`💬 Ответ агента: "${agentMessage}"`)
       
+      // Детектируем момент для показа кнопок выбора режима налогообложения
+      // Проверяем, ответил ли пользователь "нет" на вопрос про дополнительные выписки
+      let showTaxRegimeButtons = false
+      if (agentName === 'investment') {
+        const normalizedText = String(text || '').toLowerCase().trim()
+        
+        // Проверяем, был ли вопрос про дополнительные выписки в последних сообщениях агента
+        const recentAgentMessages = history
+          .filter(msg => msg.role === 'assistant')
+          .slice(-5)
+          .map(msg => {
+            if (typeof msg.content === 'string') return msg.content
+            if (Array.isArray(msg.content)) {
+              return msg.content.map(c => c.text || c.input_text || c.output_text || '').join(' ')
+            }
+            return ''
+          })
+          .join(' ')
+          .toLowerCase()
+        
+        // Проверяем, если пользователь ответил "нет" и агент спрашивал про дополнительные выписки или другие банки
+        const hasNoAnswer = /^(нет|no|не\s*[а-яё]*)$/i.test(normalizedText) || 
+          normalizedText === 'нет больше' || 
+          normalizedText === 'нет, больше нет' ||
+          normalizedText.includes('нет больше')
+        
+        const hasAskedForMoreStatements = (recentAgentMessages.includes('еще') || 
+          recentAgentMessages.includes('других банк')) && 
+          (recentAgentMessages.includes('выписк') || recentAgentMessages.includes('счет'))
+        
+        // Проверяем, не запрашивали ли уже режим налогообложения (в истории сообщений пользователя или агента)
+        const allHistoryText = history.map(msg => {
+          const content = typeof msg.content === 'string' 
+            ? msg.content 
+            : (Array.isArray(msg.content) ? msg.content.map(c => c.text || c.input_text || '').join(' ') : '')
+          return content.toLowerCase()
+        }).join(' ')
+        
+        const hasAskedTaxRegime = allHistoryText.includes('режим налогообложения') || 
+          allHistoryText.includes('фно 100.00') || 
+          allHistoryText.includes('фно 910.00') ||
+          allHistoryText.includes('фно 920.00') ||
+          allHistoryText.includes('общеустановленный режим') ||
+          allHistoryText.includes('упрощенная декларация') ||
+          allHistoryText.includes('сельхозпроизводитель')
+        
+        if (hasNoAnswer && hasAskedForMoreStatements && !hasAskedTaxRegime) {
+          showTaxRegimeButtons = true
+          console.log('📋 Определен момент для показа кнопок выбора режима налогообложения')
+        }
+      }
+      
       // Сохраняем ответ агента в историю
       const newItems = inv.newItems.map(item => item.rawItem)
       history.push(...newItems)
@@ -2193,6 +2247,119 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
               const nameMatch = contactText.match(/([А-Яа-яЁё]+\s+[А-Яа-яЁё]+)/i)
               if (nameMatch) name = nameMatch[1]
             }
+            
+            // Если используется ikap2, используем его для анализа выписок
+            if (USE_IKAP2_FOR_ANALYSIS && statementFiles.length > 0) {
+              console.log(`🔄 Используем ikap2 для анализа ${statementFiles.length} банковских выписок`)
+              
+              try {
+                // Получаем файлы из sessionFiles (в памяти) или из БД
+                const filesForIkap2 = []
+                const sessionFilesData = sessionFiles.get(session) || []
+                
+                for (const file of statementFiles) {
+                  let fileBuffer = null
+                  
+                  // Сначала пытаемся получить из sessionFiles (в памяти)
+                  const sessionFile = sessionFilesData.find(f => f.fileId === file.fileId)
+                  if (sessionFile && sessionFile.buffer) {
+                    fileBuffer = sessionFile.buffer
+                  } else {
+                    // Если нет в памяти, пытаемся получить из БД
+                    try {
+                      const getFile = db.prepare(`
+                        SELECT file_data FROM files WHERE file_id = ?
+                      `)
+                      const fileInfo = await getFile.get(file.fileId)
+                      if (fileInfo && fileInfo.file_data) {
+                        // PostgreSQL BYTEA возвращается как Buffer или строка
+                        if (Buffer.isBuffer(fileInfo.file_data)) {
+                          fileBuffer = fileInfo.file_data
+                        } else if (typeof fileInfo.file_data === 'string') {
+                          // Если это hex строка (начинается с \x)
+                          if (fileInfo.file_data.startsWith('\\x')) {
+                            fileBuffer = Buffer.from(fileInfo.file_data.slice(2), 'hex')
+                          } else {
+                            fileBuffer = Buffer.from(fileInfo.file_data, 'binary')
+                          }
+                        } else {
+                          fileBuffer = Buffer.from(fileInfo.file_data)
+                        }
+                      } else if (!file.fileId.startsWith('local-')) {
+                        // Если fileId не локальный, пытаемся получить из OpenAI Files API
+                        try {
+                          const fileContent = await openaiClient.files.retrieveContent(file.fileId)
+                          fileBuffer = Buffer.from(fileContent)
+                        } catch (openaiError) {
+                          console.warn(`⚠️ Не удалось получить файл ${file.fileId} из OpenAI:`, openaiError.message)
+                        }
+                      }
+                    } catch (dbError) {
+                      console.warn(`⚠️ Не удалось получить файл ${file.fileId} из БД:`, dbError.message)
+                      // Пытаемся получить из OpenAI, если fileId не локальный
+                      if (!file.fileId.startsWith('local-')) {
+                        try {
+                          const fileContent = await openaiClient.files.retrieveContent(file.fileId)
+                          fileBuffer = Buffer.from(fileContent)
+                        } catch (openaiError) {
+                          console.warn(`⚠️ Не удалось получить файл ${file.fileId} из OpenAI:`, openaiError.message)
+                        }
+                      }
+                    }
+                  }
+                  
+                  if (fileBuffer) {
+                    filesForIkap2.push({
+                      buffer: fileBuffer,
+                      originalname: file.originalName,
+                      mimetype: 'application/pdf',
+                      size: file.size || fileBuffer.length
+                    })
+                  } else {
+                    console.warn(`⚠️ Не удалось получить файл ${file.fileId} (${file.originalName}) для ikap2`)
+                  }
+                }
+                
+                if (filesForIkap2.length > 0) {
+                  // Формируем комментарий для ikap2 (используем уже извлеченные данные)
+                  const comment = `${bin !== 'не указан' ? `БИН: ${bin}` : ''} ${name !== 'не указано' ? `Имя: ${name}` : ''} ${email !== 'не указан' ? `Email: ${email}` : ''}`.trim()
+                  
+                  // Вызываем ikap2 для анализа
+                  const ikap2Result = await proxyAnalysisToIkap2(session, comment || '', {}, filesForIkap2)
+                  
+                  if (ikap2Result && ikap2Result.sessionId) {
+                    console.log(`✅ Анализ выписок выполнен через ikap2, sessionId: ${ikap2Result.sessionId}`)
+                    
+                    // Обновляем отчет в БД результатами от ikap2
+                    // ikap2 сохраняет результаты в своей БД, мы просто обновляем статус
+                    await upsertReport(session, {
+                      status: ikap2Result.status || 'generating',
+                      reportText: null,
+                      reportStructured: null,
+                      filesCount: filesForIkap2.length,
+                      filesData: JSON.stringify(filesForIkap2.map(f => ({
+                        name: f.originalname,
+                        size: f.size,
+                        mime: f.mimetype,
+                      }))),
+                      completed: null,
+                      comment: comment || '',
+                    })
+                    
+                    runningStatementsSessions.delete(session)
+                    return // Прерываем выполнение, не используем старую логику
+                  }
+                } else {
+                  console.warn(`⚠️ Не удалось получить ни один файл для ikap2, используем старую логику`)
+                }
+              } catch (ikap2Error) {
+                console.error('❌ Ошибка при вызове ikap2 для анализа выписок:', ikap2Error.message)
+                console.error('❌ Стек ошибки:', ikap2Error.stack)
+                // Продолжаем со старой логикой в случае ошибки
+              }
+            }
+            
+            // Старая логика (используется если USE_IKAP2_FOR_ANALYSIS=false или произошла ошибка)
             
             // Сохраняем заявку в БД со статусом "generating"
             const filesData = JSON.stringify(statementFiles)
@@ -3138,6 +3305,7 @@ JSON файл с OCR результатами прикреплен.`
           message: agentMessage,
           sessionId: session,
           completed: isFinalMessage,
+          showTaxRegimeButtons: showTaxRegimeButtons,
           data: { progress }
         })
       }
@@ -3187,7 +3355,93 @@ JSON файл с OCR результатами прикреплен.`
 })
 
 // ========== ЭНДПОИНТ /api/analysis ДЛЯ ОБРАБОТКИ БАНКОВСКИХ ВЫПИСОК ==========
-// Конвертация PDF -> фильтрация -> классификация -> суммирование -> вывод
+// Проксирование запросов на ikap2 для анализа выписок
+
+const IKAP2_BACKEND_URL = process.env.IKAP2_BACKEND_URL || 'https://ikap2-backend-latest.onrender.com'
+const USE_IKAP2_FOR_ANALYSIS = process.env.USE_IKAP2_FOR_ANALYSIS !== 'false' // По умолчанию true
+
+/**
+ * Проксирует запрос анализа выписок на ikap2
+ */
+async function proxyAnalysisToIkap2(sessionId, comment, metadata, files) {
+  try {
+    console.log(`🔄 Проксирую запрос на анализ в ikap2: ${IKAP2_BACKEND_URL}/api/analysis`, {
+      sessionId,
+      commentLength: comment.length,
+      filesCount: files.length,
+      metadata,
+    })
+
+    const formData = new FormData()
+    
+    if (sessionId) {
+      formData.append('sessionId', sessionId)
+    }
+    
+    if (comment) {
+      formData.append('comment', comment)
+    }
+    
+    if (metadata && typeof metadata === 'object') {
+      formData.append('metadata', JSON.stringify(metadata))
+    }
+    
+    // Добавляем файлы
+    for (const file of files) {
+      formData.append('files', file.buffer, {
+        filename: file.originalname || file.originalName || 'file.pdf',
+        contentType: file.mimetype || 'application/pdf',
+      })
+    }
+
+    // Отправляем запрос на ikap2 с заголовком x-external-service
+    const response = await axios.post(
+      `${IKAP2_BACKEND_URL}/api/analysis`,
+      formData,
+      {
+        headers: {
+          ...formData.getHeaders(),
+          'X-External-Service': 'ikap',
+        },
+        maxContentLength: Infinity,
+        maxBodyLength: Infinity,
+        timeout: 300000, // 5 минут таймаут для больших файлов
+      }
+    )
+
+    console.log(`✅ Получен ответ от ikap2:`, {
+      status: response.status,
+      sessionId: response.data?.sessionId,
+      ok: response.data?.ok,
+    })
+
+    return response.data
+  } catch (error) {
+    console.error('❌ Ошибка при проксировании запроса на ikap2:', error.message)
+    
+    if (error.response) {
+      // Если ikap2 вернул ошибку, пробрасываем её
+      throw {
+        status: error.response.status,
+        data: error.response.data || {
+          ok: false,
+          code: 'IKAP2_ERROR',
+          message: error.response.statusText || 'Ошибка при обращении к сервису анализа',
+        },
+      }
+    }
+    
+    // Если это сетевая ошибка
+    throw {
+      status: 502,
+      data: {
+        ok: false,
+        code: 'IKAP2_CONNECTION_ERROR',
+        message: `Не удалось связаться с сервисом анализа: ${error.message}`,
+      },
+    }
+  }
+}
 
 const activeAnalysisSessions = new Set()
 let analysisRunner = null
@@ -3251,8 +3505,74 @@ app.post('/api/analysis', upload.array('files'), handleMulterError, async (req, 
     commentLength: comment.length,
     files: summariseFilesForLog(files),
     metadata,
+    useIkap2: USE_IKAP2_FOR_ANALYSIS,
   })
 
+  // Если включено использование ikap2, проксируем запрос туда
+  if (USE_IKAP2_FOR_ANALYSIS) {
+    if (activeAnalysisSessions.has(sessionId)) {
+      console.warn('⚠️ Попытка запустить анализ для сессии, которая уже обрабатывается:', sessionId)
+      return res.status(409).json({
+        ok: false,
+        code: 'ANALYSIS_IN_PROGRESS',
+        message: 'Анализ для этой сессии уже выполняется. Пожалуйста, подождите.',
+        sessionId,
+      })
+    }
+
+    activeAnalysisSessions.add(sessionId)
+
+    if (!files.length) {
+      console.error('❌ Запрос без файлов, возвращаем 400')
+      activeAnalysisSessions.delete(sessionId)
+      return res.status(400).json({
+        ok: false,
+        code: 'FILES_REQUIRED',
+        message: 'Необходимо прикрепить хотя бы один файл для анализа.',
+      })
+    }
+
+    try {
+      const result = await proxyAnalysisToIkap2(sessionId, comment, metadata, files)
+      activeAnalysisSessions.delete(sessionId)
+      
+      // Сохраняем результат в локальной БД для совместимости с фронтендом ikap
+      if (result.sessionId) {
+        try {
+          await upsertReport(result.sessionId, {
+            status: 'generating',
+            reportText: null,
+            reportStructured: null,
+            filesCount: files.length,
+            filesData: JSON.stringify(files.map(f => ({
+              name: f.originalname || f.originalName,
+              size: f.size,
+              mime: f.mimetype,
+            }))),
+            completed: null,
+            comment: comment || '',
+          })
+        } catch (dbError) {
+          console.warn('⚠️ Не удалось сохранить сессию в локальную БД:', dbError.message)
+        }
+      }
+      
+      return res.json(result)
+    } catch (proxyError) {
+      activeAnalysisSessions.delete(sessionId)
+      
+      const status = proxyError.status || 500
+      const data = proxyError.data || {
+        ok: false,
+        code: 'UNKNOWN_ERROR',
+        message: 'Произошла неизвестная ошибка при анализе',
+      }
+      
+      return res.status(status).json(data)
+    }
+  }
+
+  // Старая логика (если USE_IKAP2_FOR_ANALYSIS=false)
   if (activeAnalysisSessions.has(sessionId)) {
     console.warn('⚠️ Попытка запустить анализ для сессии, которая уже обрабатывается:', sessionId)
     return res.status(409).json({
@@ -3803,6 +4123,77 @@ app.get('/api/reports/:sessionId', async (req, res) => {
   console.log(`📊 Запрос отчета для сессии: ${sessionId}`)
   
   try {
+    // Если используется ikap2, пытаемся получить полный отчет оттуда
+    if (USE_IKAP2_FOR_ANALYSIS) {
+      try {
+        console.log(`🔄 Запрашиваю полный отчет от ikap2 для сессии: ${sessionId}`)
+        const ikap2Response = await axios.get(
+          `${IKAP2_BACKEND_URL}/api/reports/${sessionId}`,
+          {
+            headers: {
+              'X-External-Service': 'ikap',
+            },
+            timeout: 30000,
+          }
+        )
+        
+        if (ikap2Response.data && ikap2Response.data.ok !== false) {
+          // Получили отчет от ikap2
+          // ikap2 возвращает объект отчета напрямую (через ensureHumanReadableReportText)
+          const ikap2Report = ikap2Response.data
+          
+          // Сохраняем/обновляем отчет в локальной БД для быстрого доступа
+          try {
+            await upsertReport(sessionId, {
+              status: ikap2Report.status || 'generating',
+              reportText: ikap2Report.report_text || null,
+              reportStructured: ikap2Report.report_structured || null,
+              filesCount: ikap2Report.files_count || null,
+              filesData: ikap2Report.files_data || null,
+              completed: ikap2Report.completed_at || ikap2Report.completed,
+              comment: ikap2Report.comment || null,
+            })
+            console.log(`✅ Отчет от ikap2 сохранен в локальную БД`)
+          } catch (dbError) {
+            console.warn('⚠️ Не удалось сохранить отчет от ikap2 в локальную БД:', dbError.message)
+          }
+          
+          // Возвращаем отчет от ikap2 (с графиком и всеми данными)
+          return res.json({
+            ok: true,
+            report: {
+              sessionId: ikap2Report.session_id || sessionId,
+              bin: ikap2Report.company_bin,
+              amount: ikap2Report.amount,
+              term: ikap2Report.term,
+              purpose: ikap2Report.purpose,
+              name: ikap2Report.name,
+              email: ikap2Report.email,
+              phone: ikap2Report.phone,
+              filesCount: ikap2Report.files_count,
+              status: ikap2Report.status,
+              reportText: ikap2Report.report_text,
+              reportStructured: ikap2Report.report_structured, // Это содержит график и структурированные данные
+              createdAt: ikap2Report.created_at,
+              completedAt: ikap2Report.completed_at || ikap2Report.completed,
+              comment: ikap2Report.comment,
+              // Сохраняем поля от ikap2
+              filesData: ikap2Report.files_data,
+            }
+          })
+        }
+      } catch (ikap2Error) {
+        // Если ikap2 вернул ошибку или недоступен, используем локальные данные
+        if (ikap2Error.response && ikap2Error.response.status === 404) {
+          console.log(`⚠️ Отчет не найден в ikap2 для сессии ${sessionId}, используем локальные данные`)
+        } else {
+          console.warn(`⚠️ Ошибка запроса отчета от ikap2: ${ikap2Error.message}, используем локальные данные`)
+        }
+        // Продолжаем с локальной БД ниже
+      }
+    }
+    
+    // Используем локальные данные из БД (fallback или если USE_IKAP2_FOR_ANALYSIS=false)
     const report = await db.prepare('SELECT * FROM reports WHERE session_id = ?').get(sessionId)
     
     if (!report) {

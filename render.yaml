@@ -33,5 +33,11 @@ services:
       # URL фронтенда для CORS
       - key: FRONTEND_URL
         value: https://mshaim001-hue.github.io
+      # URL ikap2 для проксирования запросов анализа выписок
+      - key: IKAP2_BACKEND_URL
+        sync: false
+      # Использовать ikap2 для анализа (по умолчанию true, установить false для отключения)
+      - key: USE_IKAP2_FOR_ANALYSIS
+        value: "true"
     healthCheckPath: /api/reports
 
