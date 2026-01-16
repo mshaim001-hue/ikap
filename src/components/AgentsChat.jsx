@@ -589,19 +589,24 @@ const AgentsChat = ({ onProgressChange }) => {
               )}
               {message.taxRegimeButtons && (
                 <div className="message-actions">
-                  <div style={{ marginBottom: '10px', fontSize: '14px', color: '#666' }}>
+                  <div style={{ marginBottom: '12px', fontSize: '14px', color: '#666' }}>
                     Какое налогообложение использует ваша компания?
                   </div>
-                  {message.taxRegimeButtons.map((button) => (
-                    <button
-                      key={button.value}
-                      onClick={() => handleTaxRegimeSelection(button.value)}
-                      className="choice-button"
-                      style={{ width: '100%', marginBottom: '8px' }}
-                    >
-                      {button.label}
-                    </button>
-                  ))}
+                  <div className="tax-regime-options">
+                    {message.taxRegimeButtons.map((button, index) => (
+                      <React.Fragment key={button.value}>
+                        <span
+                          onClick={() => handleTaxRegimeSelection(button.value)}
+                          className="tax-regime-option"
+                        >
+                          {button.label}
+                        </span>
+                        {index < message.taxRegimeButtons.length - 1 && (
+                          <span className="tax-regime-separator"> | </span>
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </div>
                 </div>
               )}
               <div className="message-time">
