@@ -2,7 +2,7 @@
  * Модуль для парсинга PDF налоговых деклараций в текстовый формат
  *
  * Режимы работы:
- * 1) HTTP (Cloud Run): если задан TAX_PDF_SERVICE_URL – отправляем PDF на внешний сервис и получаем текст
+ * 1) HTTP (Render.com): если задан TAX_PDF_SERVICE_URL – отправляем PDF на внешний сервис и получаем текст
  * 2) Локальный Python: по умолчанию используем taxpdfto/app.py через subprocess
  */
 
@@ -23,13 +23,13 @@ const readFile = promisify(fs.readFile)
 const TAX_PDF_TO_PATH = process.env.TAX_PDF_TO_PATH || 
   path.join(__dirname, '..', 'taxpdfto')
 
-// URL Cloud Run сервиса для налоговых PDF
+// URL Render.com сервиса для налоговых PDF
 const TAX_PDF_SERVICE_URL = process.env.TAX_PDF_SERVICE_URL || ''
 const USE_TAX_PDF_SERVICE_HTTP = !!TAX_PDF_SERVICE_URL
 
 // Логируем режим работы сразу при загрузке модуля
 if (USE_TAX_PDF_SERVICE_HTTP) {
-  console.log(`📡 Tax OCR (Cloud Run) включен: ${TAX_PDF_SERVICE_URL}`)
+  console.log(`📡 Tax OCR (Render.com) включен: ${TAX_PDF_SERVICE_URL}`)
 } else {
   console.log('🐍 Tax OCR: используется локальный Python (TAX_PDF_SERVICE_URL не задан)')
 }
@@ -41,7 +41,7 @@ if (USE_TAX_PDF_SERVICE_HTTP) {
  * @returns {Promise<string>} Распарсенный текст
  */
 async function parseTaxPdfToText(pdfBuffer, filename) {
-  // Если настроен внешний HTTP сервис (Cloud Run) – используем его
+  // Если настроен внешний HTTP сервис (Render.com) – используем его
   if (USE_TAX_PDF_SERVICE_HTTP) {
     return parseTaxPdfToTextViaHttp(pdfBuffer, filename)
   }
@@ -81,7 +81,7 @@ async function parseTaxPdfToText(pdfBuffer, filename) {
 }
 
 /**
- * Парсит PDF через HTTP сервис (Cloud Run tax-ocr-service)
+ * Парсит PDF через HTTP сервис (Render.com tax-ocr-service)
  * Ожидаемый формат ответа:
  * {
  *   "files": [

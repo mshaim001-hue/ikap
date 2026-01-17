@@ -171,6 +171,10 @@ DATABASE_URL=postgresql://user:pass@host:5432/dbname
 # Frontend URL для CORS
 FRONTEND_URL=https://your-domain.com
 
+# Render.com сервис для парсинга налоговых PDF
+# Если не указан, используется локальный Python парсер
+TAX_PDF_SERVICE_URL=https://ikap3-backend-latest.onrender.com
+
 # Cloud Run OCR сервис для анализа финансовой отчетности (PDF)
 # Если не указан, PDF файлы финансовой отчетности не будут обрабатываться
 PDF_SERVICE_URL=https://pdf-ocr-469114228.europe-west1.run.app

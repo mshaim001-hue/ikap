@@ -27,6 +27,9 @@ services:
       # Настройки парсера налоговых PDF
       - key: TAX_PDF_TO_PATH
         value: /opt/render/project/src/taxpdfto
+      # Render.com сервис для парсинга налоговых PDF
+      - key: TAX_PDF_SERVICE_URL
+        value: https://ikap3-backend-latest.onrender.com
       # Cloud Run OCR сервис для анализа финансовой отчетности (PDF)
       - key: PDF_SERVICE_URL
         value: https://pdf-ocr-469114228.europe-west1.run.app
