@@ -38,15 +38,16 @@ if (USE_TAX_PDF_SERVICE_HTTP) {
  * Парсит PDF файл в текстовый формат используя Python скрипт
  * @param {Buffer} pdfBuffer - Байты PDF файла
  * @param {string} filename - Имя файла
- * @returns {Promise<string>} Распарсенный текст
+ * @param {boolean} withAnalysis - Если true, также получает анализ от агента
+ * @returns {Promise<{text: string, analysis?: string}>} Распарсенный текст и опционально анализ
  */
-async function parseTaxPdfToText(pdfBuffer, filename) {
+async function parseTaxPdfToText(pdfBuffer, filename, withAnalysis = false) {
   // Если настроен внешний HTTP сервис (Render.com) – используем его
   if (USE_TAX_PDF_SERVICE_HTTP) {
-    return parseTaxPdfToTextViaHttp(pdfBuffer, filename)
+    return parseTaxPdfToTextViaHttp(pdfBuffer, filename, withAnalysis)
   }
 
-  // Иначе используем локальный Python скрипт
+  // Иначе используем локальный Python скрипт (анализ не поддерживается локально)
   const tempDir = path.join(__dirname, '..', 'temp_parsing')
   const tempPdfPath = path.join(tempDir, `${randomUUID()}_${filename}`)
   const tempOutputPath = path.join(tempDir, `${randomUUID()}_output.txt`)
@@ -61,7 +62,7 @@ async function parseTaxPdfToText(pdfBuffer, filename) {
     // Вызываем Python скрипт для парсинга
     const parsedText = await parsePdfWithPython(tempPdfPath, tempOutputPath)
 
-    return parsedText
+    return { text: parsedText }
   } catch (error) {
     console.error(`❌ Ошибка парсинга PDF ${filename}:`, error)
     throw error
@@ -85,12 +86,12 @@ async function parseTaxPdfToText(pdfBuffer, filename) {
  * Ожидаемый формат ответа:
  * {
  *   "files": [
- *     {"filename": "...", "text": "..."},
+ *     {"filename": "...", "text": "...", "analysis": "..."},
  *     ...
  *   ]
  * }
  */
-async function parseTaxPdfToTextViaHttp(pdfBuffer, filename) {
+async function parseTaxPdfToTextViaHttp(pdfBuffer, filename, withAnalysis = false) {
   if (!TAX_PDF_SERVICE_URL) {
     throw new Error('TAX_PDF_SERVICE_URL не задан, не могу использовать HTTP режим для налогового парсера')
   }
@@ -103,10 +104,11 @@ async function parseTaxPdfToTextViaHttp(pdfBuffer, filename) {
 
   // Нормализуем URL (убираем трейлинг слэши)
   const baseUrl = TAX_PDF_SERVICE_URL.trim().replace(/\/+$/, '')
-  const serviceUrl = `${baseUrl}/process`
+  // Добавляем параметр analyze=true если требуется анализ
+  const serviceUrl = `${baseUrl}/process${withAnalysis ? '?analyze=true' : ''}`
 
-  // Даем достаточно времени, так как PDF могут быть большими
-  const TIMEOUT_MS = 600000 // 10 минут
+  // Даем достаточно времени, так как PDF могут быть большими, а анализ может занять время
+  const TIMEOUT_MS = withAnalysis ? 1200000 : 600000 // 20 минут для анализа, 10 минут для парсинга
 
   try {
     const response = await axios.post(serviceUrl, formData, {
@@ -145,7 +147,14 @@ async function parseTaxPdfToTextViaHttp(pdfBuffer, filename) {
       throw new Error('tax-ocr-service вернул пустой текст')
     }
 
-    return text
+    const result = { text }
+    
+    // Если был запрошен анализ и он есть в ответе
+    if (withAnalysis && fileEntry.analysis) {
+      result.analysis = String(fileEntry.analysis || '').trim()
+    }
+
+    return result
   } catch (error) {
     if (error.response) {
       const errMsg = error.response.data?.error || error.response.statusText || error.message

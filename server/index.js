@@ -2701,17 +2701,28 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                 }
                 
                 // ШАГ 2: Парсим PDF в текстовый формат (ОБЯЗАТЕЛЬНО)
-                const parsedText = await parseTaxPdfToText(pdfBuffer, file.originalName)
-                if (!parsedText || parsedText.trim().length === 0) {
+                // Если используется HTTP сервис, запрашиваем анализ напрямую
+                const USE_TAX_PDF_SERVICE_HTTP = !!process.env.TAX_PDF_SERVICE_URL
+                const parseResult = await parseTaxPdfToText(pdfBuffer, file.originalName, USE_TAX_PDF_SERVICE_HTTP)
+                
+                if (!parseResult || !parseResult.text || parseResult.text.trim().length === 0) {
                   throw new Error(`Парсинг PDF вернул пустой текст`)
                 }
                 
-                console.log(`✅ PDF "${file.originalName}" распарсен: ${parsedText.length} символов`)
+                console.log(`✅ PDF "${file.originalName}" распарсен: ${parseResult.text.length} символов`)
                 
-                return {
+                const result = {
                   fileName: file.originalName,
-                  text: parsedText
+                  text: parseResult.text
                 }
+                
+                // Если получили готовый анализ от taxpdfto, сохраняем его
+                if (parseResult.analysis) {
+                  result.analysis = parseResult.analysis
+                  console.log(`✅ Получен готовый анализ от taxpdfto для "${file.originalName}": ${parseResult.analysis.length} символов`)
+                }
+                
+                return result
               }
               
               // Парсим все PDF файлы параллельно
@@ -2748,35 +2759,63 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
               
               console.log(`✅ Успешно распарсены ${parsedTexts.length} PDF файлов из ${taxFiles.length}`)
 
-              // ШАГ 3: Бьем распарсенные тексты на батчи, чтобы не превышать лимит по длине промпта
-              // По умолчанию используем более мелкий размер батча (~200k символов), чтобы снизить риск таймаутов
-              const MAX_TAX_CHARS = Number(process.env.TAX_CHUNK_MAX_CHARS || '200000')
-              const batches = []
-              let currentBatch = []
-              let currentChars = 0
-
-              for (const item of parsedTexts) {
-                const len = item.text.length
-                // Если добавление файла превышает лимит и в батче уже что-то есть – начинаем новый батч
-                if (currentBatch.length > 0 && currentChars + len > MAX_TAX_CHARS) {
-                  batches.push({ items: currentBatch, totalChars: currentChars })
-                  currentBatch = []
-                  currentChars = 0
-                }
-                currentBatch.push(item)
-                currentChars += len
-              }
-              if (currentBatch.length > 0) {
-                batches.push({ items: currentBatch, totalChars: currentChars })
-              }
-
-              console.log(`🧩 Налоговые файлы разбиты на ${batches.length} батч(ей) (лимит ~${MAX_TAX_CHARS} символов на батч)`)
-
-              // ШАГ 4–5: Для каждого батча формируем TXT, загружаем в OpenAI и запускаем анализ
+              // Проверяем, есть ли готовые анализы от taxpdfto
+              const hasReadyAnalyses = parsedTexts.some(item => item.analysis)
+              
               let combinedTaxReport = ''
               const analysisErrors = []
 
-              for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
+              if (hasReadyAnalyses) {
+                // Если есть готовые анализы от taxpdfto, используем их
+                console.log(`📊 Используем готовые анализы от taxpdfto`)
+                
+                for (let i = 0; i < parsedTexts.length; i += 1) {
+                  const item = parsedTexts[i]
+                  
+                  if (item.analysis) {
+                    // Добавляем анализ с разделителем
+                    combinedTaxReport += `\n${'='.repeat(80)}\nОТЧЕТ ${i + 1} ИЗ ${parsedTexts.length}\nФайл: ${item.fileName}\n${'='.repeat(80)}\n\n`
+                    combinedTaxReport += item.analysis.trim()
+                    combinedTaxReport += '\n\n'
+                    console.log(`✅ Добавлен анализ для файла "${item.fileName}"`)
+                  } else {
+                    // Если для файла нет анализа, добавляем предупреждение
+                    const warning = `⚠️ Анализ для файла "${item.fileName}" не был получен от taxpdfto`
+                    analysisErrors.push(warning)
+                    console.warn(warning)
+                  }
+                }
+              } else {
+                // Если готовых анализов нет, используем старую логику с агентом
+                console.log(`⚙️ Готовых анализов нет, запускаем анализ через агента`)
+                
+                // ШАГ 3: Бьем распарсенные тексты на батчи, чтобы не превышать лимит по длине промпта
+                // По умолчанию используем более мелкий размер батча (~200k символов), чтобы снизить риск таймаутов
+                const MAX_TAX_CHARS = Number(process.env.TAX_CHUNK_MAX_CHARS || '200000')
+                const batches = []
+                let currentBatch = []
+                let currentChars = 0
+
+                for (const item of parsedTexts) {
+                  const len = item.text.length
+                  // Если добавление файла превышает лимит и в батче уже что-то есть – начинаем новый батч
+                  if (currentBatch.length > 0 && currentChars + len > MAX_TAX_CHARS) {
+                    batches.push({ items: currentBatch, totalChars: currentChars })
+                    currentBatch = []
+                    currentChars = 0
+                  }
+                  currentBatch.push(item)
+                  currentChars += len
+                }
+                if (currentBatch.length > 0) {
+                  batches.push({ items: currentBatch, totalChars: currentChars })
+                }
+
+                console.log(`🧩 Налоговые файлы разбиты на ${batches.length} батч(ей) (лимит ~${MAX_TAX_CHARS} символов на батч)`)
+
+                // ШАГ 4–5: Для каждого батча формируем TXT, загружаем в OpenAI и запускаем анализ
+
+                for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
                 const batch = batches[batchIndex]
                 const batchFiles = batch.items.map((p) => p.fileName)
 
@@ -2919,6 +2958,7 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                 } catch (error) {
                   console.error(`❌ Ошибка анализа налоговых файлов для батча ${batchIndex + 1}/${batches.length}:`, error.message)
                   analysisErrors.push(`Батч ${batchIndex + 1}/${batches.length} (${batchFiles.join(', ')}): ${error.message}`)
+                }
                 }
               }
 
