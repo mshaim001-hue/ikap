@@ -36,17 +36,28 @@
 
 ## Формат ответа от taxpdfto
 
+При `POST /process?analyze=true` сервис сохраняет анализ у себя в БД и возвращает:
+
 ```json
 {
+  "session_id": "uuid-анализа",
+  "status": "completed",
+  "analysis_text": "Аналитика (ИИ) с таблицей в Markdown — разместите у себя в результатах",
+  "files_count": 2,
   "files": [
     {
-      "filename": "tax_report.pdf",
+      "filename": "100.00-2023.pdf",
       "text": "распарсенный текст...",
-      "analysis": "готовый анализ от агента..."
+      "analysis": "тот же текст analysis_text (Аналитика ИИ с таблицей)"
     }
-  ]
+  ],
+  "errors": []
 }
 ```
+
+- **session_id** — можно сохранить для последующего запроса `GET /api/analysis/<session_id>`.
+- **analysis_text** — готовый блок «Аналитика (ИИ)» с таблицей; стороннее приложение сохраняет его у себя и выводит в результатах.
+- В каждом элементе **files** поле **analysis** дублирует **analysis_text** (один общий анализ по всем декларациям).
 
 ## Fallback
 
