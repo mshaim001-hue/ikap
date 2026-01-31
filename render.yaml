@@ -30,7 +30,10 @@ services:
       # Render.com сервис для парсинга налоговых PDF
       - key: TAX_PDF_SERVICE_URL
         value: https://ikap3-backend-latest.onrender.com
-      # Cloud Run OCR сервис для анализа финансовой отчетности (PDF)
+      # pdftopng: анализ финансовой отчётности (таблица + краткий анализ)
+      - key: FINANCIAL_PDF_SERVICE_URL
+        value: https://ikap4-backend.onrender.com
+      # Cloud Run OCR сервис (fallback, если FINANCIAL_PDF_SERVICE_URL не задан)
       - key: PDF_SERVICE_URL
         value: https://pdf-ocr-469114228.europe-west1.run.app
       # URL фронтенда для CORS

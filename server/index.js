@@ -12,6 +12,7 @@ const { createDb } = require('./db')
 const { convertPdfsToJson } = require('./pdfConverter')
 const transactionProcessor = require('./transactionProcessor')
 const { parseTaxPdfToText } = require('./taxPdfParser')
+const { USE_FINANCIAL_PDF_SERVICE, analyzeFinancialPdfsViaPdftopng } = require('./financialPdfService')
 try { require('dotenv').config({ path: '.env.local' }) } catch {}
 require('dotenv').config()
 
@@ -3065,40 +3066,49 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
             
             const fsFileReports = [] // Массив отчетов для всех файлов
             
-            // Обрабатываем PDF файлы через Cloud Run OCR сервис
+            // Обрабатываем PDF файлы: pdftopng (приоритет) или Cloud Run OCR + агент
             if (pdfFiles.length > 0) {
-              if (!USE_PDF_SERVICE) {
-                console.error(`❌ Cloud Run OCR сервис не настроен, но найдены PDF файлы финансовой отчетности`)
-                // Добавляем ошибки для всех PDF файлов
-                pdfFiles.forEach(pdfFile => {
-                  fsFileReports.push({
-                    fileId: pdfFile.file_id,
-                    fileName: pdfFile.normalized_name,
-                    report: `Ошибка: Cloud Run OCR сервис не настроен. Установите переменную окружения PDF_SERVICE_URL.`
-                  })
+              const sessionFilesData = sessionFiles.get(session) || []
+              const pdfFilesWithBuffers = pdfFiles
+                .map(pdfFile => {
+                  const sessionFile = sessionFilesData.find(f => f.fileId === pdfFile.file_id)
+                  if (sessionFile && sessionFile.buffer) {
+                    return {
+                      buffer: sessionFile.buffer,
+                      originalName: pdfFile.normalized_name,
+                      fileId: pdfFile.file_id
+                    }
+                  }
+                  return null
                 })
-              } else {
+                .filter(Boolean)
+
+              if (USE_FINANCIAL_PDF_SERVICE && pdfFilesWithBuffers.length > 0) {
+                // pdftopng: отправляем на Render, получаем готовый анализ
+                console.log(`\n📄 Отправляем ${pdfFilesWithBuffers.length} PDF на pdftopng (фин. отчётность)...`)
+                try {
+                  const { report } = await analyzeFinancialPdfsViaPdftopng(pdfFilesWithBuffers)
+                  pdfFilesWithBuffers.forEach((f, idx) => {
+                    fsFileReports.push({
+                      fileId: f.fileId,
+                      fileName: f.originalName,
+                      report: idx === 0 ? report : `См. общий отчёт выше (файлы объединены в один анализ).`
+                    })
+                  })
+                } catch (err) {
+                  console.error(`❌ Ошибка pdftopng:`, err.message)
+                  pdfFilesWithBuffers.forEach(f => {
+                    fsFileReports.push({
+                      fileId: f.fileId,
+                      fileName: f.originalName,
+                      report: `Ошибка анализа через pdftopng: ${err.message}`
+                    })
+                  })
+                }
+              } else if (USE_PDF_SERVICE && pdfFilesWithBuffers.length > 0) {
                 console.log(`\n📄 Обрабатываем ${pdfFiles.length} PDF файл(ов) через Cloud Run OCR сервис...`)
                 
                 try {
-                  // Получаем buffer'ы файлов из sessionFiles
-                  const sessionFilesData = sessionFiles.get(session) || []
-                  const pdfFilesWithBuffers = []
-                  
-                  for (const pdfFile of pdfFiles) {
-                    const sessionFile = sessionFilesData.find(f => f.fileId === pdfFile.file_id)
-                    if (sessionFile && sessionFile.buffer) {
-                      pdfFilesWithBuffers.push({
-                        buffer: sessionFile.buffer,
-                        originalName: pdfFile.normalized_name,
-                        fileId: pdfFile.file_id
-                      })
-                    } else {
-                      console.warn(`⚠️ Buffer не найден для PDF файла ${pdfFile.normalized_name}, пропускаем`)
-                    }
-                  }
-                  
-                  if (pdfFilesWithBuffers.length > 0) {
                   // Отправляем PDF файлы на OCR сервис
                   const ocrJsonData = await sendPdfsToOcrService(pdfFilesWithBuffers)
                   
@@ -3211,32 +3221,30 @@ JSON файл с OCR результатами прикреплен.`
                       console.error(`❌ Ошибка анализа финансового PDF файла ${file.originalName}:`, result.reason)
                     }
                   })
-                  } else {
-                    console.warn(`⚠️ Не найдено buffer'ов для PDF файлов, пропускаем обработку через OCR сервис`)
-                    // Добавляем ошибки для файлов без buffer
-                    pdfFiles.forEach(pdfFile => {
-                      const sessionFile = sessionFiles.get(session)?.find(f => f.fileId === pdfFile.file_id)
-                      if (!sessionFile || !sessionFile.buffer) {
-                        fsFileReports.push({
-                          fileId: pdfFile.file_id,
-                          fileName: pdfFile.normalized_name,
-                          report: `Ошибка: не найден buffer файла для обработки через OCR сервис`
-                        })
-                      }
-                    })
-                  }
                 } catch (error) {
                   console.error(`❌ Ошибка обработки PDF файлов через OCR сервис:`, error.message)
                   console.error(`❌ Стек ошибки:`, error.stack)
-                  // Добавляем ошибки для всех PDF файлов
-                  pdfFiles.forEach(pdfFile => {
+                  pdfFilesWithBuffers.forEach(f => {
                     fsFileReports.push({
-                      fileId: pdfFile.file_id,
-                      fileName: pdfFile.normalized_name,
+                      fileId: f.fileId,
+                      fileName: f.originalName,
                       report: `Ошибка обработки через OCR сервис: ${error.message}`
                     })
                   })
                 }
+              } else {
+                // Ни pdftopng, ни OCR не настроены, или нет buffer'ов
+                const errMsg = !USE_FINANCIAL_PDF_SERVICE && !USE_PDF_SERVICE
+                  ? 'Установите FINANCIAL_PDF_SERVICE_URL (pdftopng) или PDF_SERVICE_URL (OCR)'
+                  : 'Buffer файлов не найден для обработки'
+                console.error(`❌ ${errMsg}`)
+                pdfFiles.forEach(pdfFile => {
+                  fsFileReports.push({
+                    fileId: pdfFile.file_id,
+                    fileName: pdfFile.normalized_name,
+                    report: `Ошибка: ${errMsg}`
+                  })
+                })
               }
             }
             
