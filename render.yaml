@@ -30,20 +30,15 @@ services:
       # Render.com сервис для парсинга налоговых PDF
       - key: TAX_PDF_SERVICE_URL
         value: https://ikap3-backend-latest.onrender.com
-      # pdftopng: анализ финансовой отчётности (таблица + краткий анализ)
+      # ikap4 (pdftopng): анализ финансовой отчётности (таблица + краткий анализ)
       - key: FINANCIAL_PDF_SERVICE_URL
         value: https://ikap4-backend.onrender.com
-      # Cloud Run OCR сервис (fallback, если FINANCIAL_PDF_SERVICE_URL не задан)
-      - key: PDF_SERVICE_URL
-        value: https://pdf-ocr-469114228.europe-west1.run.app
       # URL фронтенда для CORS
       - key: FRONTEND_URL
         value: https://mshaim001-hue.github.io
-      # URL ikap2 для проксирования запросов анализа выписок
+      # ikap2: анализ банковских выписок (обязательно для выписок)
       - key: IKAP2_BACKEND_URL
-        sync: false
-      # Использовать ikap2 для анализа (по умолчанию true, установить false для отключения)
-      - key: USE_IKAP2_FOR_ANALYSIS
-        value: "true"
+        value: https://ikap2-backend-latest.onrender.com
+      # ikap3 уже задан выше (TAX_PDF_SERVICE_URL), ikap4 (FINANCIAL_PDF_SERVICE_URL) — выше
     healthCheckPath: /api/reports
 

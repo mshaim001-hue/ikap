@@ -2197,9 +2197,19 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
               if (nameMatch) name = nameMatch[1]
             }
             
-            // Если используется ikap2, используем его для анализа выписок
-            if (USE_IKAP2_FOR_ANALYSIS && statementFiles.length > 0) {
-              console.log(`🔄 Используем ikap2 для анализа ${statementFiles.length} банковских выписок`)
+            // Банковские выписки отправляются только в ikap2 (анализ не делается в ikap)
+            if (statementFiles.length > 0) {
+              if (!USE_IKAP2_FOR_STATEMENTS) {
+                await upsertReport(session, {
+                  status: 'error',
+                  reportText: 'Для анализа банковских выписок настройте IKAP2_BACKEND_URL (https://ikap2-backend-latest.onrender.com).',
+                  filesCount: statementFiles.length,
+                  filesData: JSON.stringify(statementFiles.map(f => ({ name: f.originalName, size: f.size }))),
+                })
+                runningStatementsSessions.delete(session)
+                return
+              }
+              console.log(`🔄 Отправляем ${statementFiles.length} банковских выписок в ikap2`)
               
               try {
                 // Получаем файлы из sessionFiles (в памяти) или из БД
@@ -2299,264 +2309,34 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                     return // Прерываем выполнение, не используем старую логику
                   }
                 } else {
-                  console.warn(`⚠️ Не удалось получить ни один файл для ikap2, используем старую логику`)
+                  await upsertReport(session, {
+                    status: 'error',
+                    reportText: 'Не удалось получить файлы для отправки в сервис анализа выписок (ikap2).',
+                    filesCount: statementFiles.length,
+                    filesData: JSON.stringify(statementFiles.map(f => ({ name: f.originalName, size: f.size }))),
+                  })
+                  runningStatementsSessions.delete(session)
+                  return
                 }
               } catch (ikap2Error) {
                 console.error('❌ Ошибка при вызове ikap2 для анализа выписок:', ikap2Error.message)
                 console.error('❌ Стек ошибки:', ikap2Error.stack)
-                // Продолжаем со старой логикой в случае ошибки
+                const errMsg = ikap2Error?.response?.data?.message || ikap2Error?.data?.message || ikap2Error.message
+                await upsertReport(session, {
+                  status: 'error',
+                  reportText: `Ошибка сервиса анализа выписок (ikap2): ${errMsg}`,
+                  filesCount: statementFiles.length,
+                  filesData: JSON.stringify(statementFiles.map(f => ({ name: f.originalName, size: f.size }))),
+                })
+                runningStatementsSessions.delete(session)
+                return
               }
             }
             
-            // Старая логика (используется если USE_IKAP2_FOR_ANALYSIS=false или произошла ошибка)
-            
-            // Сохраняем заявку в БД со статусом "generating"
-            const filesData = JSON.stringify(statementFiles)
-            const insertReport = db.prepare(`
-              INSERT INTO reports (session_id, company_bin, amount, term, purpose, name, email, phone, files_count, files_data, status)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'generating')
-              ON CONFLICT (session_id) DO UPDATE SET
-                company_bin = EXCLUDED.company_bin,
-                amount = EXCLUDED.amount,
-                term = EXCLUDED.term,
-                purpose = EXCLUDED.purpose,
-                name = EXCLUDED.name,
-                email = EXCLUDED.email,
-                phone = EXCLUDED.phone,
-                files_count = EXCLUDED.files_count,
-                files_data = EXCLUDED.files_data
-                -- НЕ обновляем status если он уже completed
-            `)
-            await insertReport.run(session, bin, amount, termMonths, purpose, name, email, phone, statementFiles.length, filesData)
-            console.log(`💾 Заявка сохранена в БД: ${session}, выписок: ${statementFiles.length}`)
-            
-            // НОВЫЙ МЕТОД: Обрабатываем выписки через новый метод (конвертация -> классификация -> отчет)
-            try {
-              // Получаем файлы из sessionFiles (где сохранены buffer'ы)
-              const downloadedFiles = []
-              const sessionFilesData = sessionFiles.get(session) || []
-              
-              for (const file of statementFiles) {
-                const sessionFile = sessionFilesData.find(f => f.fileId === file.fileId)
-                if (sessionFile && sessionFile.buffer) {
-                  downloadedFiles.push({
-                    buffer: sessionFile.buffer,
-                    originalname: file.originalName,
-                    mimetype: sessionFile.mimetype || 'application/pdf',
-                    size: sessionFile.size || sessionFile.buffer.length
-                  })
-                }
-              }
-              
-              if (downloadedFiles.length === 0) {
-                throw new Error('Не удалось найти ни один файл в памяти для обработки')
-              }
-              
-              // Формируем комментарий с данными заявки
-              const commentText = `Данные заявки:
-              - Компания (БИН): ${bin}
-              - Запрашиваемая сумма: ${amount}
-              - Срок: ${termMonths} месяцев
-              - Цель финансирования: ${purpose}
-              - Контакты: ${name}, ${email}, ${phone}`
-              
-              // Конвертируем PDF в JSON
-              const pdfFiles = downloadedFiles.filter(f => f.mimetype === 'application/pdf' || f.originalname.toLowerCase().endsWith('.pdf'))
-              
-              if (pdfFiles.length > 0) {
-                const pdfDataForConversion = pdfFiles.map(file => ({
-                  buffer: file.buffer,
-                  filename: file.originalname
-                }))
-                
-                const jsonResults = await convertPdfsToJson(pdfDataForConversion)
-                
-                // Объединяем все транзакции из всех файлов
-                const allTransactions = []
-                const allMetadata = []
-                
-                for (const result of jsonResults) {
-                  if (result.error) {
-                    console.warn(`⚠️ Ошибка при конвертации файла ${result.source_file}: ${result.error}`)
-                    continue
-                  }
-                  
-                  if (result.transactions && Array.isArray(result.transactions)) {
-                    allTransactions.push(...result.transactions)
-                  }
-                  
-                  if (result.metadata) {
-                    allMetadata.push(result.metadata)
-                  }
-                }
-                
-                console.log(`📊 Итого собрано транзакций: ${allTransactions.length}`)
-                
-                const transactionsWithInternalIds = transactionProcessor.attachInternalTransactionIds(allTransactions, session)
-                
-                // Классифицируем транзакции
-                const { obviousRevenue, obviousNonRevenue, needsReview } = transactionProcessor.splitTransactionsByConfidence(transactionsWithInternalIds)
-                
-                console.log('🧮 Классификация транзакций:', {
-                  total: transactionsWithInternalIds.length,
-                  autoRevenue: obviousRevenue.length,
-                  autoNonRevenue: obviousNonRevenue.length,
-                  needsReview: needsReview.length,
-                })
-                
-                // Если есть транзакции для проверки агентом, запускаем классификатор
-                let reviewedRevenue = []
-                let reviewedNonRevenue = []
-                
-                if (needsReview.length > 0) {
-                  console.log(`🤖 Запускаем классификатор для ${needsReview.length} транзакций...`)
-                  if (!analysisRunner) {
-                    analysisRunner = new Runner({})
-                  }
-                  const classifierAgent = createTransactionClassifierAgent()
-                  const agentInput = [{
-                    role: 'user',
-                    content: [{
-                      type: 'input_text',
-                      text: transactionProcessor.buildClassifierPrompt(needsReview),
-                    }],
-                  }]
-                  
-                  const runResult = await analysisRunner.run(classifierAgent, agentInput)
-                  
-                  let finalOutputText = ''
-                  if (typeof runResult.finalOutput === 'string') {
-                    finalOutputText = runResult.finalOutput.trim()
-                  } else if (runResult.finalOutput && typeof runResult.finalOutput === 'object' && typeof runResult.finalOutput.text === 'string') {
-                    finalOutputText = runResult.finalOutput.text.trim()
-                  }
-                  
-                  if (!finalOutputText) {
-                    const rawNewItems = Array.isArray(runResult.newItems)
-                      ? runResult.newItems.map((item) => item?.rawItem || item)
-                      : []
-                    finalOutputText = transactionProcessor.extractAssistantAnswer(rawNewItems) || ''
-                  }
-                  
-                  const classificationEntries = transactionProcessor.parseClassifierResponse(finalOutputText)
-                  
-                  const decisionsMap = new Map()
-                  for (const entry of classificationEntries) {
-                    if (!entry || !entry.id) continue
-                    const key = String(entry.id)
-                    const isRevenue =
-                      entry.is_revenue ??
-                      entry.isRevenue ??
-                      entry.revenue ??
-                      (entry.label === 'revenue')
-                    decisionsMap.set(key, {
-                      isRevenue: Boolean(isRevenue),
-                      reason: entry.reason || entry.explanation || '',
-                    })
-                  }
-                  
-                  for (const transaction of needsReview) {
-                    const decision =
-                      decisionsMap.get(String(transaction._ikap_tx_id)) ||
-                      decisionsMap.get(transaction._ikap_tx_id)
-                    const isRevenue = decision ? decision.isRevenue : false
-                    const reason =
-                      decision?.reason ||
-                      (decision ? '' : 'нет решения от агента, по умолчанию не выручка')
-                    
-                    const enriched = {
-                      ...transaction,
-                      _ikap_classification_source: decision ? 'agent' : 'agent_missing',
-                      _ikap_classification_reason: reason,
-                    }
-                    
-                    if (isRevenue) {
-                      reviewedRevenue.push(enriched)
-                    } else {
-                      reviewedNonRevenue.push(enriched)
-                    }
-                  }
-                  
-                  console.log(`✅ Классификация завершена: ${reviewedRevenue.length} выручка, ${reviewedNonRevenue.length} не выручка`)
-                }
-                
-                // Объединяем транзакции и сортируем по датам
-                const finalNonRevenueTransactions = [...obviousNonRevenue, ...reviewedNonRevenue]
-                  .sort((a, b) => {
-                    const dateA = transactionProcessor.extractTransactionDate(a)
-                    const dateB = transactionProcessor.extractTransactionDate(b)
-                    if (!dateA && !dateB) return 0
-                    if (!dateA) return 1
-                    if (!dateB) return -1
-                    return dateA.getTime() - dateB.getTime()
-                  })
-                const finalRevenueTransactions = [...obviousRevenue, ...reviewedRevenue]
-                  .sort((a, b) => {
-                    const dateA = transactionProcessor.extractTransactionDate(a)
-                    const dateB = transactionProcessor.extractTransactionDate(b)
-                    if (!dateA && !dateB) return 0
-                    if (!dateA) return 1
-                    if (!dateB) return -1
-                    return dateA.getTime() - dateB.getTime()
-                  })
-                
-                const sortedObviousRevenue = [...obviousRevenue].sort((a, b) => {
-                  const dateA = transactionProcessor.extractTransactionDate(a)
-                  const dateB = transactionProcessor.extractTransactionDate(b)
-                  if (!dateA && !dateB) return 0
-                  if (!dateA) return 1
-                  if (!dateB) return -1
-                  return dateA.getTime() - dateB.getTime()
-                })
-                
-                // Формируем структурированный отчет
-                const structuredSummary = transactionProcessor.buildStructuredSummary({
-                  revenueTransactions: finalRevenueTransactions,
-                  nonRevenueTransactions: finalNonRevenueTransactions,
-                  stats: {
-                    totalTransactions: transactionsWithInternalIds.length,
-                    autoRevenue: obviousRevenue.length,
-                    autoNonRevenue: obviousNonRevenue.length,
-                    agentReviewed: needsReview.length,
-                    agentDecisions: needsReview.length > 0 ? (reviewedRevenue.length + reviewedNonRevenue.length) : 0,
-                    unresolved: Math.max(0, needsReview.length - (reviewedRevenue.length + reviewedNonRevenue.length)),
-                  },
-                  autoRevenuePreview: transactionProcessor.buildTransactionsPreview(sortedObviousRevenue, { limit: 10000 }),
-                  convertedExcels: [],
-                })
-                
-                const formattedReportText = transactionProcessor.formatReportAsText(structuredSummary)
-                const finalReportPayload = JSON.stringify(structuredSummary, null, 2)
-                
-                // Сохраняем отчет в БД
-                await upsertReport(session, {
-                  status: 'completed',
-                  reportText: formattedReportText,
-                  reportStructured: finalReportPayload,
-                  filesCount: statementFiles.length,
-                  filesData: JSON.stringify(statementFiles.map(f => ({ name: f.originalName, size: f.size }))),
-                  completed: new Date().toISOString(),
-                  comment: commentText,
-                  openaiResponseId: null,
-                  openaiStatus: needsReview.length === 0 ? 'skipped' : (reviewedRevenue.length + reviewedNonRevenue.length > 0 ? 'completed' : 'partial'),
-                })
-                
-                console.log(`✅ Отчет сгенерирован и сохранен в БД для сессии: ${session}`)
-                console.log(`📊 Статистика: ${finalRevenueTransactions.length} выручка, ${finalNonRevenueTransactions.length} не выручка`)
-              } else {
-                throw new Error('Не найдено PDF файлов для обработки')
-              }
-            } catch (processingError) {
-              console.error(`❌ Ошибка обработки выписок новым методом:`, processingError.message)
-              console.error(`❌ Стек ошибки:`, processingError.stack)
-              
-              // Сохраняем ошибку в БД
-              const updateError = db.prepare(`
-                UPDATE reports 
-                SET report_text = ?, status = 'error', completed_at = CURRENT_TIMESTAMP
-                WHERE session_id = ?
-              `)
-              await updateError.run(`Ошибка обработки выписок: ${processingError.message}`, session)
+            // Если есть выписки, анализ делается только через ikap2 — сюда не доходим при statementFiles.length > 0
+            if (statementFiles.length > 0) {
+              runningStatementsSessions.delete(session)
+              return
             }
             
           } catch (error) {
@@ -2787,180 +2567,17 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                   }
                 }
               } else {
-                // Если готовых анализов нет, используем старую логику с агентом
-                console.log(`⚙️ Готовых анализов нет, запускаем анализ через агента`)
-                
-                // ШАГ 3: Бьем распарсенные тексты на батчи, чтобы не превышать лимит по длине промпта
-                // По умолчанию используем более мелкий размер батча (~200k символов), чтобы снизить риск таймаутов
-                const MAX_TAX_CHARS = Number(process.env.TAX_CHUNK_MAX_CHARS || '200000')
-                const batches = []
-                let currentBatch = []
-                let currentChars = 0
-
-                for (const item of parsedTexts) {
-                  const len = item.text.length
-                  // Если добавление файла превышает лимит и в батче уже что-то есть – начинаем новый батч
-                  if (currentBatch.length > 0 && currentChars + len > MAX_TAX_CHARS) {
-                    batches.push({ items: currentBatch, totalChars: currentChars })
-                    currentBatch = []
-                    currentChars = 0
-                  }
-                  currentBatch.push(item)
-                  currentChars += len
-                }
-                if (currentBatch.length > 0) {
-                  batches.push({ items: currentBatch, totalChars: currentChars })
-                }
-
-                console.log(`🧩 Налоговые файлы разбиты на ${batches.length} батч(ей) (лимит ~${MAX_TAX_CHARS} символов на батч)`)
-
-                // ШАГ 4–5: Для каждого батча формируем TXT, загружаем в OpenAI и запускаем анализ
-
-                for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-                const batch = batches[batchIndex]
-                const batchFiles = batch.items.map((p) => p.fileName)
-
-                // 4.1 Формируем объединенный текст для батча
-                const parts = []
-                batch.items.forEach((parsed, idx) => {
-                  parts.push(`\n${'='.repeat(80)}\n`)
-                  parts.push(`ФАЙЛ ${idx + 1} из ${batch.items.length}: ${parsed.fileName}\n`)
-                  parts.push(`${'='.repeat(80)}\n\n`)
-                  parts.push(parsed.text)
-                  parts.push(`\n\n`)
-                })
-                const batchText = parts.join('')
-                console.log(`✅ Объединенный текст для батча ${batchIndex + 1}/${batches.length} создан: ${batchText.length} символов`)
-
-                // 4.2 Загружаем TXT батча в OpenAI
-                const batchFilename = `tax_reports_batch${batchIndex + 1}_${session}.txt`
-                let batchFileId = null
+                // Налоговый анализ делается только через ikap3 (taxpdfto). Агенты в ikap не используются.
+                const errMsg = process.env.TAX_PDF_SERVICE_URL
+                  ? 'Сервис налоговых деклараций (ikap3) не вернул анализ. Убедитесь, что TAX_PDF_SERVICE_URL указывает на https://ikap3-backend-latest.onrender.com и сервис доступен.'
+                  : 'Для анализа налоговых деклараций настройте TAX_PDF_SERVICE_URL (https://ikap3-backend-latest.onrender.com).'
+                console.error(`❌ ${errMsg}`)
                 try {
-                  const txtFile = await openaiClient.files.create({
-                    file: await toFile(Buffer.from(batchText, 'utf-8'), batchFilename, { type: 'text/plain' }),
-                    purpose: 'assistants',
-                  })
-                  batchFileId = txtFile.id
-                  console.log(`✅ TXT батча ${batchIndex + 1}/${batches.length} загружен в OpenAI (file_id: ${batchFileId})`)
-                } catch (uploadError) {
-                  const errorMessage = `Не удалось загрузить TXT батча ${batchIndex + 1}/${batches.length} в OpenAI: ${uploadError.message}`
-                  console.error(`❌ ${errorMessage}`)
-                  analysisErrors.push(`Батч ${batchIndex + 1}/${batches.length} (${batchFiles.join(', ')}): ${uploadError.message}`)
-                  continue
+                  await db.prepare(`UPDATE reports SET tax_status = 'error', tax_report_text = ? WHERE session_id = ?`).run(errMsg, session)
+                } catch (dbError) {
+                  console.error(`❌ Ошибка сохранения статуса ошибки в БД:`, dbError.message)
                 }
-
-                // 5. Запускаем анализ TXT батча
-                const taxRequest = `Сделай анализ налоговой отчетности для всех прикрепленных файлов (батч ${batchIndex + 1} из ${batches.length}).
-В файлах могут находиться несколько деклараций (формы 100/200/300/910). 
-Пройди весь текст целиком, чтобы не пропустить ни одну форму.
-
-Файлы для анализа в этом батче: ${batchFiles.join(', ')}`
-
-                const analysisTimeout = new Promise((_, reject) =>
-                  setTimeout(() => reject(new Error(`Tax Analyst timeout (${TAX_TIMEOUT_MS/1000}s)`)), TAX_TIMEOUT_MS)
-                )
-
-                try {
-                  const taxAgent = new Agent({
-                    name: 'Tax Analyst',
-                    instructions: `Ты налоговый аналитик. Проанализируй прикрепленный файл налоговой отчетности.
-Файл предоставлен в текстовом формате (распарсен из PDF). Используй Code Interpreter, чтобы прочитать и разобрать всё содержимое.
-
-Алгоритм:
-1. Просканируй весь файл — в нём может быть несколько деклараций подряд. Для каждого обнаруженного блока определи тип формы (100/200/300/910).
-2. Для каждой формы заполни указанные ниже поля. ВАЖНО: Для каждого кода строки (например, "100.00.055") найди строку/абзац в тексте, где упоминается этот код. Извлеки числовое значение, которое находится в той же строке/абзаце рядом с кодом. НЕ ищи числа по всему файлу — только в контексте найденной строки с кодом. Замени "..." на реальное значение из текста. Если в строке с кодом нет числового значения, оставь поле пустым.
-3. После перечисления всех форм добавь раздел "Краткий анализ по годам" — сгруппируй выводы по налоговым периодам/годам, отметь динамику, задолженности и заметные изменения.
-4. Если в файле отсутствуют требуемые формы, явно укажи это.
-
-Формат вывода:
-- Для КАЖДОЙ найденной формы используй отдельный блок:
-  *\`Форма 100\`*: 
-    БИН: ...
-    Налоговый период: ...
-    Наименование налогоплательщика: ...
-    100.00.015 СОВОКУПНЫЙ ГОДОВОЙ ДОХОД (сумма с 100.00.001 по 100.00.014): ...
-    100.00.055 НАЛОГООБЛАГАЕМЫЙ ДОХОД С УЧЕТОМ ПЕРЕНЕСЕННЫХ УБЫТКОВ (100.00.053 - 100.00.054): ...
-    ВАЖНО: Замени "..." на реальное значение из текста. Например, если в тексте есть строка "100.00.055 НАЛОГООБЛАГАЕМЫЙ ДОХОД С УЧЕТОМ ПЕРЕНЕСЕННЫХ 21302759 УБЫТКОВ", то укажи: 100.00.055 НАЛОГООБЛАГАЕМЫЙ ДОХОД С УЧЕТОМ ПЕРЕНЕСЕННЫХ УБЫТКОВ (100.00.053 - 100.00.054): 21302759
-
-  *\`Форма 300\`*: 
-    БИН: ...
-    Налоговый период: ...
-    Наименование налогоплательщика: ...
-    300.00.006 Общий оборот: ...
-    300.00.030 Исчисленная сумма НДС за налоговый период:
-      I. сумма НДС, подлежащая уплате: ...
-      II. Превышение суммы НДС, относимого в зачет, над суммой начисленного налога: ...
-    ВАЖНО: Замени "..." на реальное значение из текста. Найди строку с кодом (например, "300.00.006") и извлеки число из той же строки/абзаца.
-
-  *\`Форма 200\`*: 
-    БИН: ...
-    Налоговый период: ...
-    Наименование налогоплательщика: ...
-    200.01.001 Итого за отчетный квартал: ...
-    Общая численность работников: 3 мес.: ...
-    ВАЖНО: Замени "..." на реальное значение из текста. Найди строку с кодом (например, "200.01.001") и извлеки число из той же строки/абзаца.
-
-  *\`Форма 910\`*: 
-    БИН: ...
-    Налоговый период: ...
-    Наименование налогоплательщика: ...
-    910.00.001 Доход: ...
-    910.00.016 Начисление доходы. Итого за полугодие: ...
-    910.00.005 Сумма начисленных налогов: ...
-    910.00.003 Среднесписочная численность работников, в том числе: ...
-    ВАЖНО: Замени "..." на реальное значение из текста. Найди строку с кодом (например, "910.00.001") и извлеки число из той же строки/абзаца.
-
-5. В конце добавь раздел "Краткий анализ по годам" с выводами по каждому году: итоги доходов/НДС, наличие доначислений или задолженности, существенные отклонения.`,
-                    model: 'gpt-5',
-                    tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [batchFileId] } })],
-                    modelSettings: { store: true }
-                  })
-                  const taxRunner = new Runner({})
-
-                  const taxMessages = [{ role: 'user', content: [{ type: 'input_text', text: taxRequest }] }]
-                  logAgentInput('Tax Analyst', session, taxMessages, {
-                    batchFileId,
-                    taxFiles: batchFiles,
-                    taxRequestLength: taxRequest.length,
-                  })
-                  console.log(`⚙️ Запускаем анализ TXT батча ${batchIndex + 1}/${batches.length} (${batchFiles.length} файлов)...`)
-
-                  const result = await Promise.race([
-                    taxRunner.run(taxAgent, taxMessages),
-                    analysisTimeout,
-                  ])
-
-                  // Извлекаем отчет для батча
-                  let taxText = ''
-                  for (let i = result.newItems.length - 1; i >= 0; i -= 1) {
-                    const it = result.newItems[i]
-                    if (it.rawItem?.role === 'assistant') {
-                      const c = it.rawItem.content
-                      if (Array.isArray(c)) {
-                        const t = c.find((x) => x?.type === 'text' || x?.type === 'output_text')
-                        taxText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
-                      } else if (typeof it.rawItem.content === 'string') {
-                        taxText = it.rawItem.content
-                      }
-                      if (taxText) break
-                    }
-                  }
-
-                  if (!taxText) {
-                    taxText = `Анализ налоговой отчетности для батча ${batchIndex + 1}/${batches.length} не удалось извлечь из ответа агента.`
-                  }
-
-                  // Добавляем результат батча в общий отчет с разделителем
-                  combinedTaxReport += `\n${'='.repeat(80)}\nОТЧЕТ ПО БАТЧУ ${batchIndex + 1} ИЗ ${batches.length}\nФайлы: ${batchFiles.join(', ')}\n${'='.repeat(80)}\n\n`
-                  combinedTaxReport += taxText.trim()
-                  combinedTaxReport += '\n\n'
-
-                  console.log(`✅ Анализ налоговых файлов для батча ${batchIndex + 1}/${batches.length} завершен`)
-                } catch (error) {
-                  console.error(`❌ Ошибка анализа налоговых файлов для батча ${batchIndex + 1}/${batches.length}:`, error.message)
-                  analysisErrors.push(`Батч ${batchIndex + 1}/${batches.length} (${batchFiles.join(', ')}): ${error.message}`)
-                }
-                }
+                return
               }
 
               if (!combinedTaxReport) {
@@ -3083,9 +2700,9 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                 })
                 .filter(Boolean)
 
+              // Финансовая отчётность отправляется только в ikap4 (pdftopng). Агенты в ikap не используются.
               if (USE_FINANCIAL_PDF_SERVICE && pdfFilesWithBuffers.length > 0) {
-                // pdftopng: отправляем на Render, получаем готовый анализ
-                console.log(`\n📄 Отправляем ${pdfFilesWithBuffers.length} PDF на pdftopng (фин. отчётность)...`)
+                console.log(`\n📄 Отправляем ${pdfFilesWithBuffers.length} PDF на ikap4 (pdftopng, фин. отчётность)...`)
                 try {
                   const { report } = await analyzeFinancialPdfsViaPdftopng(pdfFilesWithBuffers)
                   pdfFilesWithBuffers.forEach((f, idx) => {
@@ -3096,146 +2713,18 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                     })
                   })
                 } catch (err) {
-                  console.error(`❌ Ошибка pdftopng:`, err.message)
+                  console.error(`❌ Ошибка ikap4 (pdftopng):`, err.message)
                   pdfFilesWithBuffers.forEach(f => {
                     fsFileReports.push({
                       fileId: f.fileId,
                       fileName: f.originalName,
-                      report: `Ошибка анализа через pdftopng: ${err.message}`
-                    })
-                  })
-                }
-              } else if (USE_PDF_SERVICE && pdfFilesWithBuffers.length > 0) {
-                console.log(`\n📄 Обрабатываем ${pdfFiles.length} PDF файл(ов) через Cloud Run OCR сервис...`)
-                
-                try {
-                  // Отправляем PDF файлы на OCR сервис
-                  const ocrJsonData = await sendPdfsToOcrService(pdfFilesWithBuffers)
-                  
-                  // Создаем временный JSON файл с результатами OCR
-                  const jsonFileName = `financial_ocr_${session}_${Date.now()}.json`
-                  const jsonBuffer = Buffer.from(JSON.stringify(ocrJsonData, null, 2), 'utf-8')
-                  
-                  // Загружаем JSON файл в OpenAI
-                  const jsonFile = await toFile(jsonBuffer, jsonFileName, { type: 'application/json' })
-                  const uploadedJsonFile = await openaiClient.files.create({
-                    file: jsonFile,
-                    purpose: 'assistants'
-                  })
-                  
-                  console.log(`✅ JSON файл с OCR результатами загружен в OpenAI: ${uploadedJsonFile.id}`)
-                  
-                  // Анализируем JSON через агента
-                  const pdfAnalysisPromises = pdfFilesWithBuffers.map(async (pdfFile) => {
-                    const fileStartTime = Date.now()
-                    console.log(`\n📄 Анализируем финансовый PDF файл: ${pdfFile.originalName}`)
-                    
-                    const fsRequest = `Сделай анализ финансовой отчетности для файла "${pdfFile.originalName}".
-Данные из файла уже обработаны через OCR и представлены в структурированном JSON формате.
-Требования:
-- Сфокусируйся на текущем и предыдущем годах
-- Если какого-то года нет, явно укажи об этом и сделай анализ по имеющимся данным
-- Дай ключевые метрики: выручка, валовая прибыль/маржа, операционная прибыль, чистая прибыль, активы/обязательства
-- Выведи краткий вывод о динамике и рисках.
-- Используй структурированные таблицы из JSON (structured_table или structured_table_array) для анализа данных.
-JSON файл с OCR результатами прикреплен.`
-                    
-                    const FS_TIMEOUT_MS = 30 * 60 * 1000 // 30 минут
-                    const analysisTimeout = new Promise((_, reject) =>
-                      setTimeout(() => reject(new Error(`Financial Statements Analyst timeout для ${pdfFile.originalName} (${FS_TIMEOUT_MS/1000}s)`)), FS_TIMEOUT_MS)
-                    )
-                    
-                    try {
-                      const fsAgent = new Agent({
-                        name: 'Financial Statements Analyst',
-                        instructions: `Ты аналитик финансовой отчетности. Проанализируй Баланс и ОПУ (P&L) используя структурированные данные из JSON файла с OCR результатами.
-                        Требования:
-                        - Сфокусируйся на текущем и предыдущем годах
-                        - Если какого-то года нет, явно укажи об этом и сделай анализ по имеющимся данным
-                        - Дай ключевые метрики: выручка, валовая прибыль/маржа, операционная прибыль, чистая прибыль, активы/обязательства
-                        - Выведи краткий вывод о динамике и рисках.
-                        - Используй структурированные таблицы из JSON (structured_table или structured_table_array) для анализа данных.`,
-                        model: 'gpt-5',
-                        tools: [codeInterpreterTool({ container: { type: 'auto', file_ids: [uploadedJsonFile.id] } })],
-                        modelSettings: { store: true }
-                      })
-                      const fsRunner = new Runner({})
-                      
-                      console.log(`⚙️ Запускаем анализ финансового PDF файла "${pdfFile.originalName}"...`)
-                      
-                      const result = await Promise.race([
-                        fsRunner.run(fsAgent, [{ role: 'user', content: [{ type: 'input_text', text: fsRequest }] }]),
-                        analysisTimeout
-                      ])
-                      
-                      // Извлекаем отчет
-                      let fsText = ''
-                      for (let i = result.newItems.length - 1; i >= 0; i--) {
-                        const it = result.newItems[i]
-                        if (it.rawItem?.role === 'assistant') {
-                          const c = it.rawItem.content
-                          if (Array.isArray(c)) {
-                            const t = c.find(x => x?.type === 'text' || x?.type === 'output_text')
-                            fsText = (typeof t?.text === 'string') ? t.text : (t?.text?.value || '')
-                          } else if (typeof it.rawItem.content === 'string') {
-                            fsText = it.rawItem.content
-                          }
-                          if (fsText) break
-                        }
-                      }
-                      
-                      if (!fsText) {
-                        fsText = `Анализ финансовой отчетности для файла "${pdfFile.originalName}" не удалось извлечь из ответа агента.`
-                      }
-                      
-                      const fileAnalysisTime = ((Date.now() - fileStartTime) / 1000).toFixed(2)
-                      console.log(`✅ Анализ финансового PDF файла "${pdfFile.originalName}" завершен за ${fileAnalysisTime}s`)
-                      
-                      return {
-                        fileId: pdfFile.fileId,
-                        fileName: pdfFile.originalName,
-                        report: fsText
-                      }
-                    } catch (error) {
-                      console.error(`❌ Ошибка анализа финансового PDF файла "${pdfFile.originalName}":`, error.message)
-                      return {
-                        fileId: pdfFile.fileId,
-                        fileName: pdfFile.originalName,
-                        report: `Ошибка анализа файла "${pdfFile.originalName}": ${error.message}`
-                      }
-                    }
-                  })
-                  
-                  const pdfResults = await Promise.allSettled(pdfAnalysisPromises)
-                  pdfResults.forEach((result, index) => {
-                    if (result.status === 'fulfilled') {
-                      fsFileReports.push(result.value)
-                      console.log(`✅ Финансовый PDF отчет ${index + 1}/${pdfFilesWithBuffers.length} готов: ${result.value.fileName}`)
-                    } else {
-                      const file = pdfFilesWithBuffers[index]
-                      fsFileReports.push({
-                        fileId: file.fileId,
-                        fileName: file.originalName,
-                        report: `Ошибка анализа: ${result.reason?.message || 'Неизвестная ошибка'}`
-                      })
-                      console.error(`❌ Ошибка анализа финансового PDF файла ${file.originalName}:`, result.reason)
-                    }
-                  })
-                } catch (error) {
-                  console.error(`❌ Ошибка обработки PDF файлов через OCR сервис:`, error.message)
-                  console.error(`❌ Стек ошибки:`, error.stack)
-                  pdfFilesWithBuffers.forEach(f => {
-                    fsFileReports.push({
-                      fileId: f.fileId,
-                      fileName: f.originalName,
-                      report: `Ошибка обработки через OCR сервис: ${error.message}`
+                      report: `Ошибка анализа через ikap4 (pdftopng): ${err.message}`
                     })
                   })
                 }
               } else {
-                // Ни pdftopng, ни OCR не настроены, или нет buffer'ов
-                const errMsg = !USE_FINANCIAL_PDF_SERVICE && !USE_PDF_SERVICE
-                  ? 'Установите FINANCIAL_PDF_SERVICE_URL (pdftopng) или PDF_SERVICE_URL (OCR)'
+                const errMsg = !USE_FINANCIAL_PDF_SERVICE
+                  ? 'Для анализа финансовой отчётности настройте FINANCIAL_PDF_SERVICE_URL (https://ikap4-backend.onrender.com).'
                   : 'Buffer файлов не найден для обработки'
                 console.error(`❌ ${errMsg}`)
                 pdfFiles.forEach(pdfFile => {
@@ -3352,8 +2841,9 @@ JSON файл с OCR результатами прикреплен.`
 // ========== ЭНДПОИНТ /api/analysis ДЛЯ ОБРАБОТКИ БАНКОВСКИХ ВЫПИСОК ==========
 // Проксирование запросов на ikap2 для анализа выписок
 
+// Банковские выписки отправляются только в ikap2 (анализ не делается в ikap)
 const IKAP2_BACKEND_URL = process.env.IKAP2_BACKEND_URL || 'https://ikap2-backend-latest.onrender.com'
-const USE_IKAP2_FOR_ANALYSIS = process.env.USE_IKAP2_FOR_ANALYSIS !== 'false' // По умолчанию true
+const USE_IKAP2_FOR_STATEMENTS = !!IKAP2_BACKEND_URL
 
 /**
  * Проксирует запрос анализа выписок на ikap2
@@ -3500,11 +2990,11 @@ app.post('/api/analysis', upload.array('files'), handleMulterError, async (req, 
     commentLength: comment.length,
     files: summariseFilesForLog(files),
     metadata,
-    useIkap2: USE_IKAP2_FOR_ANALYSIS,
+    useIkap2: USE_IKAP2_FOR_STATEMENTS,
   })
 
   // Если включено использование ikap2, проксируем запрос туда
-  if (USE_IKAP2_FOR_ANALYSIS) {
+  if (USE_IKAP2_FOR_STATEMENTS) {
     if (activeAnalysisSessions.has(sessionId)) {
       console.warn('⚠️ Попытка запустить анализ для сессии, которая уже обрабатывается:', sessionId)
       return res.status(409).json({
@@ -3567,7 +3057,6 @@ app.post('/api/analysis', upload.array('files'), handleMulterError, async (req, 
     }
   }
 
-  // Старая логика (если USE_IKAP2_FOR_ANALYSIS=false)
   if (activeAnalysisSessions.has(sessionId)) {
     console.warn('⚠️ Попытка запустить анализ для сессии, которая уже обрабатывается:', sessionId)
     return res.status(409).json({
@@ -4119,7 +3608,7 @@ app.get('/api/reports/:sessionId', async (req, res) => {
   
   try {
     // Если используется ikap2, пытаемся получить полный отчет оттуда
-    if (USE_IKAP2_FOR_ANALYSIS) {
+    if (USE_IKAP2_FOR_STATEMENTS) {
       try {
         console.log(`🔄 Запрашиваю полный отчет от ikap2 для сессии: ${sessionId}`)
         const ikap2Response = await axios.get(
@@ -4188,7 +3677,7 @@ app.get('/api/reports/:sessionId', async (req, res) => {
       }
     }
     
-    // Используем локальные данные из БД (fallback или если USE_IKAP2_FOR_ANALYSIS=false)
+    // Fallback: локальные данные из БД (если ikap2 недоступен или отчёт ещё не подтянут)
     const report = await db.prepare('SELECT * FROM reports WHERE session_id = ?').get(sessionId)
     
     if (!report) {
