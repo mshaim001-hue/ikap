@@ -23,13 +23,13 @@ const readFile = promisify(fs.readFile)
 const TAX_PDF_TO_PATH = process.env.TAX_PDF_TO_PATH || 
   path.join(__dirname, '..', 'taxpdfto')
 
-// URL Render.com сервиса для налоговых PDF
-const TAX_PDF_SERVICE_URL = process.env.TAX_PDF_SERVICE_URL || ''
+// ikap3 (taxpdfto): по умолчанию https://ikap3-backend-latest.onrender.com
+const TAX_PDF_SERVICE_URL = process.env.TAX_PDF_SERVICE_URL || 'https://ikap3-backend-latest.onrender.com'
 const USE_TAX_PDF_SERVICE_HTTP = !!TAX_PDF_SERVICE_URL
 
 // Логируем режим работы сразу при загрузке модуля
 if (USE_TAX_PDF_SERVICE_HTTP) {
-  console.log(`📡 Tax OCR (Render.com) включен: ${TAX_PDF_SERVICE_URL}`)
+  console.log(`📡 Tax OCR (ikap3/taxpdfto): ${TAX_PDF_SERVICE_URL}`)
 } else {
   console.log('🐍 Tax OCR: используется локальный Python (TAX_PDF_SERVICE_URL не задан)')
 }
@@ -108,69 +108,127 @@ async function parseTaxPdfToTextViaHttp(pdfBuffer, filename, withAnalysis = fals
   const serviceUrl = `${baseUrl}/process${withAnalysis ? '?analyze=true' : ''}`
 
   // Даем достаточно времени, так как PDF могут быть большими, а анализ может занять время
-  const TIMEOUT_MS = withAnalysis ? 1200000 : 600000 // 20 минут для анализа, 10 минут для парсинга
+  const TIMEOUT_MS = withAnalysis ? 1200000 : 600000
+  const MAX_RETRIES = 2
+  const RETRY_DELAY_MS = 3000
 
-  try {
-    const response = await axios.post(serviceUrl, formData, {
-      headers: formData.getHeaders(),
-      timeout: TIMEOUT_MS,
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity
-    })
-
-    if (response.status !== 200) {
-      throw new Error(`Неожиданный статус ответа от tax-ocr-service: ${response.status}`)
-    }
-
-    const data = response.data || {}
+  function parseResponseData(data) {
     const files = Array.isArray(data.files) ? data.files : []
-
-    if (!files.length) {
-      throw new Error('tax-ocr-service вернул пустой результат (нет файлов)')
-    }
-
-    // Ищем текст по имени файла, если совпадает
+    if (!files.length) throw new Error('tax-ocr-service вернул пустой результат (нет файлов)')
     const normalizedName = filename.toLowerCase()
     let fileEntry = files.find(f => (f.filename || '').toLowerCase() === normalizedName)
-
-    if (!fileEntry) {
-      // Если точного совпадения нет – берём первый файл
-      fileEntry = files[0]
-    }
-
-    if (!fileEntry || !fileEntry.text) {
-      throw new Error('tax-ocr-service вернул результат без текста')
-    }
-
+    if (!fileEntry) fileEntry = files[0]
+    if (!fileEntry || !fileEntry.text) throw new Error('tax-ocr-service вернул результат без текста')
     const text = String(fileEntry.text || '').trim()
-    if (!text) {
-      throw new Error('tax-ocr-service вернул пустой текст')
-    }
-
+    if (!text) throw new Error('tax-ocr-service вернул пустой текст')
     const result = { text }
-    
-    // Если был запрошен анализ и он есть в ответе
-    if (withAnalysis && fileEntry.analysis) {
-      result.analysis = String(fileEntry.analysis || '').trim()
-    }
-
+    if (withAnalysis && fileEntry.analysis) result.analysis = String(fileEntry.analysis || '').trim()
     return result
-  } catch (error) {
+  }
+
+  function throwWithLog(error) {
     if (error.response) {
+      if (error.response.status === 404) {
+        console.error(`❌ tax-ocr-service (ikap3) вернул 404. URL: ${serviceUrl}`)
+        console.error(`   Проверьте: 1) сервис ikap3 запущен на Render; 2) маршрут POST /process существует (taxpdfto app.py).`)
+      }
       const errMsg = error.response.data?.error || error.response.statusText || error.message
       console.error('❌ Ошибка tax-ocr-service (HTTP):', error.response.status, errMsg)
       throw new Error(`Ошибка tax-ocr-service (${error.response.status}): ${errMsg}`)
-    } else if (error.code === 'ECONNABORTED' || `${error.message}`.includes('timeout')) {
+    }
+    if (error.code === 'ECONNABORTED' || `${error.message}`.includes('timeout')) {
       console.error(`⏱️ Таймаут запроса к tax-ocr-service после ${TIMEOUT_MS / 1000} секунд`)
       throw new Error(`tax-ocr-service не ответил в течение ${TIMEOUT_MS / 1000} секунд`)
-    } else if (error.request) {
+    }
+    if (error.request) {
       console.error('❌ tax-ocr-service не ответил:', error.message)
       throw new Error(`tax-ocr-service не ответил: ${error.message}`)
-    } else {
-      console.error('❌ Ошибка при вызове tax-ocr-service:', error.message)
-      throw new Error(`Ошибка при вызове tax-ocr-service: ${error.message}`)
+    }
+    console.error('❌ Ошибка при вызове tax-ocr-service:', error.message)
+    throw new Error(`Ошибка при вызове tax-ocr-service: ${error.message}`)
+  }
+
+  const opts = { timeout: TIMEOUT_MS, maxContentLength: Infinity, maxBodyLength: Infinity }
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      if (attempt > 0) {
+        console.log(`🔄 Повтор запроса к tax-ocr-service (${attempt}/${MAX_RETRIES}) через ${RETRY_DELAY_MS / 1000} сек: ${filename}`)
+        await new Promise((r) => setTimeout(r, RETRY_DELAY_MS))
+        const retryForm = new FormData()
+        retryForm.append('files', pdfBuffer, { filename, contentType: 'application/pdf' })
+        const res = await axios.post(serviceUrl, retryForm, { ...opts, headers: retryForm.getHeaders() })
+        if (res.status !== 200) throw new Error(`Неожиданный статус: ${res.status}`)
+        return parseResponseData(res.data || {})
+      }
+      const response = await axios.post(serviceUrl, formData, { ...opts, headers: formData.getHeaders() })
+      if (response.status !== 200) throw new Error(`Неожиданный статус ответа от tax-ocr-service: ${response.status}`)
+      return parseResponseData(response.data || {})
+    } catch (error) {
+      const is404 = error.response && error.response.status === 404
+      if (is404 && attempt < MAX_RETRIES) continue
+      throwWithLog(error)
     }
   }
+  throwWithLog(new Error('Превышено число повторов'))
+}
+
+/**
+ * Отправляет один запрос в ikap3 (taxpdfto) с несколькими PDF — один анализ в списке сервиса.
+ * @param {Array<{buffer: Buffer, filename: string}>} files - массив { buffer, filename }
+ * @param {boolean} withAnalysis - запрашивать анализ от агента
+ * @returns {Promise<{files: Array<{filename: string, text: string, analysis?: string}>}>}
+ */
+async function parseTaxPdfsBatchViaHttp(files, withAnalysis = false) {
+  if (!TAX_PDF_SERVICE_URL || !Array.isArray(files) || files.length === 0) {
+    throw new Error('TAX_PDF_SERVICE_URL не задан или нет файлов для батч-запроса')
+  }
+
+  const formData = new FormData()
+  for (const { buffer, filename } of files) {
+    formData.append('files', buffer, {
+      filename: filename || 'document.pdf',
+      contentType: 'application/pdf'
+    })
+  }
+
+  const baseUrl = TAX_PDF_SERVICE_URL.trim().replace(/\/+$/, '')
+  const serviceUrl = `${baseUrl}/process${withAnalysis ? '?analyze=true' : ''}`
+
+  const TIMEOUT_MS = withAnalysis ? 1200000 : 600000
+  const MAX_RETRIES = 2
+  const RETRY_DELAY_MS = 3000
+
+  const opts = { timeout: TIMEOUT_MS, maxContentLength: Infinity, maxBodyLength: Infinity }
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      if (attempt > 0) {
+        console.log(`🔄 Повтор батч-запроса к taxpdfto (${attempt}/${MAX_RETRIES}) через ${RETRY_DELAY_MS / 1000} сек, файлов: ${files.length}`)
+        await new Promise(r => setTimeout(r, RETRY_DELAY_MS))
+        const retryForm = new FormData()
+        for (const { buffer, filename } of files) {
+          retryForm.append('files', buffer, { filename: filename || 'document.pdf', contentType: 'application/pdf' })
+        }
+        const res = await axios.post(serviceUrl, retryForm, { ...opts, headers: retryForm.getHeaders() })
+        if (res.status !== 200) throw new Error(`Неожиданный статус: ${res.status}`)
+        return res.data || { files: [] }
+      }
+      const response = await axios.post(serviceUrl, formData, { ...opts, headers: formData.getHeaders() })
+      if (response.status !== 200) throw new Error(`Неожиданный статус ответа: ${response.status}`)
+      return response.data || { files: [] }
+    } catch (error) {
+      const is404 = error.response && error.response.status === 404
+      if (is404 && attempt < MAX_RETRIES) continue
+      if (error.response) {
+        console.error(`❌ taxpdfto батч: ${error.response.status}`, error.response.data?.error || error.message)
+      } else {
+        console.error('❌ taxpdfto батч:', error.message)
+      }
+      throw error
+    }
+  }
+  throw new Error('Превышено число повторов батч-запроса к taxpdfto')
 }
 
 /**
@@ -267,6 +325,7 @@ print(text)
 }
 
 module.exports = {
-  parseTaxPdfToText
+  parseTaxPdfToText,
+  parseTaxPdfsBatchViaHttp
 }
 

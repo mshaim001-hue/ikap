@@ -6,7 +6,8 @@
 const axios = require('axios')
 const FormData = require('form-data')
 
-const FINANCIAL_PDF_SERVICE_URL = process.env.FINANCIAL_PDF_SERVICE_URL || ''
+// ikap4 (pdftopng): по умолчанию https://ikap4-backend.onrender.com
+const FINANCIAL_PDF_SERVICE_URL = process.env.FINANCIAL_PDF_SERVICE_URL || 'https://ikap4-backend.onrender.com'
 const USE_FINANCIAL_PDF_SERVICE = !!FINANCIAL_PDF_SERVICE_URL
 
 const POLL_INTERVAL_MS = 3000
@@ -15,9 +16,9 @@ const UPLOAD_TIMEOUT_MS = 120000 // 2 мин на загрузку
 const REQUEST_TIMEOUT_MS = 10000 // 10 сек на каждый poll
 
 if (USE_FINANCIAL_PDF_SERVICE) {
-  console.log(`📡 Financial PDF (pdftopng) включен: ${FINANCIAL_PDF_SERVICE_URL}`)
+  console.log(`📡 Financial PDF (ikap4/pdftopng): ${FINANCIAL_PDF_SERVICE_URL}`)
 } else {
-  console.log('📄 Financial PDF: используется Cloud Run OCR + агент (FINANCIAL_PDF_SERVICE_URL не задан)')
+  console.log('📄 Financial PDF: FINANCIAL_PDF_SERVICE_URL не задан')
 }
 
 /**

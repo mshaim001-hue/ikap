@@ -11,7 +11,7 @@ const FormData = require('form-data')
 const { createDb } = require('./db')
 const { convertPdfsToJson } = require('./pdfConverter')
 const transactionProcessor = require('./transactionProcessor')
-const { parseTaxPdfToText } = require('./taxPdfParser')
+const { parseTaxPdfToText, parseTaxPdfsBatchViaHttp } = require('./taxPdfParser')
 const { USE_FINANCIAL_PDF_SERVICE, analyzeFinancialPdfsViaPdftopng } = require('./financialPdfService')
 try { require('dotenv').config({ path: '.env.local' }) } catch {}
 require('dotenv').config()
@@ -2289,13 +2289,15 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                   if (ikap2Result && ikap2Result.sessionId) {
                     console.log(`✅ Анализ выписок выполнен через ikap2, sessionId: ${ikap2Result.sessionId}`)
                     
-                    // Обновляем отчет в БД результатами от ikap2
-                    // ikap2 сохраняет результаты в своей БД, мы просто обновляем статус
+                    // Общее число файлов по сессии (выписки + налоги + фин. отчётность)
+                    const fileCountRow = await db.prepare('SELECT COUNT(*) as cnt FROM files WHERE session_id = ?').get(session)
+                    const totalFiles = (fileCountRow && fileCountRow.cnt != null) ? Number(fileCountRow.cnt) : filesForIkap2.length
+                    
                     await upsertReport(session, {
                       status: ikap2Result.status || 'generating',
                       reportText: null,
                       reportStructured: null,
-                      filesCount: filesForIkap2.length,
+                      filesCount: totalFiles,
                       filesData: JSON.stringify(filesForIkap2.map(f => ({
                         name: f.originalname,
                         size: f.size,
@@ -2303,6 +2305,13 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                       }))),
                       completed: null,
                       comment: comment || '',
+                      company_bin: bin,
+                      amount: amount,
+                      term: termMonths,
+                      purpose: purpose || null,
+                      name: name,
+                      email: email,
+                      phone: phone,
                     })
                     
                     runningStatementsSessions.delete(session)
@@ -2417,114 +2426,95 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
               })
               
               console.log(`\n📄 Начинаем парсинг ${taxFiles.length} налоговых PDF файлов в TXT...`)
-              
-              // Функция для парсинга одного PDF файла в TXT
-              const parseSingleTaxFile = async (file) => {
-                console.log(`🔄 Парсим PDF: ${file.originalName}`)
-                
-                let pdfBuffer = null
-                
-                // ШАГ 1: Получаем PDF buffer из памяти, локального хранилища или скачиваем
+
+              const USE_TAX_PDF_SERVICE_HTTP = !!process.env.TAX_PDF_SERVICE_URL
+
+              // Получить buffer для одного налогового файла (память → БД → OpenAI)
+              const getBufferForTaxFile = async (file) => {
                 if (file.buffer && Buffer.isBuffer(file.buffer)) {
-                  pdfBuffer = file.buffer
-                  console.log(`✅ Используем PDF buffer из памяти (${pdfBuffer.length} bytes)`)
-                } else {
-                  // Пытаемся прочитать из БД (file_data)
-                  let foundInDB = false
-                  try {
-                    const getFile = db.prepare(`
-                      SELECT file_data, file_path FROM files WHERE file_id = ?
-                    `)
-                    const fileInfo = await getFile.get(file.fileId)
-                    if (fileInfo && fileInfo.file_data) {
-                      // PostgreSQL BYTEA возвращается как Buffer или строка
-                      if (Buffer.isBuffer(fileInfo.file_data)) {
-                        pdfBuffer = fileInfo.file_data
-                      } else if (typeof fileInfo.file_data === 'string') {
-                        // Если это hex строка (начинается с \x)
-                        if (fileInfo.file_data.startsWith('\\x')) {
-                          pdfBuffer = Buffer.from(fileInfo.file_data.slice(2), 'hex')
-                        } else {
-                          pdfBuffer = Buffer.from(fileInfo.file_data, 'binary')
-                        }
-                      } else {
-                        pdfBuffer = Buffer.from(fileInfo.file_data)
-                      }
-                      console.log(`✅ PDF файл прочитан из БД (${pdfBuffer.length} bytes)`)
-                      foundInDB = true
-                    } else if (fileInfo && fileInfo.file_path) {
-                      // Fallback: пытаемся прочитать из файловой системы (для старых файлов)
-                      const filePath = path.join(__dirname, fileInfo.file_path)
-                      if (fs.existsSync(filePath)) {
-                        pdfBuffer = fs.readFileSync(filePath)
-                        console.log(`✅ PDF файл прочитан из файловой системы (fallback, ${pdfBuffer.length} bytes)`)
-                        foundInDB = true
-                      }
-                    }
-                  } catch (dbError) {
-                    console.log(`⚠️ Не удалось прочитать файл из БД:`, dbError.message)
+                  return file.buffer
+                }
+                let foundInDB = false
+                let pdfBuffer = null
+                try {
+                  const fileInfo = await db.prepare('SELECT file_data, file_path FROM files WHERE file_id = ?').get(file.fileId)
+                  if (fileInfo && fileInfo.file_data) {
+                    if (Buffer.isBuffer(fileInfo.file_data)) pdfBuffer = fileInfo.file_data
+                    else if (typeof fileInfo.file_data === 'string') {
+                      pdfBuffer = fileInfo.file_data.startsWith('\\x')
+                        ? Buffer.from(fileInfo.file_data.slice(2), 'hex')
+                        : Buffer.from(fileInfo.file_data, 'binary')
+                    } else pdfBuffer = Buffer.from(fileInfo.file_data)
+                    foundInDB = true
+                  } else if (fileInfo && fileInfo.file_path && fs.existsSync(path.join(__dirname, fileInfo.file_path))) {
+                    pdfBuffer = fs.readFileSync(path.join(__dirname, fileInfo.file_path))
+                    foundInDB = true
                   }
-                  
-                  // Если не нашли в БД, скачиваем из OpenAI (только для старых файлов)
-                  // Локальные файлы (fileId начинается с "local-") не загружаются в OpenAI
-                  if (!foundInDB && !file.fileId.startsWith('local-')) {
-                    try {
-                      console.log(`📥 Скачиваем PDF файл "${file.originalName}" из OpenAI...`)
-                      const pdfFileContent = await openaiClient.files.content(file.fileId)
-                      pdfBuffer = Buffer.from(await pdfFileContent.arrayBuffer())
-                      console.log(`✅ PDF файл скачан (${pdfBuffer.length} bytes)`)
-                    } catch (downloadError) {
-                      throw new Error(`Не удалось скачать файл из OpenAI: ${downloadError.message}`)
-                    }
-                  } else if (!foundInDB && file.fileId.startsWith('local-')) {
-                    throw new Error(`Файл не найден в БД для fileId: ${file.fileId}`)
-                  }
+                } catch (e) { /* ignore */ }
+                if (!foundInDB && !file.fileId.startsWith('local-')) {
+                  const pdfFileContent = await openaiClient.files.content(file.fileId)
+                  pdfBuffer = Buffer.from(await pdfFileContent.arrayBuffer())
+                } else if (!pdfBuffer) {
+                  throw new Error(`Файл не найден: ${file.fileId}`)
                 }
-                
-                // ШАГ 2: Парсим PDF в текстовый формат (ОБЯЗАТЕЛЬНО)
-                // Если используется HTTP сервис, запрашиваем анализ напрямую
-                const USE_TAX_PDF_SERVICE_HTTP = !!process.env.TAX_PDF_SERVICE_URL
-                const parseResult = await parseTaxPdfToText(pdfBuffer, file.originalName, USE_TAX_PDF_SERVICE_HTTP)
-                
-                if (!parseResult || !parseResult.text || parseResult.text.trim().length === 0) {
-                  throw new Error(`Парсинг PDF вернул пустой текст`)
-                }
-                
-                console.log(`✅ PDF "${file.originalName}" распарсен: ${parseResult.text.length} символов`)
-                
-                const result = {
-                  fileName: file.originalName,
-                  text: parseResult.text
-                }
-                
-                // Если получили готовый анализ от taxpdfto, сохраняем его
-                if (parseResult.analysis) {
-                  result.analysis = parseResult.analysis
-                  console.log(`✅ Получен готовый анализ от taxpdfto для "${file.originalName}": ${parseResult.analysis.length} символов`)
-                }
-                
-                return result
+                return pdfBuffer
               }
-              
-              // Парсим все PDF файлы параллельно
-              const parseResults = await Promise.allSettled(
-                taxFiles.map(file => parseSingleTaxFile(file))
-              )
-              
-              // Проверяем результаты парсинга
-              const parsedTexts = []
-              const parseErrors = []
-              
-              parseResults.forEach((result, index) => {
-                if (result.status === 'fulfilled') {
-                  parsedTexts.push(result.value)
-                } else {
-                  const file = taxFiles[index]
-                  const error = `Ошибка парсинга файла "${file.originalName}": ${result.reason?.message || 'Неизвестная ошибка'}`
-                  parseErrors.push(error)
-                  console.error(`❌ ${error}`)
+
+              let parsedTexts = []
+              let parseErrors = []
+
+              if (USE_TAX_PDF_SERVICE_HTTP && taxFiles.length > 0) {
+                // Один запрос в ikap3 на всю заявку — один анализ в списке сервиса
+                const resolved = await Promise.allSettled(
+                  taxFiles.map(async (file) => ({
+                    buffer: await getBufferForTaxFile(file),
+                    filename: file.originalName
+                  }))
+                )
+                const batchFiles = resolved.filter(r => r.status === 'fulfilled' && r.value && r.value.buffer).map(r => r.value)
+                parseErrors = resolved.filter(r => r.status === 'rejected').map(r => `Ошибка получения файла: ${r.reason?.message || 'Неизвестная ошибка'}`)
+
+                if (batchFiles.length > 0) {
+                  console.log(`📤 Один батч-запрос в ikap3 (taxpdfto): ${batchFiles.length} файлов`)
+                  try {
+                    const batchResult = await parseTaxPdfsBatchViaHttp(batchFiles, true)
+                    const files = Array.isArray(batchResult.files) ? batchResult.files : []
+                    parsedTexts = files.map((f) => ({
+                      fileName: f.filename || f.fileName || 'document.pdf',
+                      text: f.text || '',
+                      analysis: f.analysis || null
+                    }))
+                    parsedTexts.forEach((item, i) => {
+                      if (item.analysis) console.log(`✅ Анализ от taxpdfto для "${item.fileName}": ${item.analysis.length} символов`)
+                    })
+                  } catch (batchErr) {
+                    parseErrors.push(`Батч-запрос к ikap3: ${batchErr.message}`)
+                    console.error('❌ Батч taxpdfto:', batchErr.message)
+                  }
                 }
-              })
+              } else {
+                // Пофайловый парсинг (локальный Python или fallback)
+                const parseSingleTaxFile = async (file) => {
+                  console.log(`🔄 Парсим PDF: ${file.originalName}`)
+                  const pdfBuffer = await getBufferForTaxFile(file)
+                  const parseResult = await parseTaxPdfToText(pdfBuffer, file.originalName, false)
+                  if (!parseResult?.text?.trim()) throw new Error('Парсинг PDF вернул пустой текст')
+                  const result = { fileName: file.originalName, text: parseResult.text }
+                  if (parseResult.analysis) result.analysis = parseResult.analysis
+                  return result
+                }
+                const TAX_BATCH_SIZE = 5
+                const runBatch = (batch) => Promise.allSettled(batch.map(file => parseSingleTaxFile(file)))
+                const parseResults = []
+                for (let i = 0; i < taxFiles.length; i += TAX_BATCH_SIZE) {
+                  const batchResults = await runBatch(taxFiles.slice(i, i + TAX_BATCH_SIZE))
+                  parseResults.push(...batchResults)
+                }
+                parseResults.forEach((result, index) => {
+                  if (result.status === 'fulfilled') parsedTexts.push(result.value)
+                  else parseErrors.push(`Ошибка парсинга файла "${taxFiles[index].originalName}": ${result.reason?.message || 'Неизвестная ошибка'}`)
+                })
+              }
               
               if (parsedTexts.length === 0) {
                 const errorMessage = 'Нет файлов для анализа'
@@ -2951,6 +2941,7 @@ const upsertReport = async (sessionId, payload) => {
   const {
     status, reportText, reportStructured, filesCount, filesData,
     completed, comment, openaiResponseId, openaiStatus,
+    company_bin, amount, term, purpose, name, email, phone,
   } = payload
   try {
     const stmt = db.prepare(`
@@ -2972,6 +2963,21 @@ const upsertReport = async (sessionId, payload) => {
       typeof filesCount === 'number' ? filesCount : null, filesData || null,
       completed || null, comment ?? null, openaiResponseId ?? null, openaiStatus ?? null
     )
+    // Заполняем карточку заявки (БИН, сумма, срок, контакт), если переданы
+    const hasCardFields = [company_bin, amount, term, purpose, name, email, phone].some(v => v !== undefined && v !== null)
+    if (hasCardFields) {
+      await db.prepare(`
+        UPDATE reports SET
+          company_bin = COALESCE(?, company_bin),
+          amount = COALESCE(?, amount),
+          term = COALESCE(?, term),
+          purpose = COALESCE(?, purpose),
+          name = COALESCE(?, name),
+          email = COALESCE(?, email),
+          phone = COALESCE(?, phone)
+        WHERE session_id = ?
+      `).run(company_bin ?? null, amount ?? null, term ?? null, purpose ?? null, name ?? null, email ?? null, phone ?? null, sessionId)
+    }
   } catch (error) {
     console.error('❌ Ошибка сохранения отчёта в БД:', error)
   }
@@ -3623,16 +3629,17 @@ app.get('/api/reports/:sessionId', async (req, res) => {
         
         if (ikap2Response.data && ikap2Response.data.ok !== false) {
           // Получили отчет от ikap2
-          // ikap2 возвращает объект отчета напрямую (через ensureHumanReadableReportText)
           const ikap2Report = ikap2Response.data
           
-          // Сохраняем/обновляем отчет в локальной БД для быстрого доступа
+          // Локальные поля (налог и фин. отчётность) — не перезатирать данными от ikap2
+          const localReport = await db.prepare('SELECT company_bin, amount, term, purpose, name, email, phone, files_count, tax_status, tax_report_text, fs_status, fs_report_text, tax_missing_periods, fs_missing_periods FROM reports WHERE session_id = ?').get(sessionId)
+          
           try {
             await upsertReport(sessionId, {
               status: ikap2Report.status || 'generating',
               reportText: ikap2Report.report_text || null,
               reportStructured: ikap2Report.report_structured || null,
-              filesCount: ikap2Report.files_count || null,
+              filesCount: ikap2Report.files_count ?? localReport?.files_count ?? null,
               filesData: ikap2Report.files_data || null,
               completed: ikap2Report.completed_at || ikap2Report.completed,
               comment: ikap2Report.comment || null,
@@ -3642,27 +3649,32 @@ app.get('/api/reports/:sessionId', async (req, res) => {
             console.warn('⚠️ Не удалось сохранить отчет от ikap2 в локальную БД:', dbError.message)
           }
           
-          // Возвращаем отчет от ikap2 (с графиком и всеми данными)
+          // Возвращаем отчёт: выписки от ikap2, карточка и налоги/фин — из локальной БД (если есть)
           return res.json({
             ok: true,
             report: {
               sessionId: ikap2Report.session_id || sessionId,
-              bin: ikap2Report.company_bin,
-              amount: ikap2Report.amount,
-              term: ikap2Report.term,
-              purpose: ikap2Report.purpose,
-              name: ikap2Report.name,
-              email: ikap2Report.email,
-              phone: ikap2Report.phone,
-              filesCount: ikap2Report.files_count,
+              bin: localReport?.company_bin ?? ikap2Report.company_bin,
+              amount: localReport?.amount ?? ikap2Report.amount,
+              term: localReport?.term ?? ikap2Report.term,
+              purpose: localReport?.purpose ?? ikap2Report.purpose,
+              name: localReport?.name ?? ikap2Report.name,
+              email: localReport?.email ?? ikap2Report.email,
+              phone: localReport?.phone ?? ikap2Report.phone,
+              filesCount: localReport?.files_count ?? ikap2Report.files_count,
               status: ikap2Report.status,
               reportText: ikap2Report.report_text,
-              reportStructured: ikap2Report.report_structured, // Это содержит график и структурированные данные
+              reportStructured: ikap2Report.report_structured,
               createdAt: ikap2Report.created_at,
               completedAt: ikap2Report.completed_at || ikap2Report.completed,
               comment: ikap2Report.comment,
-              // Сохраняем поля от ikap2
               filesData: ikap2Report.files_data,
+              taxStatus: localReport?.tax_status,
+              taxReportText: localReport?.tax_report_text,
+              taxMissing: localReport?.tax_missing_periods,
+              fsStatus: localReport?.fs_status,
+              fsReportText: localReport?.fs_report_text,
+              fsMissing: localReport?.fs_missing_periods,
             }
           })
         }

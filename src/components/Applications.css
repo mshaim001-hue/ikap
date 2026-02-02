@@ -736,3 +736,70 @@
   border-radius: 0;
   padding: 24px;
 }
+
+.report-modal-content--wide {
+  max-width: 95vw;
+  width: 960px;
+}
+
+.revenue-chart-container {
+  margin-bottom: 24px;
+  background: white;
+  padding: 20px;
+  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+}
+
+.revenue-chart-container h4 {
+  margin: 0 0 16px 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: #1f2937;
+}
+
+.structured-tables {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.structured-tables .details-report {
+  background: white;
+  padding: 20px;
+  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+}
+
+.structured-tables .details-report h4 {
+  margin: 0 0 12px 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: #374151;
+}
+
+.auto-revenue-table-wrapper {
+  overflow-x: auto;
+}
+
+.auto-revenue-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.auto-revenue-table th,
+.auto-revenue-table td {
+  padding: 10px 12px;
+  text-align: left;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.auto-revenue-table th {
+  font-weight: 600;
+  color: #374151;
+  background: #f8fafc;
+}
+
+.auto-revenue-table tbody tr:hover {
+  background: #f8fafc;
+}

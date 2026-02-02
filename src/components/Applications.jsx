@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useMemo } from 'react'
 import { 
   Calendar, 
   User, 
@@ -16,8 +16,184 @@ import {
   Download,
   Paperclip
 } from 'lucide-react'
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
 import { getApiUrl } from '../utils/api'
 import './Applications.css'
+
+const MONTH_NAMES_SHORT = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
+
+function formatStructuredDate(value) {
+  if (!value) return '—'
+  const valueStr = String(value)
+  const ddmm = valueStr.match(/^(\d{1,2})\.(\d{1,2})\.(\d{2,4})/)
+  if (ddmm) {
+    const [, dd, mm, yy] = ddmm
+    let year = Number(yy)
+    if (String(yy).length === 2) year += 2000
+    const date = new Date(year, Number(mm) - 1, Number(dd))
+    if (!Number.isNaN(date.getTime())) {
+      return date.toLocaleDateString('ru-RU', { year: 'numeric', month: 'short', day: 'numeric' })
+    }
+  }
+  try {
+    const d = new Date(value)
+    if (!Number.isNaN(d.getTime())) return d.toLocaleDateString('ru-RU', { year: 'numeric', month: 'short', day: 'numeric' })
+  } catch (_) {}
+  return value
+}
+
+function RevenueChart({ structuredReport }) {
+  if (!structuredReport?.revenue?.years?.length) return null
+  const chartData = []
+  const allYears = [...new Set(structuredReport.revenue.years.map(y => y.year))].sort()
+  allYears.forEach((year) => {
+    const revenueYear = structuredReport.revenue.years.find(y => y.year === year)
+    if (!revenueYear?.months) return
+    revenueYear.months.forEach((month) => {
+      chartData.push({
+        month: MONTH_NAMES_SHORT[month.monthIndex] ?? month.month,
+        year: year,
+        value: month.value || 0,
+        fullLabel: `${MONTH_NAMES_SHORT[month.monthIndex] ?? month.month} ${year}`,
+      })
+    })
+  })
+  if (chartData.length === 0) return null
+  return (
+    <div className="revenue-chart-container">
+      <h4>Выручка по месяцам</h4>
+      <ResponsiveContainer width="100%" height={360}>
+        <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
+          <CartesianGrid strokeDasharray="3 3" />
+          <XAxis dataKey="fullLabel" angle={-45} textAnchor="end" height={100} interval={0} />
+          <YAxis />
+          <Tooltip formatter={(value) => value.toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} />
+          <Legend />
+          <Bar dataKey="value" fill="#3b82f6" name="Сумма" />
+        </BarChart>
+      </ResponsiveContainer>
+    </div>
+  )
+}
+
+function StatementReportContent({ reportText, reportStructured }) {
+  const structured = useMemo(() => {
+    if (!reportStructured) return null
+    if (typeof reportStructured === 'object') return reportStructured
+    try {
+      return JSON.parse(reportStructured)
+    } catch {
+      return null
+    }
+  }, [reportStructured])
+
+  if (structured) {
+    const autoRevenue = structured.autoRevenuePreview || []
+    const autoNonRevenue = structured.autoNonRevenuePreview || []
+    const agentRevenue = structured.agentReviewedRevenuePreview || []
+    const agentNonRevenue = structured.agentReviewedNonRevenuePreview || []
+    const hasTables = autoRevenue.length > 0 || autoNonRevenue.length > 0 || agentRevenue.length > 0 || agentNonRevenue.length > 0
+    return (
+      <>
+        <RevenueChart structuredReport={structured} />
+        {hasTables && (
+          <div className="structured-tables">
+            {autoRevenue.length > 0 && (
+              <div className="details-report">
+                <h4>Авто: выручка</h4>
+                <div className="auto-revenue-table-wrapper">
+                  <table className="auto-revenue-table">
+                    <thead>
+                      <tr><th>Дата</th><th>Сумма</th><th>Назначение</th><th>Источник</th></tr>
+                    </thead>
+                    <tbody>
+                      {autoRevenue.map((item, i) => (
+                        <tr key={i}>
+                          <td>{formatStructuredDate(item.date)}</td>
+                          <td>{item.amountFormatted || item.amountRaw || '—'}</td>
+                          <td><strong>{item.purpose || '—'}</strong> {item.sender || item.correspondent || ''}</td>
+                          <td>{item.source === 'heuristic' ? 'Авто' : item.source || '—'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+            {agentRevenue.length > 0 && (
+              <div className="details-report">
+                <h4>Проверено агентом: выручка</h4>
+                <div className="auto-revenue-table-wrapper">
+                  <table className="auto-revenue-table">
+                    <thead>
+                      <tr><th>Дата</th><th>Сумма</th><th>Назначение</th><th>Источник</th></tr>
+                    </thead>
+                    <tbody>
+                      {agentRevenue.map((item, i) => (
+                        <tr key={i}>
+                          <td>{formatStructuredDate(item.date)}</td>
+                          <td>{item.amountFormatted || item.amountRaw || '—'}</td>
+                          <td><strong>{item.purpose || '—'}</strong> {item.sender || item.correspondent || ''}</td>
+                          <td>{item.source || 'agent'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+            {agentNonRevenue.length > 0 && (
+              <div className="details-report">
+                <h4>Проверено агентом: не выручка</h4>
+                <div className="auto-revenue-table-wrapper">
+                  <table className="auto-revenue-table">
+                    <thead>
+                      <tr><th>Дата</th><th>Сумма</th><th>Назначение</th><th>Источник</th></tr>
+                    </thead>
+                    <tbody>
+                      {agentNonRevenue.map((item, i) => (
+                        <tr key={i}>
+                          <td>{formatStructuredDate(item.date)}</td>
+                          <td>{item.amountFormatted || item.amountRaw || '—'}</td>
+                          <td><strong>{item.purpose || '—'}</strong> {item.sender || item.correspondent || ''}</td>
+                          <td>{item.source || 'agent'}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </>
+    )
+  }
+
+  const text = reportText || ''
+  const matches = [...text.matchAll(/\n\n={80,}\nОТЧЕТ\s+(\d+)\s+из\s+(\d+)\nФайл:\s*(.+?)\n={80,}\n\n/g)]
+  if (matches.length > 0) {
+    return (
+      <div className="reports-list">
+        {matches.map((match, idx) => {
+          const startIndex = match.index + match[0].length
+          const endIndex = idx < matches.length - 1 ? matches[idx + 1].index : text.length
+          const reportContent = text.substring(startIndex, endIndex).trim()
+          return (
+            <div key={idx} className="report-file-section">
+              <div className="report-file-header">
+                <FileText size={16} />
+                <h4>Отчет {match[1]} из {match[2]}: {match[3]}</h4>
+              </div>
+              <pre className="report-text">{reportContent}</pre>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+  return <pre className="report-text">{text || 'Нет данных'}</pre>
+}
 
 const Applications = () => {
   const [applications, setApplications] = useState([])
@@ -552,7 +728,8 @@ const Applications = () => {
                 {/* Аналитика выписок */}
                 {(() => {
                   const isGenerating = selectedApplication.status === 'generating'
-                  const isCompleted = selectedApplication.status === 'completed' && !!selectedApplication.reportText
+                  const hasReport = !!selectedApplication.reportText || !!selectedApplication.reportStructured
+                  const isCompleted = selectedApplication.status === 'completed' && hasReport
                   const enabled = isCompleted
                   return (
                     <button
@@ -645,10 +822,10 @@ const Applications = () => {
 
             
 
-              {/* Модальное окно для просмотра отчета */}
-              {showStatementsModal && selectedApplication.reportText && (
+              {/* Модальное окно для просмотра отчета (таблица + график как в ikap2 или текст) */}
+              {showStatementsModal && selectedApplication && (selectedApplication.reportText || selectedApplication.reportStructured) && (
                 <div className="report-modal-overlay" onClick={() => setShowStatementsModal(false)}>
-                  <div className="report-modal-content" onClick={(e) => e.stopPropagation()}>
+                  <div className="report-modal-content report-modal-content--wide" onClick={(e) => e.stopPropagation()}>
                     <div className="report-modal-header">
                       <h3>Аналитика выписок</h3>
                       <button
@@ -659,43 +836,10 @@ const Applications = () => {
                       </button>
                     </div>
                     <div className="report-modal-body">
-                      {(() => {
-                        // Парсим объединенный отчет на отдельные отчеты по файлам
-                        const reportText = selectedApplication.reportText || ''
-                        // Разделяем по паттерну "ОТЧЕТ X из Y\nФайл: имя\n===...\n"
-                        const reportSections = reportText.split(/\n\n={80,}\nОТЧЕТ\s+\d+\s+из\s+\d+\nФайл:\s*(.+?)\n={80,}\n\n/)
-                        
-                        if (reportSections.length > 1) {
-                          // Парсим заголовки отдельно
-                          const matches = [...reportText.matchAll(/\n\n={80,}\nОТЧЕТ\s+(\d+)\s+из\s+(\d+)\nФайл:\s*(.+?)\n={80,}\n\n/g)]
-                          
-                          return (
-                            <div className="reports-list">
-                              {matches.map((match, idx) => {
-                                const reportNum = match[1]
-                                const totalNum = match[2]
-                                const fileName = match[3]
-                                const startIndex = match.index + match[0].length
-                                const endIndex = idx < matches.length - 1 ? matches[idx + 1].index : reportText.length
-                                const reportContent = reportText.substring(startIndex, endIndex).trim()
-                                
-                                return (
-                                  <div key={idx} className="report-file-section">
-                                    <div className="report-file-header">
-                                      <FileText size={16} />
-                                      <h4>Отчет {reportNum} из {totalNum}: {fileName}</h4>
-                                    </div>
-                                    <pre className="report-text">{reportContent}</pre>
-                                  </div>
-                                )
-                              })}
-                            </div>
-                          )
-                        } else {
-                          // Если разделителей нет - показываем как есть
-                          return <pre className="report-text">{reportText}</pre>
-                        }
-                      })()}
+                      <StatementReportContent
+                        reportText={selectedApplication.reportText}
+                        reportStructured={selectedApplication.reportStructured}
+                      />
                     </div>
                   </div>
                 </div>
