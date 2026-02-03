@@ -2283,6 +2283,14 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
               let combinedFsReport = fsFileReports.map((fr, idx) => {
                 return `\n\n${'='.repeat(80)}\nОТЧЕТ ${idx + 1} из ${fsFileReports.length}\nФайл: ${fr.fileName}\n${'='.repeat(80)}\n\n${fr.report}`
               }).join('\n\n')
+
+              // Нормализуем markdown-таблицы в отчете по фин. отчетности:
+              // добавляем перевод строки между заголовком и строкой-разделителем,
+              // а также убираем лишние пустые строки внутри таблицы.
+              combinedFsReport = combinedFsReport.replace(
+                /(\|[^\n]+?\|)\s*(\|[-:\s|]+\|)/g,
+                '$1\n$2'
+              )
               
               if (nonPdfFiles.length > 0) {
                 const nonPdfNames = nonPdfFiles.map(f => f.normalized_name).join(', ')
