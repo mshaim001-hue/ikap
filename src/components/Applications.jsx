@@ -17,6 +17,7 @@ import {
   Paperclip
 } from 'lucide-react'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
+import ReactMarkdown from 'react-markdown'
 import { getApiUrl } from '../utils/api'
 import './Applications.css'
 
@@ -86,6 +87,17 @@ function StatementReportContent({ reportText, reportStructured }) {
       return null
     }
   }, [reportStructured])
+
+  // ikap2-формат: revenue, totals, trailing12MonthsRevenue (без autoRevenuePreview) — показываем текст отчёта + график
+  const isIkap2Format = structured && (structured.revenue || structured.totals || structured.trailing12MonthsRevenue) && !(structured.autoRevenuePreview?.length || structured.agentReviewedRevenuePreview?.length)
+  if (isIkap2Format && (reportText || structured)) {
+    return (
+      <>
+        <RevenueChart structuredReport={structured} />
+        {reportText && <pre className="report-text report-text--block">{reportText}</pre>}
+      </>
+    )
+  }
 
   if (structured) {
     const autoRevenue = structured.autoRevenuePreview || []
@@ -856,11 +868,10 @@ const Applications = () => {
                       {(() => {
                         const taxReportText = selectedApplication.taxReportText || ''
                         if (!taxReportText || taxReportText === 'Анализ не готов') {
-                          return <pre className="report-text">Анализ не готов</pre>
+                          return <div className="report-text">Анализ не готов</div>
                         }
-                        
+                        const isMarkdown = /^#|^##|\n##|\|[^\n]+\|\n\|[-:\s|]+\|/.test(taxReportText)
                         const matches = [...taxReportText.matchAll(/\n\n={80,}\nОТЧЕТ\s+(\d+)\s+из\s+(\d+)\nФайл:\s*(.+?)\n={80,}\n\n/g)]
-                        
                         if (matches.length > 0) {
                           return (
                             <div className="reports-list">
@@ -871,22 +882,28 @@ const Applications = () => {
                                 const startIndex = match.index + match[0].length
                                 const endIndex = idx < matches.length - 1 ? matches[idx + 1].index : taxReportText.length
                                 const reportContent = taxReportText.substring(startIndex, endIndex).trim()
-                                
                                 return (
                                   <div key={idx} className="report-file-section">
                                     <div className="report-file-header">
                                       <FileText size={16} />
                                       <h4>Отчет {reportNum} из {totalNum}: {fileName}</h4>
                                     </div>
-                                    <pre className="report-text">{reportContent}</pre>
+                                    {isMarkdown ? (
+                                      <div className="report-markdown"><ReactMarkdown>{reportContent}</ReactMarkdown></div>
+                                    ) : (
+                                      <pre className="report-text">{reportContent}</pre>
+                                    )}
                                   </div>
                                 )
                               })}
                             </div>
                           )
-                        } else {
-                          return <pre className="report-text">{taxReportText}</pre>
                         }
+                        return isMarkdown ? (
+                          <div className="report-markdown"><ReactMarkdown>{taxReportText}</ReactMarkdown></div>
+                        ) : (
+                          <pre className="report-text">{taxReportText}</pre>
+                        )
                       })()}
                     </div>
                   </div>
@@ -904,11 +921,10 @@ const Applications = () => {
                       {(() => {
                         const fsReportText = selectedApplication.fsReportText || ''
                         if (!fsReportText || fsReportText === 'Анализ не готов') {
-                          return <pre className="report-text">Анализ не готов</pre>
+                          return <div className="report-text">Анализ не готов</div>
                         }
-                        
+                        const isMarkdown = /^#|^##|\n##|\|[^\n]+\|\n\|[-:\s|]+\|/.test(fsReportText)
                         const matches = [...fsReportText.matchAll(/\n\n={80,}\nОТЧЕТ\s+(\d+)\s+из\s+(\d+)\nФайл:\s*(.+?)\n={80,}\n\n/g)]
-                        
                         if (matches.length > 0) {
                           return (
                             <div className="reports-list">
@@ -919,22 +935,28 @@ const Applications = () => {
                                 const startIndex = match.index + match[0].length
                                 const endIndex = idx < matches.length - 1 ? matches[idx + 1].index : fsReportText.length
                                 const reportContent = fsReportText.substring(startIndex, endIndex).trim()
-                                
                                 return (
                                   <div key={idx} className="report-file-section">
                                     <div className="report-file-header">
                                       <FileText size={16} />
                                       <h4>Отчет {reportNum} из {totalNum}: {fileName}</h4>
                                     </div>
-                                    <pre className="report-text">{reportContent}</pre>
+                                    {isMarkdown ? (
+                                      <div className="report-markdown"><ReactMarkdown>{reportContent}</ReactMarkdown></div>
+                                    ) : (
+                                      <pre className="report-text">{reportContent}</pre>
+                                    )}
                                   </div>
                                 )
                               })}
                             </div>
                           )
-                        } else {
-                          return <pre className="report-text">{fsReportText}</pre>
                         }
+                        return isMarkdown ? (
+                          <div className="report-markdown"><ReactMarkdown>{fsReportText}</ReactMarkdown></div>
+                        ) : (
+                          <pre className="report-text">{fsReportText}</pre>
+                        )
                       })()}
                     </div>
                   </div>

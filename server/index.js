@@ -9,7 +9,6 @@ const { toFile } = require('openai/uploads')
 const axios = require('axios')
 const FormData = require('form-data')
 const { createDb } = require('./db')
-const { convertPdfsToJson } = require('./pdfConverter')
 const transactionProcessor = require('./transactionProcessor')
 const { parseTaxPdfToText, parseTaxPdfsBatchViaHttp } = require('./taxPdfParser')
 const { USE_FINANCIAL_PDF_SERVICE, analyzeFinancialPdfsViaPdftopng } = require('./financialPdfService')
@@ -59,265 +58,12 @@ const prepareUploadedFiles = (files = []) => {
   return files
 }
 
-/**
- * Логирует, какие данные отправляются в конкретного агента.
- * Чтобы не засорять логи, показываем только последние несколько сообщений и обрезаем текст.
- * @param {string} agentName
- * @param {string} sessionId
- * @param {Array<{role:string, content:any}>} messages
- * @param {object} extra Дополнительная информация (файлы, тип анализа и т.д.)
- */
-function logAgentInput(agentName, sessionId, messages = [], extra = {}) {
-  try {
-    const MAX_MESSAGES = 5
-    const MAX_TEXT = 300
-
-    const tail = (messages || []).slice(-MAX_MESSAGES).map((msg, idx) => {
-      let text = ''
-      if (typeof msg.content === 'string') {
-        text = msg.content
-      } else if (Array.isArray(msg.content)) {
-        text = msg.content
-          .map((c) => (typeof c === 'string' ? c : (c.text || c.input_text || c.output_text || '')))
-          .filter(Boolean)
-          .join(' ')
-      } else if (msg.content && typeof msg.content.text === 'string') {
-        text = msg.content.text
-      }
-      const preview = text ? text.slice(0, MAX_TEXT).replace(/\s+/g, ' ') : ''
-      return {
-        index: messages.length - MAX_MESSAGES + idx + 1,
-        role: msg.role,
-        preview,
-      }
-    })
-
-    console.log(`🧾 Вход для агента "${agentName}" (session=${sessionId})`, {
-      messagesCount: messages?.length || 0,
-      lastMessages: tail,
-      ...extra,
-    })
-  } catch (err) {
-    console.error('⚠️ Не удалось залогировать вход агента:', err.message)
-  }
-}
-
 console.log('Loading Agents SDK...')
-const { codeInterpreterTool, Agent, Runner, MCPServerStdio } = require('@openai/agents')
+const { Agent, Runner, MCPServerStdio } = require('@openai/agents')
 const { z } = require('zod')
 console.log('Agents SDK loaded successfully')
 
 const app = express()
-
-// Конфигурация Cloud Run OCR сервиса
-const PDF_SERVICE_URL = process.env.PDF_SERVICE_URL || ''
-const USE_PDF_SERVICE = !!PDF_SERVICE_URL
-
-if (USE_PDF_SERVICE) {
-  // Нормализуем URL для логирования (убираем trailing slash)
-  const normalizedUrl = PDF_SERVICE_URL.trim().replace(/\/+$/, '')
-  console.log(`📡 Cloud Run OCR сервис настроен: ${normalizedUrl}`)
-  console.log(`📡 Исходный URL (из env): ${PDF_SERVICE_URL}`)
-} else {
-  console.log(`⚠️ Cloud Run OCR сервис не настроен (PDF_SERVICE_URL не установлен)`)
-}
-
-/**
- * Отправляет один батч PDF файлов на Cloud Run OCR сервис
- * @param {Array<{buffer: Buffer, originalName: string}>} batch - Батч PDF файлов
- * @param {string} serviceUrl - URL сервиса
- * @param {number} timeout - Таймаут в миллисекундах
- * @returns {Promise<Object>} JSON ответ от сервиса
- */
-async function sendBatchToOcrService(batch, serviceUrl, timeout) {
-  const formData = new FormData()
-  
-  // Добавляем файлы батча в FormData
-  for (const file of batch) {
-    if (!file.buffer || !Buffer.isBuffer(file.buffer)) {
-      throw new Error(`Файл ${file.originalName} не содержит buffer`)
-    }
-    formData.append('files', file.buffer, {
-      filename: file.originalName,
-      contentType: 'application/pdf'
-    })
-  }
-
-  const batchSize = batch.reduce((sum, f) => sum + f.buffer.length, 0) / 1024 / 1024
-  console.log(`📤 Отправляем батч из ${batch.length} файл(ов) (${batchSize.toFixed(2)} MB) на OCR сервис`)
-
-  const response = await axios.post(serviceUrl, formData, {
-    headers: {
-      ...formData.getHeaders()
-    },
-    timeout: timeout,
-    maxContentLength: Infinity,
-    maxBodyLength: Infinity
-  })
-
-  if (response.status === 200 && response.data) {
-    console.log(`✅ Получен JSON ответ для батча из ${batch.length} файл(ов)`)
-    return response.data
-  } else {
-    throw new Error(`Неожиданный ответ от OCR сервиса: статус ${response.status}`)
-  }
-}
-
-/**
- * Объединяет результаты нескольких батчей в один JSON (как process_multiple_pdfs_to_json в app.py)
- * @param {Array<Object>} batchResults - Массив JSON результатов от каждого батча
- * @returns {Object} Объединенный JSON
- */
-function mergeBatchResults(batchResults) {
-  if (batchResults.length === 0) {
-    throw new Error('Нет результатов для объединения')
-  }
-
-  if (batchResults.length === 1) {
-    return batchResults[0]
-  }
-
-  // Объединяем все страницы и метаданные
-  const allPages = []
-  const allMetadata = {
-    total_files: 0,
-    total_pages: 0,
-    total_text_blocks: 0,
-    files: [],
-    average_confidence: 0.0,
-    description: 'Объединенный OCR результат нескольких PDF файлов. Используйте structured_table для анализа данных.'
-  }
-
-  const allConfidenceScores = []
-
-  for (const result of batchResults) {
-    if (result.pages && Array.isArray(result.pages)) {
-      allPages.push(...result.pages)
-    }
-
-    if (result.metadata) {
-      allMetadata.total_files += result.metadata.total_files || 0
-      allMetadata.total_pages += result.metadata.total_pages || 0
-      allMetadata.total_text_blocks += result.metadata.total_text_blocks || 0
-      
-      if (result.metadata.files && Array.isArray(result.metadata.files)) {
-        allMetadata.files.push(...result.metadata.files)
-      }
-
-      if (result.metadata.average_confidence) {
-        allConfidenceScores.push(result.metadata.average_confidence)
-      }
-    }
-  }
-
-  // Вычисляем среднюю уверенность
-  if (allConfidenceScores.length > 0) {
-    allMetadata.average_confidence = allConfidenceScores.reduce((a, b) => a + b, 0) / allConfidenceScores.length
-  }
-
-  return {
-    pages: allPages,
-    metadata: allMetadata
-  }
-}
-
-/**
- * Отправляет PDF файлы на Cloud Run OCR сервис батчами и получает объединенный JSON ответ
- * Cloud Run имеет лимит ~32MB на запрос, поэтому отправляем по 2-3 файла за раз
- * @param {Array<{buffer: Buffer, originalName: string}>} pdfFiles - Массив PDF файлов с buffer
- * @returns {Promise<Object>} Объединенный JSON ответ от сервиса
- */
-async function sendPdfsToOcrService(pdfFiles) {
-  if (!USE_PDF_SERVICE) {
-    throw new Error('Cloud Run OCR сервис не настроен (PDF_SERVICE_URL не установлен)')
-  }
-
-  if (!pdfFiles || pdfFiles.length === 0) {
-    throw new Error('Нет файлов для отправки на OCR сервис')
-  }
-
-  // Нормализуем URL: убираем все trailing слэши и добавляем один
-  const baseUrl = PDF_SERVICE_URL.trim().replace(/\/+$/, '')
-  const serviceUrl = `${baseUrl}/process`
-  const timeout = 600000 // 10 минут таймаут
-
-  const totalSize = pdfFiles.reduce((sum, f) => sum + f.buffer.length, 0) / 1024 / 1024
-  console.log(`📤 Отправляем ${pdfFiles.length} PDF файл(ов) на OCR сервис: ${serviceUrl}`)
-  console.log(`📦 Общий размер файлов: ${totalSize.toFixed(2)} MB`)
-  console.log(`⏱️ Таймаут запроса: ${timeout / 1000} секунд`)
-
-  // Cloud Run имеет лимит ~32MB на запрос, поэтому разбиваем на батчи
-  // Каждый файл ~4-5MB, отправляем по 2 файла за раз (максимум ~10MB на батч)
-  const MAX_BATCH_SIZE_MB = 25 // Оставляем запас от лимита 32MB
-  const batches = []
-  let currentBatch = []
-  let currentBatchSize = 0
-
-  for (const file of pdfFiles) {
-    const fileSizeMB = file.buffer.length / 1024 / 1024
-    
-    // Если добавление этого файла превысит лимит, начинаем новый батч
-    if (currentBatchSize + fileSizeMB > MAX_BATCH_SIZE_MB && currentBatch.length > 0) {
-      batches.push(currentBatch)
-      currentBatch = [file]
-      currentBatchSize = fileSizeMB
-    } else {
-      currentBatch.push(file)
-      currentBatchSize += fileSizeMB
-    }
-  }
-
-  // Добавляем последний батч
-  if (currentBatch.length > 0) {
-    batches.push(currentBatch)
-  }
-
-  console.log(`📦 Файлы разбиты на ${batches.length} батч(ей) для обхода лимита Cloud Run (32MB)`)
-
-  try {
-    // Отправляем батчи последовательно и собираем результаты
-    const batchResults = []
-    for (let i = 0; i < batches.length; i++) {
-      console.log(`🔄 Обработка батча ${i + 1}/${batches.length}...`)
-      try {
-        const batchResult = await sendBatchToOcrService(batches[i], serviceUrl, timeout)
-        batchResults.push(batchResult)
-      } catch (error) {
-        if (error.response) {
-          const errorMsg = error.response.data?.error || error.response.statusText || 'Неизвестная ошибка'
-          console.error(`❌ OCR сервис вернул ошибку для батча ${i + 1} (${error.response.status}): ${errorMsg}`)
-          throw new Error(`Ошибка OCR сервиса для батча ${i + 1} (${error.response.status}): ${errorMsg}`)
-        } else if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
-          console.error(`⏱️ Таймаут запроса к OCR сервису для батча ${i + 1} после ${timeout / 1000} секунд`)
-          throw new Error(`OCR сервис не ответил в течение ${timeout / 1000} секунд для батча ${i + 1}.`)
-        } else {
-          throw error
-        }
-      }
-    }
-
-    // Объединяем результаты всех батчей
-    console.log(`🔗 Объединяем результаты ${batchResults.length} батч(ей)...`)
-    const mergedResult = mergeBatchResults(batchResults)
-    console.log(`✅ Объединенный JSON создан: ${mergedResult.pages?.length || 0} страниц, ${mergedResult.metadata?.total_files || 0} файлов`)
-    
-    return mergedResult
-  } catch (error) {
-    if (error.request && !error.response) {
-      // Запрос был отправлен, но ответа не получено
-      console.error(`❌ OCR сервис не ответил: ${error.message}`)
-      console.error(`🔍 Проверьте доступность сервиса: ${baseUrl}/health`)
-      throw new Error(`OCR сервис не ответил: ${error.message}. Проверьте доступность сервиса.`)
-    } else if (!error.response && !error.request) {
-      // Ошибка при настройке запроса
-      console.error(`❌ Ошибка при отправке на OCR сервис: ${error.message}`)
-      throw new Error(`Ошибка при отправке на OCR сервис: ${error.message}`)
-    } else {
-      // Ошибка уже обработана выше
-      throw error
-    }
-  }
-}
 
 const resumePendingAnalyses = async () => {
   try {
@@ -880,105 +626,6 @@ initSchema().catch(e => {
   console.error('❌ DB init failed', e)
 })
 
-// Проверка и установка Python зависимостей для парсера налоговых PDF
-async function checkAndInstallPythonDeps() {
-  if (process.env.NODE_ENV !== 'production') {
-    // В development пропускаем автоматическую установку
-    return
-  }
-  
-  const { spawn } = require('child_process')
-  const path = require('path')
-  const fs = require('fs')
-  
-  const taxpdftoPath = process.env.TAX_PDF_TO_PATH || path.join(__dirname, '..', 'taxpdfto')
-  const installScriptPath = path.join(taxpdftoPath, 'install_deps.sh')
-  
-  // Проверяем, существует ли скрипт установки
-  if (!fs.existsSync(installScriptPath)) {
-    console.log('⚠️ Скрипт установки зависимостей не найден, пропускаем проверку')
-    return
-  }
-  
-  // Проверяем, установлен ли pdfplumber
-  const pythonExecutable = process.env.PYTHON_PATH || 'python3'
-  
-  return new Promise((resolve) => {
-    const checkProcess = spawn(pythonExecutable, ['-c', 'import pdfplumber; print("OK")'], {
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
-      stdio: ['pipe', 'pipe', 'pipe']
-    })
-    
-    let stdout = ''
-    let stderr = ''
-    
-    checkProcess.stdout.on('data', (data) => {
-      stdout += data.toString()
-    })
-    
-    checkProcess.stderr.on('data', (data) => {
-      stderr += data.toString()
-    })
-    
-    checkProcess.on('close', (code) => {
-      if (code === 0 && stdout.includes('OK')) {
-        console.log('✅ Python зависимости для парсера налоговых PDF установлены')
-        resolve()
-      } else {
-        console.log('⚠️ Python зависимости не найдены, пытаемся установить...')
-        
-        // Пытаемся установить зависимости
-        const installProcess = spawn('bash', [installScriptPath], {
-          cwd: taxpdftoPath,
-          env: { ...process.env, PYTHONUNBUFFERED: '1' },
-          stdio: ['pipe', 'pipe', 'pipe']
-        })
-        
-        let installStdout = ''
-        let installStderr = ''
-        
-        installProcess.stdout.on('data', (data) => {
-          installStdout += data.toString()
-          console.log(`[Python deps install] ${data.toString().trim()}`)
-        })
-        
-        installProcess.stderr.on('data', (data) => {
-          installStderr += data.toString()
-          console.log(`[Python deps install] ${data.toString().trim()}`)
-        })
-        
-        installProcess.on('close', (installCode) => {
-          if (installCode === 0) {
-            console.log('✅ Python зависимости установлены при старте сервера')
-          } else {
-            console.warn('⚠️ Не удалось установить Python зависимости при старте, парсинг может не работать')
-          }
-          resolve()
-        })
-        
-        installProcess.on('error', (error) => {
-          console.warn(`⚠️ Ошибка запуска скрипта установки: ${error.message}`)
-          resolve()
-        })
-      }
-    })
-    
-    checkProcess.on('error', (error) => {
-      console.warn(`⚠️ Python не найден или недоступен: ${error.message}`)
-      resolve()
-    })
-  })
-}
-
-// Запускаем проверку зависимостей асинхронно (не блокируем старт сервера)
-setImmediate(() => {
-  checkAndInstallPythonDeps().catch(err => {
-    console.warn('⚠️ Ошибка при проверке Python зависимостей:', err.message)
-  })
-})
-
-// SQLite миграции удалены: проект использует только PostgreSQL
-
 // Вспомогательные функции для работы с БД
 const saveMessageToDB = async (sessionId, role, content, messageOrder) => {
   try {
@@ -1183,125 +830,10 @@ const runningStatementsSessions = new Set()
 const runningTaxSessions = new Set()
 const runningFsSessions = new Set()
 
-// Code Interpreter без предустановленных файлов
-// Файлы будут добавляться динамически
-const codeInterpreter = codeInterpreterTool({
-  container: { type: 'auto' }
-})
-
 const InvestmentAgentSchema = z.object({
   amount: z.number().nullable().optional(),
   term_months: z.number().nullable().optional(),
   completed: z.boolean().nullable().optional()
-})
-
-// Financial Analyst Agent для создания отчета
-const financialAnalystAgent = new Agent({
-  name: 'Financial Analyst',
-  instructions: `Ты финансовый аналитик iKapitalist. Твоя ГЛАВНАЯ ЦЕЛЬ - получить чистую выручку от реализации товаров и услуг за последние 12 месяцев, с учётом всех валютных счетов, и убедиться, соответствует ли компания требованиям платформы (оборот менее 60 млн тенге за 12 месяцев).
-
-📊 **РЕЗЮМЕ ЗАЯВКИ**
-- Компания: [БИН]
-- Запрашиваемая сумма: [сумма] KZT
-- Срок: [месяцев]
-- Цель: [цель финансирования]
-- Контакты: [имя, фамилия, email, телефон]
-
-🎯 **ОСНОВНЫЕ НАПРАВЛЕНИЯ РАБОТЫ**
-
-1. 💰 **ВЫЯВЛЕНИЕ ОБОРОТОВ ПО РЕАЛИЗАЦИИ**
-   Цель: Определить реальные поступления от продажи товаров и услуг.
-   
-   Что нужно сделать:
-   - Из всех банковских выписок (тенговых, долларовых, рублёвых, евро-счетов) выделить операции, которые являются оплатой от клиентов за товары или услуги
-   - Убедиться, что эти операции — реальная выручка, а не внутренние переводы или кредиты
-   - Идентифицировать операции по реализации по характерным признакам (назначение платежа, контрагенты, регулярность)
-
-2. 🚫 **ИСКЛЮЧЕНИЕ НЕРЕЛЕВАНТНЫХ ОПЕРАЦИЙ**
-   Цель: Очистить данные, чтобы осталась только "чистая реализация".
-   
-   Убрать:
-   - Возвраты товаров и услуг (обратные платежи клиентам)
-   - Займы, кредиты, пополнения, переводы между своими счетами
-   - Ошибочные зачисления
-   - Любые поступления, не связанные с продажей
-   - Внутренние переводы между счетами компании
-
-3. 💱 **УЧЁТ ВАЛЮТНЫХ СЧЕТОВ**
-   Цель: Корректно включить валютную выручку в общую сумму.
-   
-   Что нужно сделать:
-   - По каждому валютному счёту определить поступления (USD, EUR, RUB и т.д.)
-   - Конвертировать поступления в тенге по курсу на дату поступления (курс можно брать из данных банка или официального НБ РК)
-   - НЕ учитывать внутренние переводы между валютными и тенговыми счетами (чтобы не задвоить выручку)
-   - Если часть валюты отправляется поставщику напрямую — эти суммы не считать выручкой (так как они не доходят до компании в тенге)
-
-4. 📅 **ГРУППИРОВКА ПО МЕСЯЦАМ**
-   Цель: Посмотреть динамику продаж во времени.
-   
-   Что нужно сделать:
-   - ПРОАНАЛИЗИРУЙ ВСЕ выписки: они могут быть как от одного так и от нескольких казахстанских банков.
-   - ОБЪЕДИНИ данные из всех выписок для создания непрерывного периода за последние 12 месяцев
-   - Сгруппировать чистые поступления (в пересчёте в тенге) по месяцам за последние 12 месяцев
-   - Рассчитать итоговую сумму реализации за период
-   - Создать таблицу динамики по месяцам
-   - ВАЖНО: Убедись, что ты используешь данные за 12 месяцев, даже если они из разных выписок
-
-5. 📈 **ФОРМИРОВАНИЕ СВОДНОГО АНАЛИЗА**
-   Цель: Подготовить понятный итог для отчёта или проверки.
-   
-   Что нужно сделать:
-   - Сделать сводную таблицу с колонками:
-     * Месяц
-     * Реализация (тенге + валютные счета в пересчёте)
-     * Возвраты
-     * Чистая реализация
-   - По желанию добавить график (динамика по месяцам)
-
-6. ⚖️ **СРАВНЕНИЕ С ТРЕБОВАНИЯМИ ПЛАТФОРМЫ**
-   Цель: Проверить соответствие лимиту.
-   
-   Что нужно сделать:
-   - Сравнить общую чистую реализацию за 12 месяцев с порогом 60 млн тенге
-   - Если меньше — компания НЕ соответствует требованиям платформы
-   - Если больше или равна — компания соответствует требованиям
-
-📋 **СТРУКТУРА ОТЧЕТА**
-
-**АНАЛИЗ ПО БАНКАМ:**
-Для каждого банка:
-- Название банка и период(ы) выписки
-- Выявленные операции по реализации (сумма в тенге)
-- Исключённые операции (с обоснованием)
-- Чистая выручка по банку (с учётом всех выписок этого банка)
-
-**СВОДНЫЙ АНАЛИЗ:**
-- Общая чистая выручка за 12 месяцев: [сумма] KZT
-- Динамика по месяцам (таблица)
-- Соответствие требованиям платформы: ✅/❌
-
-**РЕКОМЕНДАЦИЯ:**
-- ✅ СООТВЕТСТВУЕТ требованиям (выручка ≥ 60 млн KZT)
-- ❌ НЕ СООТВЕТСТВУЕТ требованиям (выручка < 60 млн KZT)
-
----
-
-ВАЖНО:
-- Используй Code Interpreter для анализа всех файлов
-- Банковские выписки могут быть очень большими (100+ страниц) - ОБЯЗАТЕЛЬНО прочитай ВЕСЬ файл целиком, все страницы!
-- Не ограничивайся первыми страницами - используй инструменты для чтения всего PDF файла
-- Если файл большой, обработай его по частям, но проанализируй ВСЕ данные из ВСЕХ страниц
-- Проверь самую раннюю и самую позднюю дату операций в файле - убедись, что покрыт полный период
-- Все суммы указывай в KZT с разделителями тысяч
-- Будь точным с датами и периодами
-- При объединении данных из разных выписок убедись, что нет дублирования операций
-- Проверь, что покрыты полные 12 месяцев (может потребоваться использовать данные из разных выписок)
-- Выдели ключевые моменты жирным шрифтом
-- Используй эмодзи для визуальной структуры
-- ФОКУСИРУЙСЯ на чистой выручке от реализации, а не на общих оборотах`,
-  model: 'gpt-5',
-  tools: [codeInterpreter],
-  modelSettings: { store: true }
 })
 
 const investmentAgent = new Agent({
@@ -1440,10 +972,8 @@ const getAgentSettings = async (agentName) => {
   }
 }
 
-// Функция для инициализации настроек по умолчанию
-const initDefaultAgentSettings = async () => {
-  try {
-    const defaultInstructions = `Ты информационный агент краудфандинговой платформы iKapitalist.
+// Единый промпт по умолчанию для Information Agent (БД при старте + fallback в createInformationAgent)
+const DEFAULT_INFORMATION_AGENT_INSTRUCTIONS = `Ты информационный агент краудфандинговой платформы iKapitalist.
 
 Твоя цель — через короткий диалог помочь человеку понять возможности платформы и мягко подвести к подаче заявки, чтобы затем подключить инвестиционного агента. Общайся на русском языке, поддерживай живой диалог вопрос–ответ. Отвечай естественно, как будто ты знаешь всю информацию о платформе. НИКОГДА не упоминай MCP, инструменты или технические детали - просто отвечай на вопросы.
 
@@ -1490,6 +1020,8 @@ const initDefaultAgentSettings = async () => {
 - НИКОГДА не представляйся ("Я — информационный агент", "Я агент iKapitalist" и т.п.) - это КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО
 - Если пользователь отклоняет подачу заявки, уважай решение и предложи вернуться позже.`
 
+const initDefaultAgentSettings = async () => {
+  try {
     // Обновляем инструкции в БД, даже если запись уже существует
     const upsertSettings = db.prepare(`
       INSERT INTO agent_settings (agent_name, instructions, role, functionality, model, model_settings, default_annual_rate, updated_at)
@@ -1505,7 +1037,7 @@ const initDefaultAgentSettings = async () => {
     `)
     await upsertSettings.run(
       'Information Agent',
-      defaultInstructions,
+      DEFAULT_INFORMATION_AGENT_INSTRUCTIONS,
       'Информационный консультант',
       'Отвечает на вопросы о платформе iKapitalist, помогает пользователям понять возможности платформы и подводит к подаче заявки',
       'gpt-5-mini',
@@ -1531,21 +1063,7 @@ const CACHE_TTL = 60000 // 1 минута кэш
 
 const createInformationAgent = async () => {
   const settings = await getAgentSettings('Information Agent')
-  const instructions = settings?.instructions || `Ты информационный агент краудфандинговой платформы iKapitalist.
-
-Твоя цель — через короткий диалог помочь человеку понять возможности платформы и мягко подвести к подаче заявки, чтобы затем подключить инвестиционного агента. Общайся на русском языке, поддерживай живой диалог вопрос–ответ. Отвечай естественно, как будто ты знаешь всю информацию о платформе. НИКОГДА не упоминай MCP, инструменты или технические детали - просто отвечай на вопросы.
-
-КРИТИЧЕСКИ ВАЖНО - ЗАПРЕТ НА ПРИВЕТСТВИЯ:
-- НИКОГДА не здоровайся ("Здравствуйте", "Привет" и т.п.)
-- НИКОГДА не представляйся ("Я — информационный агент", "Я агент iKapitalist" и т.п.)
-- Пользователь УЖЕ знает, кто ты - просто отвечай на вопросы
-
-АНАЛИЗ ИСТОРИИ ДИАЛОГА:
-- ПЕРЕД каждым ответом анализируй всю историю диалога
-- Если пользователь уже ответил на вопрос или выбрал опцию - НЕ повторяй этот вопрос
-- Продолжай диалог с того места, где остановились
-
-Если клиент хочет расчёт займа, ОБЯЗАТЕЛЬНО вызови инструмент \`ikapitalist_calculate_loan_schedule\` с правильными параметрами. НИКОГДА не упоминай, что используешь инструменты - просто рассчитай и покажи результат.`
+  const instructions = settings?.instructions || DEFAULT_INFORMATION_AGENT_INSTRUCTIONS
   const model = settings?.model || 'gpt-5-mini'
   
   // Безопасный парсинг model_settings
@@ -1811,14 +1329,7 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
 
     console.log(`💰 Запуск Investment Agent...`)
     console.log(`📚 История для агента: ${history.length} сообщений`)
-    logAgentInput(agentName, session, history, {
-      filesInSession: (sessionFiles.get(session) || []).map(f => ({
-        name: f.originalName,
-        size: f.size,
-        mime: f.mimetype,
-      })),
-    })
-      
+
       const startTime = Date.now()
       console.log(`⏱️ Начало выполнения агента: ${new Date().toLocaleTimeString()}`)
       
@@ -2437,7 +1948,7 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                 let foundInDB = false
                 let pdfBuffer = null
                 try {
-                  const fileInfo = await db.prepare('SELECT file_data, file_path FROM files WHERE file_id = ?').get(file.fileId)
+                  const fileInfo = await db.prepare('SELECT file_data FROM files WHERE file_id = ?').get(file.fileId)
                   if (fileInfo && fileInfo.file_data) {
                     if (Buffer.isBuffer(fileInfo.file_data)) pdfBuffer = fileInfo.file_data
                     else if (typeof fileInfo.file_data === 'string') {
@@ -2445,9 +1956,6 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                         ? Buffer.from(fileInfo.file_data.slice(2), 'hex')
                         : Buffer.from(fileInfo.file_data, 'binary')
                     } else pdfBuffer = Buffer.from(fileInfo.file_data)
-                    foundInDB = true
-                  } else if (fileInfo && fileInfo.file_path && fs.existsSync(path.join(__dirname, fileInfo.file_path))) {
-                    pdfBuffer = fs.readFileSync(path.join(__dirname, fileInfo.file_path))
                     foundInDB = true
                   }
                 } catch (e) { /* ignore */ }
@@ -2673,7 +2181,7 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
             
             const fsFileReports = [] // Массив отчетов для всех файлов
             
-            // Обрабатываем PDF файлы: pdftopng (приоритет) или Cloud Run OCR + агент
+            // Обрабатываем PDF файлы через ikap4 (pdftopng)
             if (pdfFiles.length > 0) {
               const sessionFilesData = sessionFiles.get(session) || []
               const pdfFilesWithBuffers = pdfFiles
@@ -2919,16 +2427,6 @@ async function proxyAnalysisToIkap2(sessionId, comment, metadata, files) {
 }
 
 const activeAnalysisSessions = new Set()
-let analysisRunner = null
-
-const createTransactionClassifierAgent = () => {
-  return new Agent({
-    name: 'Revenue Classifier',
-    instructions: transactionProcessor.transactionClassifierInstructions,
-    model: 'gpt-5.1',
-    modelSettings: { store: true },
-  })
-}
 
 const summariseFilesForLog = (files = []) =>
   files.map((file, index) => ({
@@ -3063,546 +2561,13 @@ app.post('/api/analysis', upload.array('files'), handleMulterError, async (req, 
     }
   }
 
-  if (activeAnalysisSessions.has(sessionId)) {
-    console.warn('⚠️ Попытка запустить анализ для сессии, которая уже обрабатывается:', sessionId)
-    return res.status(409).json({
-      ok: false,
-      code: 'ANALYSIS_IN_PROGRESS',
-      message: 'Анализ для этой сессии уже выполняется. Пожалуйста, подождите.',
-      sessionId,
-    })
-  }
-
-  activeAnalysisSessions.add(sessionId)
-
-  if (!files.length) {
-    console.error('❌ Запрос без файлов, возвращаем 400')
-    activeAnalysisSessions.delete(sessionId)
-    return res.status(400).json({
-      ok: false,
-      code: 'FILES_REQUIRED',
-      message: 'Необходимо прикрепить хотя бы один файл для анализа.',
-    })
-  }
-
-  if (!comment || comment.length === 0) {
-    console.error('❌ Запрос без комментария, возвращаем 400')
-    activeAnalysisSessions.delete(sessionId)
-    return res.status(400).json({
-      ok: false,
-      code: 'COMMENT_REQUIRED',
-      message: 'Укажите важные данные',
-    })
-  }
-
-  try {
-    conversationHistory.set(sessionId, conversationHistory.get(sessionId) || [])
-    const history = conversationHistory.get(sessionId)
-
-    if (comment) {
-      history.push({ role: 'user', content: [{ type: 'text', text: comment }] })
-      await saveMessageToDB(sessionId, 'user', [{ type: 'text', text: comment }], history.length)
-    }
-
-    const attachments = []
-    const pdfFiles = []
-    const otherFiles = []
-    let extractedTransactions = []
-    let convertedExcels = []
-
-    // Разделяем файлы на PDF и остальные
-    for (const file of files) {
-      const isPdf = file.mimetype === 'application/pdf' || file.originalname.toLowerCase().endsWith('.pdf')
-      if (isPdf) {
-        pdfFiles.push(file)
-      } else {
-        otherFiles.push(file)
-      }
-    }
-
-    // Обрабатываем PDF файлы: конвертируем в JSON
-    if (pdfFiles.length > 0) {
-      console.log(`🔄 Конвертирую ${pdfFiles.length} PDF файл(ов) в JSON...`)
-      try {
-        const pdfDataForConversion = pdfFiles.map(file => ({
-          buffer: file.buffer,
-          filename: file.originalname
-        }))
-        
-        const jsonResults = await convertPdfsToJson(pdfDataForConversion)
-        console.log(`✅ Конвертация завершена: получено ${jsonResults.length} результат(ов)`)
-
-        // Объединяем все транзакции из всех файлов
-        const allTransactions = []
-        const allMetadata = []
-        const collectedExcels = []
-        
-        for (const result of jsonResults) {
-          if (result.error) {
-            console.warn(`⚠️ Ошибка при конвертации файла ${result.source_file}: ${result.error}`)
-            continue
-          }
-          
-          if (result.transactions && Array.isArray(result.transactions)) {
-            allTransactions.push(...result.transactions)
-          }
-          
-          if (result.metadata) {
-            allMetadata.push({
-              source_file: result.source_file,
-              ...result.metadata
-            })
-          }
-
-          if (result.excel_file && typeof result.excel_file === 'object' && result.excel_file.base64) {
-            try {
-              const excelBuffer = Buffer.from(result.excel_file.base64, 'base64')
-              collectedExcels.push({
-                name: result.excel_file.name || (result.source_file ? result.source_file.replace(/\.pdf$/i, '.xlsx') : 'converted.xlsx'),
-                size: result.excel_file.size || excelBuffer.length,
-                mime: result.excel_file.mime || 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-                source: result.source_file,
-                base64: result.excel_file.base64,
-              })
-            } catch (excelError) {
-              console.error('⚠️ Не удалось обработать Excel файл из результата конвертации', excelError)
-            }
-          }
-        }
-        
-        console.log(`📊 Итого собрано транзакций: ${allTransactions.length}`)
-        convertedExcels = collectedExcels
-
-        const transactionsWithInternalIds = transactionProcessor.attachInternalTransactionIds(allTransactions, sessionId)
-        extractedTransactions = transactionsWithInternalIds
-
-        // Создаем JSON файл с результатами конвертации
-        const jsonData = {
-          metadata: allMetadata,
-          transactions: transactionsWithInternalIds,
-          summary: {
-            total_files: pdfFiles.length,
-            total_transactions: allTransactions.length,
-            converted_at: new Date().toISOString()
-          }
-        }
-
-        const jsonString = JSON.stringify(jsonData, null, 2)
-        const jsonBuffer = Buffer.from(jsonString, 'utf-8')
-        const jsonFilename = `converted_statements_${Date.now()}.json`
-
-        // Загружаем JSON файл в OpenAI Files API
-        let jsonFileId = null
-        if (allTransactions.length > 0) {
-          try {
-            const uploadedJsonFile = await openaiClient.files.create({
-              file: await toFile(jsonBuffer, jsonFilename, { type: 'application/json' }),
-              purpose: 'assistants',
-            })
-            
-            jsonFileId = uploadedJsonFile.id
-            console.log('✅ JSON файл загружен в OpenAI', {
-              fileId: jsonFileId,
-              filename: uploadedJsonFile.filename,
-              size: jsonBuffer.length,
-              transactions: allTransactions.length,
-            })
-
-            // Сохраняем JSON файл в БД
-            try {
-              await saveFileToDatabase(jsonBuffer, sessionId, jsonFileId, jsonFilename, 'application/json')
-              console.log(`💾 JSON файл сохранен в БД: ${jsonFilename}`)
-            } catch (dbError) {
-              console.error('⚠️ Не удалось сохранить JSON файл в БД, продолжаем работу', dbError)
-            }
-
-            // Обновляем категорию файла
-            try {
-              await saveFileToDB(
-                sessionId,
-                jsonFileId,
-                jsonFilename,
-                jsonBuffer.length,
-                'application/json',
-                'converted_statement',
-                null
-              )
-            } catch (error) {
-              console.error('⚠️ Не удалось обновить категорию JSON файла в БД, продолжаем работу', error)
-            }
-
-            attachments.push({
-              file_id: jsonFileId,
-              original_filename: jsonFilename,
-              is_converted: true,
-              source_files: pdfFiles.map(f => f.originalname),
-              transaction_count: allTransactions.length
-            })
-          } catch (uploadError) {
-            console.error('❌ Ошибка загрузки JSON файла в OpenAI:', uploadError.message)
-            if (jsonBuffer.length < 100000) {
-              console.warn('⚠️ Используем fallback: вставляем JSON в промпт (файл меньше 100KB)')
-              attachments.push({
-                is_converted: true,
-                source_files: pdfFiles.map(f => f.originalname),
-                json_data: jsonString,
-                transaction_count: allTransactions.length
-              })
-            } else {
-              throw new Error(`Не удалось загрузить JSON файл (${jsonBuffer.length} bytes) в OpenAI. Файл слишком большой для вставки в промпт.`)
-            }
-          }
-        } else {
-          attachments.push({
-            is_converted: true,
-            source_files: pdfFiles.map(f => f.originalname),
-            transaction_count: 0
-          })
-        }
-      } catch (conversionError) {
-        console.error('❌ Ошибка конвертации PDF в JSON:', conversionError.message)
-        throw new Error(`Не удалось конвертировать PDF файлы: ${conversionError.message}`)
-      }
-    }
-
-    // Обрабатываем остальные файлы (не PDF)
-    for (const file of otherFiles) {
-
-      const uploadedFile = await openaiClient.files.create({
-        file: await toFile(file.buffer, file.originalname, { type: file.mimetype }),
-        purpose: 'assistants',
-      })
-
-      console.log('✅ Файл загружен в OpenAI', {
-        fileId: uploadedFile.id,
-        filename: uploadedFile.filename,
-        purpose: uploadedFile.purpose,
-      })
-
-      // Сохраняем файл в БД
-      try {
-        await saveFileToDatabase(file.buffer, sessionId, uploadedFile.id, file.originalname, file.mimetype)
-        console.log(`💾 Файл сохранен в БД: ${file.originalname}`)
-      } catch (dbError) {
-        console.error('⚠️ Не удалось сохранить файл в БД, продолжаем работу', dbError)
-      }
-
-      const category = categorizeUploadedFile(file.originalname, file.mimetype)
-      try {
-        await saveFileToDB(
-          sessionId,
-          uploadedFile.id,
-          file.originalname,
-          file.size,
-          file.mimetype,
-          category,
-          null
-        )
-      } catch (error) {
-        console.error('⚠️ Не удалось обновить категорию файла в БД, продолжаем работу', error)
-      }
-
-      attachments.push({
-        file_id: uploadedFile.id,
-        original_filename: file.originalname,
-      })
-    }
-
-    const filesDataJson = JSON.stringify(
-      files.map((file) => ({
-        name: file.originalname,
-        size: file.size,
-        mime: file.mimetype,
-      }))
-    )
-
-    try {
-      await upsertReport(sessionId, {
-        status: 'generating',
-        reportText: null,
-        reportStructured: null,
-        filesCount: files.length,
-        filesData: filesDataJson,
-        completed: null,
-        comment,
-      })
-    } catch (error) {
-      console.error('⚠️ Не удалось создать запись отчёта перед анализом', error)
-    }
-
-    const transactionsWithIds = Array.isArray(extractedTransactions) ? extractedTransactions : []
-
-    const { obviousRevenue, obviousNonRevenue, needsReview } = transactionProcessor.splitTransactionsByConfidence(transactionsWithIds)
-    const classificationStats = {
-      totalTransactions: transactionsWithIds.length,
-      autoRevenue: obviousRevenue.length,
-      autoNonRevenue: obviousNonRevenue.length,
-      agentReviewed: needsReview.length,
-    }
-
-    console.log('🧮 Подготовка операций перед классификацией', {
-      sessionId,
-      ...classificationStats,
-    })
-
-    // Асинхронная обработка классификации
-    ;(async () => {
-      try {
-        let runResult = null
-        let rawNewItems = []
-        let classificationEntries = []
-
-        if (needsReview.length > 0) {
-          if (!analysisRunner) {
-            analysisRunner = new Runner({})
-          }
-          const classifierAgent = createTransactionClassifierAgent()
-          const agentInput = [{
-            role: 'user',
-            content: [{
-              type: 'input_text',
-              text: transactionProcessor.buildClassifierPrompt(needsReview),
-            }],
-          }]
-
-          console.log('🤖 Запускаем классификатор операций через Runner (async)', {
-            sessionId,
-            needsReview: needsReview.length,
-          })
-
-          runResult = await analysisRunner.run(classifierAgent, agentInput)
-
-          rawNewItems = Array.isArray(runResult.newItems)
-            ? runResult.newItems.map((item) => item?.rawItem || item)
-            : []
-
-          const historyLengthBefore = history.length
-          if (rawNewItems.length > 0) {
-            history.push(...rawNewItems)
-          }
-
-          for (let index = 0; index < rawNewItems.length; index += 1) {
-            const item = rawNewItems[index]
-            const role = item?.role
-            if (role === 'assistant' || role === 'user') {
-              try {
-                await saveMessageToDB(sessionId, role, item.content, historyLengthBefore + index + 1)
-              } catch (dbError) {
-                if (dbError.code === 'XX000' || dbError.message?.includes('db_termination') || dbError.message?.includes('shutdown')) {
-                  console.error('⚠️ БД соединение разорвано при сохранении сообщения агента. Продолжаем работу без сохранения в БД.')
-                } else {
-                  console.error('⚠️ Ошибка сохранения сообщения агента в БД (продолжаем работу):', dbError.message)
-                }
-              }
-            }
-          }
-
-          let finalOutputText = ''
-          if (typeof runResult.finalOutput === 'string') {
-            finalOutputText = runResult.finalOutput.trim()
-          } else if (runResult.finalOutput && typeof runResult.finalOutput === 'object' && typeof runResult.finalOutput.text === 'string') {
-            finalOutputText = runResult.finalOutput.text.trim()
-          }
-
-          if (!finalOutputText) {
-            finalOutputText =
-              transactionProcessor.extractAssistantAnswer(rawNewItems) ||
-              transactionProcessor.extractAssistantAnswer(Array.isArray(runResult.history) ? runResult.history : []) ||
-              ''
-          }
-
-          classificationEntries = transactionProcessor.parseClassifierResponse(finalOutputText)
-
-          console.log('🗂️ Результаты классификации от агента', {
-            sessionId,
-            parsedTransactions: classificationEntries.length,
-            responseId: runResult.lastResponseId,
-          })
-        }
-
-        const decisionsMap = new Map()
-        for (const entry of classificationEntries) {
-          if (!entry || !entry.id) continue
-          const key = String(entry.id)
-          const isRevenue =
-            entry.is_revenue ??
-            entry.isRevenue ??
-            entry.revenue ??
-            (entry.label === 'revenue')
-          decisionsMap.set(key, {
-            isRevenue: Boolean(isRevenue),
-            reason: entry.reason || entry.explanation || '',
-          })
-        }
-
-        const reviewedRevenue = []
-        const reviewedNonRevenue = []
-
-        for (const transaction of needsReview) {
-          const decision =
-            decisionsMap.get(String(transaction._ikap_tx_id)) ||
-            decisionsMap.get(transaction._ikap_tx_id)
-          const isRevenue = decision ? decision.isRevenue : false
-          const reason =
-            decision?.reason ||
-            (decision ? '' : 'нет решения от агента, по умолчанию не выручка')
-
-          const enriched = {
-            ...transaction,
-            _ikap_classification_source: decision ? 'agent' : 'agent_missing',
-            _ikap_classification_reason: reason,
-          }
-
-          if (isRevenue) {
-            reviewedRevenue.push(enriched)
-          } else {
-            reviewedNonRevenue.push(enriched)
-          }
-        }
-
-        // Объединяем транзакции и сортируем по датам
-        const finalNonRevenueTransactions = [...obviousNonRevenue, ...reviewedNonRevenue]
-          .sort((a, b) => {
-            const dateA = transactionProcessor.extractTransactionDate(a)
-            const dateB = transactionProcessor.extractTransactionDate(b)
-            if (!dateA && !dateB) return 0
-            if (!dateA) return 1
-            if (!dateB) return -1
-            return dateA.getTime() - dateB.getTime()
-          })
-        const finalRevenueTransactions = [...obviousRevenue, ...reviewedRevenue]
-          .sort((a, b) => {
-            const dateA = transactionProcessor.extractTransactionDate(a)
-            const dateB = transactionProcessor.extractTransactionDate(b)
-            if (!dateA && !dateB) return 0
-            if (!dateA) return 1
-            if (!dateB) return -1
-            return dateA.getTime() - dateB.getTime()
-          })
-
-        const sortedObviousRevenue = [...obviousRevenue].sort((a, b) => {
-          const dateA = transactionProcessor.extractTransactionDate(a)
-          const dateB = transactionProcessor.extractTransactionDate(b)
-          if (!dateA && !dateB) return 0
-          if (!dateA) return 1
-          if (!dateB) return -1
-          return dateA.getTime() - dateB.getTime()
-        })
-
-        const structuredSummary = transactionProcessor.buildStructuredSummary({
-          revenueTransactions: finalRevenueTransactions,
-          nonRevenueTransactions: finalNonRevenueTransactions,
-          stats: {
-            ...classificationStats,
-            agentDecisions: decisionsMap.size,
-            unresolved: Math.max(0, needsReview.length - decisionsMap.size),
-          },
-          autoRevenuePreview: transactionProcessor.buildTransactionsPreview(sortedObviousRevenue, { limit: 10000 }),
-          convertedExcels,
-        })
-
-        const completedAt = new Date().toISOString()
-        const finalReportPayload = JSON.stringify(structuredSummary, null, 2)
-        const formattedReportText = transactionProcessor.formatReportAsText(structuredSummary)
-        const openaiStatus =
-          needsReview.length === 0 ? 'skipped' : decisionsMap.size > 0 ? 'completed' : 'partial'
-
-        await upsertReport(sessionId, {
-          status: 'completed',
-          reportText: formattedReportText,
-          reportStructured: finalReportPayload,
-          filesCount: files.length,
-          filesData: filesDataJson,
-          completed: completedAt,
-          comment,
-          openaiResponseId: runResult?.lastResponseId || null,
-          openaiStatus,
-        })
-
-        console.log('📦 Классификация операций завершена (async)', {
-          sessionId,
-          durationMs: Date.now() - startedAt.getTime(),
-          totalTransactions: transactionsWithIds.length,
-          autoRevenue: obviousRevenue.length,
-          autoNonRevenue: obviousNonRevenue.length,
-          reviewedByAgent: needsReview.length,
-          agentDecisions: decisionsMap.size,
-        })
-      } catch (streamError) {
-        console.error('❌ Ошибка в фоне при обработке классификации', {
-          sessionId,
-          error: streamError.message,
-        })
-        try {
-          await upsertReport(sessionId, {
-            status: 'failed',
-            reportText: streamError.message,
-            reportStructured: null,
-            filesCount: files.length,
-            filesData: filesDataJson,
-            completed: new Date().toISOString(),
-            comment,
-            openaiResponseId: null,
-            openaiStatus: 'failed',
-          })
-        } catch (dbError) {
-          console.error('⚠️ Не удалось зафиксировать ошибку в БД (async)', dbError)
-        }
-      } finally {
-        activeAnalysisSessions.delete(sessionId)
-      }
-    })().catch((unhandled) => {
-      console.error('❌ Необработанная ошибка фоновой классификации', {
-        sessionId,
-        error: unhandled?.message || unhandled,
-      })
-      activeAnalysisSessions.delete(sessionId)
-    })
-
-    const progress = await getSessionProgress(sessionId)
-
-    return res.status(202).json({
-      ok: true,
-      sessionId,
-      status: 'generating',
-      openaiStatus: 'generating',
-      message: 'Анализ запущен. Обновите историю позже, чтобы увидеть результат.',
-      data: {
-        progress,
-      },
-      completed: false,
-    })
-  } catch (error) {
-    console.error('❌ Ошибка анализа выписок', {
-      sessionId,
-      error: error.message,
-      stack: error.stack,
-    })
-
-    activeAnalysisSessions.delete(sessionId)
-
-    try {
-      await upsertReport(sessionId, {
-        status: 'failed',
-        reportText: error.message,
-        reportStructured: null,
-        filesCount: files.length,
-        filesData: JSON.stringify(summariseFilesForLog(files)),
-        completed: new Date().toISOString(),
-        comment,
-        openaiStatus: 'failed',
-      })
-    } catch (dbError) {
-      console.error('⚠️ Не удалось зафиксировать ошибку в БД', dbError)
-    }
-
-    return res.status(500).json({
-      ok: false,
-      code: 'ANALYSIS_FAILED',
-      message: 'Не удалось завершить анализ выписок. Проверьте логи на сервере.',
-      error: error.message,
-    })
-  }
+  // Без ikap2 анализ выписок не выполняется (локальный путь удалён)
+  return res.status(503).json({
+    ok: false,
+    code: 'IKAP2_REQUIRED',
+    message: 'Для анализа банковских выписок настройте IKAP2_BACKEND_URL (https://ikap2-backend-latest.onrender.com).',
+    sessionId,
+  })
 })
 
 // Эндпоинт для получения финансового отчета
@@ -3925,7 +2890,7 @@ app.get('/api/files/:fileId/download', async (req, res) => {
   try {
     // Получаем файл из БД (включая file_data)
     const getFile = db.prepare(`
-      SELECT file_id, original_name, mime_type, file_data, file_path
+      SELECT file_id, original_name, mime_type, file_data
       FROM files 
       WHERE file_id = ?
     `)
@@ -3961,45 +2926,11 @@ app.get('/api/files/:fileId/download', async (req, res) => {
         console.error(`⚠️ Ошибка чтения файла из БД:`, readError.message)
       }
     }
-    
-    // Fallback: пытаемся прочитать из файловой системы (для старых файлов)
-    if (!buffer && file.file_path) {
-      const filePath = path.join(__dirname, file.file_path)
-      if (fs.existsSync(filePath)) {
-        try {
-          buffer = fs.readFileSync(filePath)
-          console.log(`✅ Файл прочитан из файловой системы (fallback): ${filePath}`)
-        } catch (readError) {
-          console.error(`⚠️ Ошибка чтения файла из файловой системы:`, readError.message)
-        }
-      }
-    }
-    
-    // Fallback: пытаемся загрузить из OpenAI (только для старых файлов с OpenAI fileId)
-    // Локальные файлы (fileId начинается с "local-") не загружаются в OpenAI
-    if (!buffer && !fileId.startsWith('local-')) {
-      try {
-        console.log(`⚠️ Пытаемся загрузить файл из OpenAI как fallback...`)
-        const fileContent = await openaiClient.files.content(fileId)
-        buffer = Buffer.from(await fileContent.arrayBuffer())
-        console.log(`✅ Файл загружен из OpenAI (fallback)`)
-      } catch (openaiError) {
-        console.error(`❌ Ошибка загрузки файла из OpenAI:`, openaiError.message)
-        // Если это ошибка о purpose 'assistants', сообщаем об этом
-        if (openaiError.message?.includes('Not allowed to download files of purpose: assistants')) {
-          return res.status(500).json({
-            ok: false,
-            message: 'Файл недоступен для скачивания. Файл не найден в БД.'
-          })
-        }
-        throw openaiError
-      }
-    }
-    
+
     if (!buffer) {
       return res.status(404).json({
         ok: false,
-        message: 'Файл не найден в БД, файловой системе или OpenAI'
+        message: 'Файл не найден в БД'
       })
     }
     
@@ -4535,7 +3466,6 @@ app.listen(PORT, () => {
   console.log(`[server] NODE_ENV: ${process.env.NODE_ENV || 'development'}`)
   console.log(`[server] API key present: ${!!process.env.OPENAI_API_KEY}`)
   console.log(`[server] Database: ${process.env.DATABASE_URL ? 'configured' : 'missing'}`)
-  console.log(`[server] PDF_SERVICE_URL: ${process.env.PDF_SERVICE_URL ? 'configured' : 'missing'}`)
 })
 
 // Keep server alive

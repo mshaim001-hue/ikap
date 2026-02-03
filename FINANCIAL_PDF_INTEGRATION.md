@@ -16,10 +16,9 @@
 ### ikap
 - `FINANCIAL_PDF_SERVICE_URL` — URL pdftopng (уже в render.yaml)
 
-## Приоритет
+## Настройка ikap
 
-1. **FINANCIAL_PDF_SERVICE_URL** — если задан, используется pdftopng
-2. **PDF_SERVICE_URL** — fallback на Cloud Run OCR + агент
+Используется только **FINANCIAL_PDF_SERVICE_URL** (pdftopng). Если не задан — анализ финансовой отчётности недоступен.
 
 ## Формат ответа pdftopng
 
