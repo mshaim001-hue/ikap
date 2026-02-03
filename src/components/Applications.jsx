@@ -18,6 +18,7 @@ import {
 } from 'lucide-react'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
 import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { getApiUrl } from '../utils/api'
 import './Applications.css'
 
@@ -888,7 +889,7 @@ const Applications = () => {
                                       <h4>Отчет {reportNum} из {totalNum}: {fileName}</h4>
                                     </div>
                                     <div className="report-markdown">
-                                      <ReactMarkdown>{reportContent}</ReactMarkdown>
+                                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{reportContent}</ReactMarkdown>
                                     </div>
                                   </div>
                                 )
@@ -898,7 +899,7 @@ const Applications = () => {
                         }
                         return (
                           <div className="report-markdown">
-                            <ReactMarkdown>{taxReportText}</ReactMarkdown>
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{taxReportText}</ReactMarkdown>
                           </div>
                         )
                       })()}
@@ -938,7 +939,7 @@ const Applications = () => {
                                       <h4>Отчет {reportNum} из {totalNum}: {fileName}</h4>
                                     </div>
                                     <div className="report-markdown">
-                                      <ReactMarkdown>{reportContent}</ReactMarkdown>
+                                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{reportContent}</ReactMarkdown>
                                     </div>
                                   </div>
                                 )
@@ -948,7 +949,7 @@ const Applications = () => {
                         }
                         return (
                           <div className="report-markdown">
-                            <ReactMarkdown>{fsReportText}</ReactMarkdown>
+                            <ReactMarkdown remarkPlugins={[remarkGfm]}>{fsReportText}</ReactMarkdown>
                           </div>
                         )
                       })()}
