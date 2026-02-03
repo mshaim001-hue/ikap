@@ -870,7 +870,6 @@ const Applications = () => {
                         if (!taxReportText || taxReportText === 'Анализ не готов') {
                           return <div className="report-text">Анализ не готов</div>
                         }
-                        const isMarkdown = /^#|^##|\n##|\|[^\n]+\|\n\|[-:\s|]+\|/.test(taxReportText)
                         const matches = [...taxReportText.matchAll(/\n\n={80,}\nОТЧЕТ\s+(\d+)\s+из\s+(\d+)\nФайл:\s*(.+?)\n={80,}\n\n/g)]
                         if (matches.length > 0) {
                           return (
@@ -888,21 +887,19 @@ const Applications = () => {
                                       <FileText size={16} />
                                       <h4>Отчет {reportNum} из {totalNum}: {fileName}</h4>
                                     </div>
-                                    {isMarkdown ? (
-                                      <div className="report-markdown"><ReactMarkdown>{reportContent}</ReactMarkdown></div>
-                                    ) : (
-                                      <pre className="report-text">{reportContent}</pre>
-                                    )}
+                                    <div className="report-markdown">
+                                      <ReactMarkdown>{reportContent}</ReactMarkdown>
+                                    </div>
                                   </div>
                                 )
                               })}
                             </div>
                           )
                         }
-                        return isMarkdown ? (
-                          <div className="report-markdown"><ReactMarkdown>{taxReportText}</ReactMarkdown></div>
-                        ) : (
-                          <pre className="report-text">{taxReportText}</pre>
+                        return (
+                          <div className="report-markdown">
+                            <ReactMarkdown>{taxReportText}</ReactMarkdown>
+                          </div>
                         )
                       })()}
                     </div>
@@ -923,7 +920,6 @@ const Applications = () => {
                         if (!fsReportText || fsReportText === 'Анализ не готов') {
                           return <div className="report-text">Анализ не готов</div>
                         }
-                        const isMarkdown = /^#|^##|\n##|\|[^\n]+\|\n\|[-:\s|]+\|/.test(fsReportText)
                         const matches = [...fsReportText.matchAll(/\n\n={80,}\nОТЧЕТ\s+(\d+)\s+из\s+(\d+)\nФайл:\s*(.+?)\n={80,}\n\n/g)]
                         if (matches.length > 0) {
                           return (
@@ -941,21 +937,19 @@ const Applications = () => {
                                       <FileText size={16} />
                                       <h4>Отчет {reportNum} из {totalNum}: {fileName}</h4>
                                     </div>
-                                    {isMarkdown ? (
-                                      <div className="report-markdown"><ReactMarkdown>{reportContent}</ReactMarkdown></div>
-                                    ) : (
-                                      <pre className="report-text">{reportContent}</pre>
-                                    )}
+                                    <div className="report-markdown">
+                                      <ReactMarkdown>{reportContent}</ReactMarkdown>
+                                    </div>
                                   </div>
                                 )
                               })}
                             </div>
                           )
                         }
-                        return isMarkdown ? (
-                          <div className="report-markdown"><ReactMarkdown>{fsReportText}</ReactMarkdown></div>
-                        ) : (
-                          <pre className="report-text">{fsReportText}</pre>
+                        return (
+                          <div className="report-markdown">
+                            <ReactMarkdown>{fsReportText}</ReactMarkdown>
+                          </div>
                         )
                       })()}
                     </div>
