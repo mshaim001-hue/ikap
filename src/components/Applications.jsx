@@ -918,6 +918,68 @@ const Applications = () => {
                     <div className="report-modal-body">
                       {(() => {
                         const fsReportText = selectedApplication.fsReportText || ''
+                        const fsReportStructuredRaw = selectedApplication.fsReportStructured
+
+                        // Если есть структурированные данные от ikap4 — рендерим таблицу как в UI pdftopng
+                        let structured = null
+                        if (fsReportStructuredRaw) {
+                          if (typeof fsReportStructuredRaw === 'object') {
+                            structured = fsReportStructuredRaw
+                          } else {
+                            try {
+                              structured = JSON.parse(fsReportStructuredRaw)
+                            } catch (_) {
+                              structured = null
+                            }
+                          }
+                        }
+
+                        if (structured && Array.isArray(structured.table) && Array.isArray(structured.years) && structured.table.length > 0 && structured.years.length > 0) {
+                          const years = structured.years
+                          const rows = structured.table
+                          const summary = structured.summary || ''
+
+                          return (
+                            <>
+                              {summary && (
+                                <div className="report-text" style={{ marginBottom: 16 }}>
+                                  {summary}
+                                </div>
+                              )}
+                              <div className="table-wrap">
+                                <table className="auto-revenue-table">
+                                  <thead>
+                                    <tr>
+                                      <th>Показатель</th>
+                                      {years.map((y) => (
+                                        <th key={y}>{y}</th>
+                                      ))}
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {rows.map((row, idx) => (
+                                      <tr key={idx}>
+                                        <td>{row.indicator || ''}</td>
+                                        {years.map((y) => {
+                                          const v = row.values?.[y]
+                                          return (
+                                            <td key={y}>
+                                              {typeof v === 'number'
+                                                ? v.toLocaleString('ru-RU', { maximumFractionDigits: 0 })
+                                                : v ?? '—'}
+                                            </td>
+                                          )
+                                        })}
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </>
+                          )
+                        }
+
+                        // Фоллбек на текстовый отчёт (markdown), если structured нет
                         if (!fsReportText || fsReportText === 'Анализ не готов') {
                           return <div className="report-text">Анализ не готов</div>
                         }

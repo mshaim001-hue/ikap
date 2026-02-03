@@ -462,6 +462,7 @@ async function initSchema() {
       ALTER TABLE reports ADD COLUMN IF NOT EXISTS tax_missing_periods TEXT;
       
       ALTER TABLE reports ADD COLUMN IF NOT EXISTS fs_report_text TEXT;
+      ALTER TABLE reports ADD COLUMN IF NOT EXISTS fs_report_structured TEXT;
       ALTER TABLE reports ADD COLUMN IF NOT EXISTS fs_status TEXT DEFAULT 'pending';
       ALTER TABLE reports ADD COLUMN IF NOT EXISTS fs_missing_periods TEXT;
       ALTER TABLE reports ADD COLUMN IF NOT EXISTS comment TEXT;
@@ -2245,7 +2246,7 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
               if (USE_FINANCIAL_PDF_SERVICE && pdfFilesWithBuffers.length > 0) {
                 console.log(`\n📄 Отправляем ${pdfFilesWithBuffers.length} PDF на ikap4 (pdftopng, фин. отчётность)...`)
                 try {
-                  const { report } = await analyzeFinancialPdfsViaPdftopng(pdfFilesWithBuffers)
+                  const { report, table, years, summary } = await analyzeFinancialPdfsViaPdftopng(pdfFilesWithBuffers)
                   pdfFilesWithBuffers.forEach((f, idx) => {
                     fsFileReports.push({
                       fileId: f.fileId,
@@ -2284,9 +2285,8 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                 return `\n\n${'='.repeat(80)}\nОТЧЕТ ${idx + 1} из ${fsFileReports.length}\nФайл: ${fr.fileName}\n${'='.repeat(80)}\n\n${fr.report}`
               }).join('\n\n')
 
-              // Нормализуем markdown-таблицы в отчете по фин. отчетности:
-              // 1) добавляем перевод строки между заголовком и строкой-разделителем;
-              // 2) убираем пустые строки между строками таблицы, чтобы строки шли подряд.
+              // Нормализуем markdown-таблицы в текстовом отчете (для совместимости),
+              // но основной источник таблицы для фронта — это fs_report_structured (JSON).
               combinedFsReport = combinedFsReport.replace(
                 /(\|[^\n]+?\|)\s*(\|[-:\s|]+\|)/g,
                 '$1\n$2'
@@ -2303,7 +2303,17 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
               
               // Сохраняем объединенный отчет в БД
               console.log(`💾 Сохраняем ${fsFileReports.length} финансовых отчетов в БД...`)
-              await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_status = 'completed' WHERE session_id = ?`).run(combinedFsReport, session)
+              let fsStructured = null
+              try {
+                fsStructured = JSON.stringify({ table: table || [], years: years || [], summary: summary || '' })
+              } catch (e) {
+                console.warn('⚠️ Не удалось сериализовать fs_report_structured:', e.message)
+              }
+              await db.prepare(`UPDATE reports SET fs_report_text = ?, fs_report_structured = ?, fs_status = 'completed' WHERE session_id = ?`).run(
+                combinedFsReport,
+                fsStructured,
+                session
+              )
               console.log(`✅ Финансовые отчеты сгенерированы для всех ${fsFileReports.length} файлов`)
             } else if (fsFileIds.length > 0) {
               // Есть файлы, но не удалось их обработать
@@ -2652,7 +2662,7 @@ app.get('/api/reports/:sessionId', async (req, res) => {
           const ikap2Report = ikap2Response.data
           
           // Локальные поля (налог и фин. отчётность) — не перезатирать данными от ikap2
-          const localReport = await db.prepare('SELECT company_bin, amount, term, purpose, name, email, phone, files_count, tax_status, tax_report_text, fs_status, fs_report_text, tax_missing_periods, fs_missing_periods FROM reports WHERE session_id = ?').get(sessionId)
+          const localReport = await db.prepare('SELECT company_bin, amount, term, purpose, name, email, phone, files_count, tax_status, tax_report_text, fs_status, fs_report_text, fs_report_structured, tax_missing_periods, fs_missing_periods FROM reports WHERE session_id = ?').get(sessionId)
           
           try {
             await upsertReport(sessionId, {
@@ -2694,6 +2704,7 @@ app.get('/api/reports/:sessionId', async (req, res) => {
               taxMissing: localReport?.tax_missing_periods,
               fsStatus: localReport?.fs_status,
               fsReportText: localReport?.fs_report_text,
+              fsReportStructured: localReport?.fs_report_structured,
               fsMissing: localReport?.fs_missing_periods,
             }
           })
@@ -2747,6 +2758,7 @@ app.get('/api/reports/:sessionId', async (req, res) => {
         taxMissing: formattedReport.tax_missing_periods,
         fsStatus: formattedReport.fs_status,
         fsReportText: formattedReport.fs_report_text,
+        fsReportStructured: formattedReport.fs_report_structured,
         fsMissing: formattedReport.fs_missing_periods,
         openaiResponseId: formattedReport.openai_response_id,
         openaiStatus: formattedReport.openai_status,
@@ -3016,7 +3028,7 @@ app.get('/api/reports', async (req, res) => {
       SELECT session_id, company_bin, amount, term, purpose, name, email, phone, 
              status, files_count, created_at, completed_at,
              tax_status, fs_status, report_text, report_structured,
-             openai_response_id, openai_status, tax_report_text, fs_report_text,
+             openai_response_id, openai_status, tax_report_text, fs_report_text, fs_report_structured,
              tax_missing_periods, fs_missing_periods
       FROM reports 
       ORDER BY created_at DESC
@@ -3050,6 +3062,7 @@ app.get('/api/reports', async (req, res) => {
         openaiStatus: r.openai_status,
         taxReportText: r.tax_report_text,
         fsReportText: r.fs_report_text,
+        fsReportStructured: r.fs_report_structured,
         taxMissing: r.tax_missing_periods,
         fsMissing: r.fs_missing_periods,
       }))
