@@ -1979,21 +1979,51 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                     filename: file.originalName
                   }))
                 )
-                const batchFiles = resolved.filter(r => r.status === 'fulfilled' && r.value && r.value.buffer).map(r => r.value)
-                parseErrors = resolved.filter(r => r.status === 'rejected').map(r => `Ошибка получения файла: ${r.reason?.message || 'Неизвестная ошибка'}`)
+                const batchFiles = resolved
+                  .filter(r => r.status === 'fulfilled' && r.value && r.value.buffer)
+                  .map(r => r.value)
+                parseErrors = resolved
+                  .filter(r => r.status === 'rejected')
+                  .map(r => `Ошибка получения файла: ${r.reason?.message || 'Неизвестная ошибка'}`)
 
                 if (batchFiles.length > 0) {
                   console.log(`📤 Один батч-запрос в ikap3 (taxpdfto): ${batchFiles.length} файлов`)
                   try {
                     const batchResult = await parseTaxPdfsBatchViaHttp(batchFiles, true)
+
+                    // ✅ Основной путь: используем итоговый анализ от ikap3 (analysis_text),
+                    // который совпадает с тем, что отображается в UI taxpdfto.
+                    if (batchResult && typeof batchResult.analysis_text === 'string' && batchResult.analysis_text.trim()) {
+                      const aiAnalysis = batchResult.analysis_text.trim()
+                      console.log(`📊 Получен итоговый налоговый анализ от ikap3 (длина: ${aiAnalysis.length} символов)`)
+
+                      try {
+                        await db.prepare(`
+                          UPDATE reports
+                          SET tax_report_text = ?, tax_status = 'completed'
+                          WHERE session_id = ?
+                        `).run(aiAnalysis, session)
+                        console.log('✅ Налоговый отчет (analysis_text) сохранен в БД')
+                      } catch (dbError) {
+                        console.error('❌ Ошибка сохранения налогового отчета (analysis_text) в БД:', dbError.message)
+                      }
+
+                      // История и структурированные данные уже сохранены в taxpdfto (ikap3),
+                      // поэтому здесь можно завершить налоговый анализ для данной сессии.
+                      return
+                    }
+
+                    // Fallback: старый путь через per-file analysis, если analysis_text отсутствует
                     const files = Array.isArray(batchResult.files) ? batchResult.files : []
                     parsedTexts = files.map((f) => ({
                       fileName: f.filename || f.fileName || 'document.pdf',
                       text: f.text || '',
                       analysis: f.analysis || null
                     }))
-                    parsedTexts.forEach((item, i) => {
-                      if (item.analysis) console.log(`✅ Анализ от taxpdfto для "${item.fileName}": ${item.analysis.length} символов`)
+                    parsedTexts.forEach((item) => {
+                      if (item.analysis) {
+                        console.log(`✅ Анализ от taxpdfto для "${item.fileName}": ${item.analysis.length} символов`)
+                      }
                     })
                   } catch (batchErr) {
                     parseErrors.push(`Батч-запрос к ikap3: ${batchErr.message}`)
