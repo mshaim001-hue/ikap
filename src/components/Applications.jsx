@@ -44,6 +44,63 @@ function formatStructuredDate(value) {
   return value
 }
 
+/** Парсит блок "Финансовые показатели" из текста отчёта, когда бэк не прислал fs_report_structured. */
+function parseFsTableFromText(text) {
+  if (!text || typeof text !== 'string') return null
+  const idx = text.indexOf('Финансовые показатели')
+  if (idx === -1) return null
+  let block = text.slice(idx + 'Финансовые показатели'.length).trim()
+  // Ограничиваем блок до следующего крупного заголовка или конца
+  const nextSection = block.search(/\n\n[A-ZА-Я][a-zа-яё]*:/)
+  if (nextSection > 0) block = block.slice(0, nextSection)
+  const lines = block.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+
+  let years = []
+  const table = []
+  let headerFound = false
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    // Заголовок: "Показатель	2024	2023" или "| Показатель | 2024 | 2023 | 2022 |"
+    if (!headerFound && (line.includes('Показатель') || line.startsWith('|'))) {
+      const cells = line.split(/\t|\s*\|\s*/).map((c) => c.trim()).filter(Boolean)
+      if (cells[0] === 'Показатель' || cells[0] === '') {
+        const first = cells[0] === 'Показатель' ? cells.slice(1) : cells
+        years = first.filter((c) => /^\d{4}$/.test(c) || c === '—' || c === '-')
+        if (years.length === 0) years = first.filter((c) => c && c !== 'Показатель')
+        headerFound = true
+      }
+      continue
+    }
+    if (!headerFound) continue
+
+    // Строки вида "| A | 1 | 2 | | B | 3 | 4 |" — разбиваем на две строки таблицы
+    const rowParts = line.split(/\s*\|\s*\|\s*/).map((p) => p.trim()).filter(Boolean)
+    for (const part of rowParts) {
+      const cells = part.split(/\t|\s*\|\s*/).map((c) => c.trim()).filter(Boolean)
+      if (cells.length < 2) continue
+      const indicator = cells[0]
+      if (!indicator || /^\d{4}$/.test(indicator)) continue
+      const values = {}
+      years.forEach((y, j) => {
+        const raw = cells[j + 1]
+        if (raw === '—' || raw === '-' || raw === '' || raw == null) {
+          values[y] = null
+        } else {
+          const num = Number(String(raw).replace(/\s/g, ''))
+          values[y] = Number.isFinite(num) ? num : raw
+        }
+      })
+      table.push({ indicator, values })
+    }
+  }
+
+  if (years.length === 0 || table.length === 0) return null
+  const summaryMatch = text.match(/Краткий анализ\s*[\r\n]+([^\n]+(?:\n(?!Финансовые показатели)[^\n]+)*)/i)
+  const summary = summaryMatch ? summaryMatch[1].trim() : ''
+  return { table, years, summary }
+}
+
 function RevenueChart({ structuredReport }) {
   if (!structuredReport?.revenue?.years?.length) return null
   const chartData = []
@@ -927,10 +984,18 @@ const Applications = () => {
                             structured = fsReportStructuredRaw
                           } else {
                             try {
-                              structured = JSON.parse(fsReportStructuredRaw)
+                              structured = JSON.parse(String(fsReportStructuredRaw))
                             } catch (_) {
                               structured = null
                             }
+                          }
+                        }
+
+                        // Фоллбек: парсим таблицу из текста, если структура пустая (бэк не прислал или старый отчёт)
+                        if ((!structured || !structured.table?.length || !structured.years?.length) && fsReportText && fsReportText.includes('Финансовые показатели')) {
+                          const parsed = parseFsTableFromText(fsReportText)
+                          if (parsed && parsed.table?.length > 0 && parsed.years?.length > 0) {
+                            structured = parsed
                           }
                         }
 
