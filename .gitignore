@@ -19,3 +19,5 @@ temp_parsing/
 
 # Uploaded files storage
 server/uploads/
+dist/
+node_modules/.package-lock.json
