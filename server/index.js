@@ -2243,10 +2243,16 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                 .filter(Boolean)
 
               // Финансовая отчётность отправляется только в ikap4 (pdftopng). Агенты в ikap не используются.
+              let fsTable = []
+              let fsYears = []
+              let fsSummary = ''
               if (USE_FINANCIAL_PDF_SERVICE && pdfFilesWithBuffers.length > 0) {
                 console.log(`\n📄 Отправляем ${pdfFilesWithBuffers.length} PDF на ikap4 (pdftopng, фин. отчётность)...`)
                 try {
                   const { report, table, years, summary } = await analyzeFinancialPdfsViaPdftopng(pdfFilesWithBuffers)
+                  fsTable = table || []
+                  fsYears = years || []
+                  fsSummary = summary || ''
                   pdfFilesWithBuffers.forEach((f, idx) => {
                     fsFileReports.push({
                       fileId: f.fileId,
@@ -2305,7 +2311,7 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
               console.log(`💾 Сохраняем ${fsFileReports.length} финансовых отчетов в БД...`)
               let fsStructured = null
               try {
-                fsStructured = JSON.stringify({ table: table || [], years: years || [], summary: summary || '' })
+                fsStructured = JSON.stringify({ table: fsTable, years: fsYears, summary: fsSummary })
               } catch (e) {
                 console.warn('⚠️ Не удалось сериализовать fs_report_structured:', e.message)
               }
