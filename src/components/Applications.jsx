@@ -23,6 +23,7 @@ import { getApiUrl } from '../utils/api'
 import './Applications.css'
 
 const MONTH_NAMES_SHORT = ['янв', 'фев', 'мар', 'апр', 'май', 'июн', 'июл', 'авг', 'сен', 'окт', 'ноя', 'дек']
+const MONTH_NAMES_TABLE = ['Янв', 'Февр', 'Март', 'Апр', 'Май', 'Июнь', 'Июль', 'Авг', 'Сент', 'Окт', 'Нояб', 'Дек']
 
 function formatStructuredDate(value) {
   if (!value) return '—'
@@ -101,6 +102,62 @@ function parseFsTableFromText(text) {
   return { table, years, summary }
 }
 
+/** Таблица по годам и месяцам (выручка), как в ikap2 */
+function RevenueTable({ structuredReport }) {
+  if (!structuredReport?.revenue?.years?.length) return null
+  const allYears = [...new Set(structuredReport.revenue.years.map(y => y.year))].sort()
+  const getMonthValue = (yearData, monthIndex) => {
+    if (!yearData?.months) return 0
+    const month = yearData.months.find(m => m.monthIndex === monthIndex)
+    return month?.value || 0
+  }
+  return (
+    <div className="revenue-table-container">
+      <table className="revenue-table">
+        <thead>
+          <tr>
+            <th>Названия строк</th>
+            <th>Сумма по полю Кредит</th>
+          </tr>
+        </thead>
+        <tbody>
+          {allYears.map(year => {
+            const revenueYear = structuredReport.revenue.years.find(y => y.year === year)
+            return (
+              <React.Fragment key={year}>
+                <tr className="year-row">
+                  <td colSpan="2"><strong>Год {year}</strong></td>
+                </tr>
+                {MONTH_NAMES_TABLE.map((monthName, monthIndex) => {
+                  const revenueValue = revenueYear ? getMonthValue(revenueYear, monthIndex) : 0
+                  return (
+                    <tr key={`${year}-${monthIndex}`}>
+                      <td>{monthName}</td>
+                      <td>{revenueValue.toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}</td>
+                    </tr>
+                  )
+                })}
+                <tr className="year-total-row">
+                  <td><strong>Итого за {year}</strong></td>
+                  <td>
+                    {(revenueYear?.value || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </td>
+                </tr>
+              </React.Fragment>
+            )
+          })}
+          <tr className="grand-total-row">
+            <td><strong>Общий итог</strong></td>
+            <td>
+              {(structuredReport.revenue?.totalValue || 0).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
 function RevenueChart({ structuredReport }) {
   if (!structuredReport?.revenue?.years?.length) return null
   const chartData = []
@@ -146,14 +203,16 @@ function StatementReportContent({ reportText, reportStructured }) {
     }
   }, [reportStructured])
 
-  // ikap2-формат: revenue, totals, trailing12MonthsRevenue (без autoRevenuePreview) — показываем текст отчёта + график
+  // ikap2-формат: сводка по выручке, таблица по годам, график (как в ikap2)
   const isIkap2Format = structured && (structured.revenue || structured.totals || structured.trailing12MonthsRevenue) && !(structured.autoRevenuePreview?.length || structured.agentReviewedRevenuePreview?.length)
   if (isIkap2Format && (reportText || structured)) {
     return (
-      <>
-        <RevenueChart structuredReport={structured} />
+      <div className="statement-report-ikap2">
+        <h3 className="report-section-title">Сводка по выручке</h3>
         {reportText && <pre className="report-text report-text--block">{reportText}</pre>}
-      </>
+        <RevenueTable structuredReport={structured} />
+        <RevenueChart structuredReport={structured} />
+      </div>
     )
   }
 
