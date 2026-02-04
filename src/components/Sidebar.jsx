@@ -22,10 +22,12 @@ const Sidebar = ({ onViewChange, activeView }) => {
   // Функция для получения количества новых заявок
   const fetchNewApplicationsCount = async () => {
     try {
-      const response = await fetch(getApiUrl('/api/reports/new-count'))
+      // В ikap2 нет эндпоинта /api/reports/new-count.
+      // Берём общее количество из пагинации списка отчётов.
+      const response = await fetch(getApiUrl('/api/reports?limit=1&offset=0'))
       if (response.ok) {
         const data = await response.json()
-        setNewApplicationsCount(data.count || 0)
+        setNewApplicationsCount(data?.pagination?.total || 0)
       }
     } catch (error) {
       console.error('Ошибка получения количества заявок:', error)

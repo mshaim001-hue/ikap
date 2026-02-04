@@ -15,7 +15,6 @@ export const getApiUrl = (endpoint) => {
 export const API_ENDPOINTS = {
   AGENTS_RUN: '/api/agents/run',
   REPORTS: '/api/reports',
-  REPORTS_NEW_COUNT: '/api/reports/new-count',
   REPORTS_BY_ID: (sessionId) => `/api/reports/${sessionId}`,
   REPORTS_DELETE: (sessionId) => `/api/reports/${sessionId}`
 }

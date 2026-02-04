@@ -628,14 +628,28 @@ initSchema().catch(e => {
 })
 
 // Вспомогательные функции для работы с БД
+const normalizeMessageRole = (role) => {
+  const r = String(role || '').toLowerCase().trim()
+  if (r === 'assistant' || r === 'user') return r
+  // Частые варианты из разных SDK/логик
+  if (r === 'bot') return 'assistant'
+  // system/developer/tool сообщения в таблицу messages не пишем (она про диалог user<->assistant)
+  return null
+}
+
 const saveMessageToDB = async (sessionId, role, content, messageOrder) => {
   try {
+    const normalizedRole = normalizeMessageRole(role)
+    if (!normalizedRole) {
+      // Молча пропускаем невалидные роли, чтобы не засорять логи "undefined"
+      return
+    }
     const insertMessage = db.prepare(`
       INSERT INTO messages (session_id, role, content, message_order)
       VALUES (?, ?, ?, ?)
     `)
-    await insertMessage.run(sessionId, role, JSON.stringify(content), messageOrder)
-    console.log(`💾 Сообщение сохранено в БД: ${role} #${messageOrder}`)
+    await insertMessage.run(sessionId, normalizedRole, JSON.stringify(content), messageOrder)
+    console.log(`💾 Сообщение сохранено в БД: ${normalizedRole} #${messageOrder}`)
   } catch (error) {
     // Если БД недоступна, логируем но продолжаем работу
     if (error.code === 'XX000' || error.message?.includes('db_termination') || error.message?.includes('shutdown')) {
@@ -1418,9 +1432,10 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
         const item = newItems[index]
         const messageOrder = history.length - newItems.length + index + 1
         const role = item && item.role
-        if (role === 'assistant' || role === 'user') {
+        const normalizedRole = normalizeMessageRole(role)
+        if (normalizedRole) {
           try {
-            await saveMessageToDB(session, role, item.content, messageOrder)
+            await saveMessageToDB(session, normalizedRole, item.content, messageOrder)
           } catch (dbError) {
             // Если БД недоступна, логируем но продолжаем работу
             if (dbError.code === 'XX000' || dbError.message?.includes('db_termination') || dbError.message?.includes('shutdown')) {
@@ -1430,7 +1445,8 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
             }
             // Продолжаем работу даже если БД недоступна
           }
-        } else {
+        } else if (role && String(role).toLowerCase() !== 'tool') {
+          // tool/другие роли из SDK не логируем как проблему
           console.warn(`⚠️ Пропущено сохранение сообщения без валидной роли: ${role}`)
         }
       }
@@ -2224,6 +2240,11 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
             })
             
             const fsFileReports = [] // Массив отчетов для всех файлов
+            // ВАЖНО: Эти переменные должны быть видимы в блоке сохранения отчёта ниже,
+            // иначе при отсутствии PDF получим ReferenceError.
+            let fsTable = []
+            let fsYears = []
+            let fsSummary = ''
             
             // Обрабатываем PDF файлы через ikap4 (pdftopng)
             if (pdfFiles.length > 0) {
@@ -2243,9 +2264,6 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                 .filter(Boolean)
 
               // Финансовая отчётность отправляется только в ikap4 (pdftopng). Агенты в ikap не используются.
-              let fsTable = []
-              let fsYears = []
-              let fsSummary = ''
               if (USE_FINANCIAL_PDF_SERVICE && pdfFilesWithBuffers.length > 0) {
                 console.log(`\n📄 Отправляем ${pdfFilesWithBuffers.length} PDF на ikap4 (pdftopng, фин. отчётность)...`)
                 try {

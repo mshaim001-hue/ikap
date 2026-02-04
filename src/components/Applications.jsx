@@ -177,15 +177,15 @@ function RevenueChart({ structuredReport }) {
   if (chartData.length === 0) return null
   return (
     <div className="revenue-chart-container">
-      <h4>Выручка по месяцам</h4>
-      <ResponsiveContainer width="100%" height={360}>
+      <h4>Связанные стороны</h4>
+      <ResponsiveContainer width="100%" height={400}>
         <BarChart data={chartData} margin={{ top: 20, right: 30, left: 20, bottom: 60 }}>
           <CartesianGrid strokeDasharray="3 3" />
           <XAxis dataKey="fullLabel" angle={-45} textAnchor="end" height={100} interval={0} />
           <YAxis />
           <Tooltip formatter={(value) => value.toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} />
           <Legend />
-          <Bar dataKey="value" fill="#3b82f6" name="Сумма" />
+          <Bar dataKey="value" fill="#8884d8" name="Кредит" />
         </BarChart>
       </ResponsiveContainer>
     </div>
@@ -209,7 +209,6 @@ function StatementReportContent({ reportText, reportStructured }) {
     return (
       <div className="statement-report-ikap2">
         <h3 className="report-section-title">Сводка по выручке</h3>
-        {reportText && <pre className="report-text report-text--block">{reportText}</pre>}
         <RevenueTable structuredReport={structured} />
         <RevenueChart structuredReport={structured} />
       </div>
