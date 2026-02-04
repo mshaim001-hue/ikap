@@ -731,11 +731,17 @@
   margin: 0 0 0.75em;
 }
 
+.report-markdown {
+  width: 100%;
+  overflow-x: auto; /* если таблица шире, скроллим внутри блока */
+}
+
 .report-markdown table {
   width: 100%;
   border-collapse: collapse;
   margin: 1em 0;
   font-size: 13px;
+  min-width: 900px; /* даём таблице стать шире окна, чтобы появился скролл */
 }
 
 .report-markdown th,
@@ -743,12 +749,14 @@
   padding: 0.5rem 0.75rem;
   text-align: right;
   border: 1px solid #e5e7eb;
+  white-space: nowrap; /* не переносим числа и заголовки по колонкам */
 }
 
 .report-markdown th:first-child,
 .report-markdown td:first-child {
   text-align: left;
   font-weight: 500;
+  white-space: normal; /* но в первом столбце (Период/Показатель) текст можно переносить */
 }
 
 .report-markdown th {

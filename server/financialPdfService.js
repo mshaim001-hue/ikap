@@ -11,7 +11,8 @@ const FINANCIAL_PDF_SERVICE_URL = process.env.FINANCIAL_PDF_SERVICE_URL || 'http
 const USE_FINANCIAL_PDF_SERVICE = !!FINANCIAL_PDF_SERVICE_URL
 
 const POLL_INTERVAL_MS = 3000
-const MAX_POLL_ATTEMPTS = 120 // 6 минут при интервале 3 сек
+// Увеличиваем лимит ожидания анализа до 12 минут (240 * 3 сек)
+const MAX_POLL_ATTEMPTS = 240
 const UPLOAD_TIMEOUT_MS = 120000 // 2 мин на загрузку
 const REQUEST_TIMEOUT_MS = 10000 // 10 сек на каждый poll
 

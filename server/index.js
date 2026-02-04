@@ -2275,12 +2275,16 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
                   fsTable = table || []
                   fsYears = years || []
                   fsSummary = summary || ''
-                  pdfFilesWithBuffers.forEach((f, idx) => {
-                    fsFileReports.push({
-                      fileId: f.fileId,
-                      fileName: f.originalName,
-                      report: idx === 0 ? report : `См. общий отчёт выше (файлы объединены в один анализ).`
-                    })
+
+                  // Формируем один общий отчёт по всем PDF, как в интерфейсе ikap4
+                  const combinedName = pdfFilesWithBuffers.length === 1
+                    ? pdfFilesWithBuffers[0].originalName
+                    : `Отчёт (${pdfFilesWithBuffers.length} файлов): ${pdfFilesWithBuffers.map(f => f.originalName).join(', ')}`
+
+                  fsFileReports.push({
+                    fileId: pdfFilesWithBuffers[0].fileId,
+                    fileName: combinedName,
+                    report
                   })
                 } catch (err) {
                   console.error(`❌ Ошибка ikap4 (pdftopng):`, err.message)
@@ -2309,9 +2313,17 @@ app.post('/api/agents/run', upload.array('files', 50), handleMulterError, async 
             
             // Сохраняем объединенный отчет (только PDF)
             if (fsFileReports.length > 0) {
-              let combinedFsReport = fsFileReports.map((fr, idx) => {
-                return `\n\n${'='.repeat(80)}\nОТЧЕТ ${idx + 1} из ${fsFileReports.length}\nФайл: ${fr.fileName}\n${'='.repeat(80)}\n\n${fr.report}`
-              }).join('\n\n')
+              let combinedFsReport
+              if (fsFileReports.length === 1) {
+                // Обычный сценарий: один общий отчёт по нескольким файлам
+                const fr = fsFileReports[0]
+                combinedFsReport = `\n\n${'='.repeat(80)}\nОТЧЕТ 1 из 1\nФайл: ${fr.fileName}\n${'='.repeat(80)}\n\n${fr.report}`
+              } else {
+                // Редкий сценарий с ошибками по отдельным файлам — сохраняем по-старому, чтобы видеть, что упало
+                combinedFsReport = fsFileReports.map((fr, idx) => {
+                  return `\n\n${'='.repeat(80)}\nОТЧЕТ ${idx + 1} из ${fsFileReports.length}\nФайл: ${fr.fileName}\n${'='.repeat(80)}\n\n${fr.report}`
+                }).join('\n\n')
+              }
 
               // Нормализуем markdown-таблицы в текстовом отчете (для совместимости),
               // но основной источник таблицы для фронта — это fs_report_structured (JSON).

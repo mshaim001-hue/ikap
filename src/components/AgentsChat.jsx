@@ -314,7 +314,9 @@ const AgentsChat = ({ onProgressChange }) => {
         return
       }
       
-      setSelectedFiles(files)
+      // Добавляем новые файлы к уже выбранным, чтобы можно было
+      // прикреплять партии файлов из разных папок последовательно.
+      setSelectedFiles((prev) => [...prev, ...files])
       // НЕ добавляем текст в поле ввода - файлы отображаются отдельно снизу
       setInputMessage('')
     }
