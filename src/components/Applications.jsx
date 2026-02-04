@@ -203,98 +203,16 @@ function StatementReportContent({ reportText, reportStructured }) {
     }
   }, [reportStructured])
 
-  // ikap2-формат: сводка по выручке, таблица по годам, график (как в ikap2)
-  const isIkap2Format = structured && (structured.revenue || structured.totals || structured.trailing12MonthsRevenue) && !(structured.autoRevenuePreview?.length || structured.agentReviewedRevenuePreview?.length)
-  if (isIkap2Format && (reportText || structured)) {
+  // Для ikap нам нужен только агрегированный анализ: сводка по выручке + график,
+  // без списков операций (AutoRevenue / AgentReview). Если есть структурированный
+  // отчёт с revenue.years — всегда показываем его в этом виде.
+  if (structured?.revenue?.years?.length) {
     return (
       <div className="statement-report-ikap2">
         <h3 className="report-section-title">Сводка по выручке</h3>
         <RevenueTable structuredReport={structured} />
         <RevenueChart structuredReport={structured} />
       </div>
-    )
-  }
-
-  if (structured) {
-    const autoRevenue = structured.autoRevenuePreview || []
-    const autoNonRevenue = structured.autoNonRevenuePreview || []
-    const agentRevenue = structured.agentReviewedRevenuePreview || []
-    const agentNonRevenue = structured.agentReviewedNonRevenuePreview || []
-    const hasTables = autoRevenue.length > 0 || autoNonRevenue.length > 0 || agentRevenue.length > 0 || agentNonRevenue.length > 0
-    return (
-      <>
-        <RevenueChart structuredReport={structured} />
-        {hasTables && (
-          <div className="structured-tables">
-            {autoRevenue.length > 0 && (
-              <div className="details-report">
-                <h4>Авто: выручка</h4>
-                <div className="auto-revenue-table-wrapper">
-                  <table className="auto-revenue-table">
-                    <thead>
-                      <tr><th>Дата</th><th>Сумма</th><th>Назначение</th><th>Источник</th></tr>
-                    </thead>
-                    <tbody>
-                      {autoRevenue.map((item, i) => (
-                        <tr key={i}>
-                          <td>{formatStructuredDate(item.date)}</td>
-                          <td>{item.amountFormatted || item.amountRaw || '—'}</td>
-                          <td><strong>{item.purpose || '—'}</strong> {item.sender || item.correspondent || ''}</td>
-                          <td>{item.source === 'heuristic' ? 'Авто' : item.source || '—'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-            {agentRevenue.length > 0 && (
-              <div className="details-report">
-                <h4>Проверено агентом: выручка</h4>
-                <div className="auto-revenue-table-wrapper">
-                  <table className="auto-revenue-table">
-                    <thead>
-                      <tr><th>Дата</th><th>Сумма</th><th>Назначение</th><th>Источник</th></tr>
-                    </thead>
-                    <tbody>
-                      {agentRevenue.map((item, i) => (
-                        <tr key={i}>
-                          <td>{formatStructuredDate(item.date)}</td>
-                          <td>{item.amountFormatted || item.amountRaw || '—'}</td>
-                          <td><strong>{item.purpose || '—'}</strong> {item.sender || item.correspondent || ''}</td>
-                          <td>{item.source || 'agent'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-            {agentNonRevenue.length > 0 && (
-              <div className="details-report">
-                <h4>Проверено агентом: не выручка</h4>
-                <div className="auto-revenue-table-wrapper">
-                  <table className="auto-revenue-table">
-                    <thead>
-                      <tr><th>Дата</th><th>Сумма</th><th>Назначение</th><th>Источник</th></tr>
-                    </thead>
-                    <tbody>
-                      {agentNonRevenue.map((item, i) => (
-                        <tr key={i}>
-                          <td>{formatStructuredDate(item.date)}</td>
-                          <td>{item.amountFormatted || item.amountRaw || '—'}</td>
-                          <td><strong>{item.purpose || '—'}</strong> {item.sender || item.correspondent || ''}</td>
-                          <td>{item.source || 'agent'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </>
     )
   }
 

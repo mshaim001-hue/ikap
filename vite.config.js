@@ -3,10 +3,9 @@ import react from '@vitejs/plugin-react'
 
 export default defineConfig({
   plugins: [react()],
-  // Для GitHub Pages нужно указать base path репозитория
-  // Если репозиторий называется "ikap", то base: '/ikap/'
-  // Если репозиторий username.github.io, то base: '/'
-  base: process.env.VITE_BASE_PATH || (process.env.NODE_ENV === 'production' ? '/ikap/' : '/'),
+  // Приложение теперь разворачивается как обычный SPA на корне домена (Render / Docker),
+  // поэтому base всегда '/' (GitHub Pages больше не используем).
+  base: process.env.VITE_BASE_PATH || '/',
   server: {
     port: 3000,
     open: true,
