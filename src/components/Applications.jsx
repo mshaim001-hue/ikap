@@ -406,10 +406,6 @@ const Applications = () => {
   }
 
   const handleApplicationClick = async (application) => {
-    console.log('🔍 Выбрана заявка:', application)
-    console.log('📊 Статус:', application.status)
-    console.log('📄 Отчет:', application.reportText ? 'Есть' : 'Нет')
-    
     setSelectedApplication(application)
     setShowDialog(false)
     setDialogMessages([])

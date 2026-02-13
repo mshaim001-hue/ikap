@@ -90,7 +90,7 @@ const AgentsChat = ({ onProgressChange }) => {
     const taxRegimes = [
       'Общеустановленный режим (ФНО 100.00 + 200.00 + 300.00)',
       'Упрощенная декларация (ФНО 910.00)',
-      'Сельхозпроизводитель (ФНО 920.00)',
+      'Крестьянские (фермерские) хозяйства (ФНО 920.00)',
       'Другое'
     ]
     
@@ -171,6 +171,7 @@ const AgentsChat = ({ onProgressChange }) => {
 
   // Общая функция для отправки сообщений к агенту
   const sendToAgent = async (messageText, files = [], options = {}) => {
+    const suppressReply = options.suppressReply || false
     setIsLoading(true)
 
     try {
@@ -245,8 +246,28 @@ const AgentsChat = ({ onProgressChange }) => {
         return false // Возвращаем false для индикации ошибки
       }
       
-      const botMessage = createBotMessage(result.message)
-      setMessages(prev => [...prev, botMessage])
+      if (!suppressReply) {
+        // По умолчанию просто показываем ответ агента
+        let botMessage
+
+        // Специальный случай: информационный агент отвечает про документы для заявки —
+        // показываем ту же кнопку "Перейти к подаче заявки", что и в стартовом меню.
+        if (
+          (options.agent || currentAgent) === 'information' &&
+          typeof result.message === 'string' &&
+          result.message.trim().startsWith('Для подачи заявки нужны документы')
+        ) {
+          botMessage = createBotMessage(result.message, {
+            choiceButtons: [
+              { label: 'Перейти к подаче заявки', value: 'apply' }
+            ]
+          })
+        } else {
+          botMessage = createBotMessage(result.message)
+        }
+
+        setMessages(prev => [...prev, botMessage])
+      }
 
       // Обновляем прогресс по факту файлов из ответа сервера (если пришел)
       if (result?.data?.progress) {
@@ -381,13 +402,26 @@ const AgentsChat = ({ onProgressChange }) => {
       setIsLoading(true)
       
       setTimeout(() => {
+        // Если пользователь написал только приветствие (без имени),
+        // не подставляем его как имя в приветствие.
+        const trimmedName = (extractedName || '').trim()
+        const isGreetingOnly = !trimmedName || /^(привет|здравствуй|здравствуйте|hi|hello)$/i.test(trimmedName)
+
+        const text = isGreetingOnly
+          ? 'Наша платформа помогает бизнесу привлекать финансирование от 10 млн до 1 млрд ₸ от 2,5% в месяц. Срок займа — 4–36 месяцев. Быстрое одобрение, прозрачные условия, инвесторы, готовые поддержать ваш проект. Примите условия платформы, чтобы продолжить.'
+          : `Здравствуйте, ${trimmedName}! Наша платформа помогает бизнесу привлекать финансирование от 10 млн до 1 млрд ₸ от 2,5% в месяц. Срок займа — 4–36 месяцев. Быстрое одобрение, прозрачные условия, инвесторы, готовые поддержать ваш проект. Примите условия платформы, чтобы продолжить.`
+
         const botMessage = createBotMessage(
-          `Здравствуйте, ${extractedName}! Наша платформа помогает бизнесу привлекать финансирование от 10 млн до 1 млрд ₸ от 2,5% в месяц. Срок займа — 4–36 месяцев. Быстрое одобрение, прозрачные условия, инвесторы, готовые поддержать ваш проект. Примите условия платформы, чтобы продолжить.`,
+          text,
           { showTermsButton: true }
         )
         
         setMessages(prev => [...prev, botMessage])
         setIsLoading(false)
+
+        // Мягкое подключение Investment Agent: создаём сессию и передаём первое сообщение,
+        // но не показываем его ответ пользователю до принятия условий.
+        sendToAgent(messageText, filesToSend, { agent: 'investment', suppressReply: true }).catch(() => {})
       }, 3000)
       
       return
