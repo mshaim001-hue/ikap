@@ -8,13 +8,68 @@ const FormData = require('form-data')
  * - normalizeFileName: функция нормализации имени файла
  * - baseUrl: базовый URL сервиса onepage
  */
+const AXIOS_PREVIEW_OPTS = {
+  timeout: 180000, // до 3 минут на конвертацию
+  maxContentLength: Infinity,
+  maxBodyLength: Infinity,
+}
+
+const AXIOS_ANALYZE_OPTS = {
+  timeout: 600000, // до 10 минут на анализ
+}
+
+/** Вызывает /api/preview + /api/analyze для набора файлов. Возвращает result или null. */
+async function runOneBatch(cleanBaseUrl, formData, sessionId, label) {
+  const previewRes = await axios.post(`${cleanBaseUrl}/api/preview`, formData, {
+    headers: formData.getHeaders(),
+    ...AXIOS_PREVIEW_OPTS,
+  })
+
+  const previewIds = (previewRes.data?.previews || []).map(p => p.id).filter(Boolean)
+  if (!previewIds.length) {
+    console.warn(`⚠️ [onepage] ${label}: пустой список превью для сессии ${sessionId}`)
+    return null
+  }
+
+  console.log(`📊 [onepage] ${label}: превью создано, id: ${previewIds.join(', ')}. Запрашиваем анализ...`)
+  const analyzeRes = await axios.post(`${cleanBaseUrl}/api/analyze`, {
+    ids: previewIds,
+    note: `ikap session ${sessionId} ${label}`,
+  }, AXIOS_ANALYZE_OPTS)
+
+  return analyzeRes.data?.result || analyzeRes.data
+}
+
+/** Мержит результаты bankTax и financial в один объект. */
+function mergeResults(resultBankTax, resultFinancial) {
+  const documents = [
+    ...(resultBankTax?.documents || []),
+    ...(resultFinancial?.documents || []),
+  ]
+
+  const c1 = resultBankTax?.completeness || {}
+  const c2 = resultFinancial?.completeness || {}
+  const hasBoth = resultBankTax && resultFinancial
+  const completeness = {
+    ...c1,
+    ...c2,
+    bankStatements: c1.bankStatements || c2.bankStatements || { present: [], missing: [] },
+    taxReports: c1.taxReports || c2.taxReports || { present: [], missing: [] },
+    financialReports: c2.financialReports || c1.financialReports || { present: [], missing: [] },
+    overallComplete: hasBoth
+      ? (!!c1.overallComplete && !!c2.overallComplete)
+      : (c1.overallComplete ?? c2.overallComplete ?? null),
+  }
+
+  return { documents, completeness, summaryText: completeness.summaryText || null }
+}
+
 async function runDocumentsOverviewAnalysis(db, normalizeFileName, baseUrl, sessionId) {
   if (!baseUrl) return
 
   try {
     const cleanBaseUrl = baseUrl.trim().replace(/\/+$/, '')
 
-    // Получаем байты файлов из БД
     const dbFiles = await db.prepare(`
       SELECT file_id, original_name, file_size, mime_type, category, file_data
       FROM files
@@ -27,55 +82,52 @@ async function runDocumentsOverviewAnalysis(db, normalizeFileName, baseUrl, sess
       return
     }
 
-    const formData = new FormData()
-    let hasBankTax = false
-    let hasFinancial = false
+    const bankTaxFiles = []
+    const financialFiles = []
 
     for (const f of dbFiles) {
       if (!f.file_data) continue
       const buffer = Buffer.isBuffer(f.file_data) ? f.file_data : Buffer.from(f.file_data)
       const filename = normalizeFileName(f.original_name || 'document.pdf')
       const mime = f.mime_type || 'application/pdf'
+      const entry = { buffer, filename, mime }
 
       if (f.category === 'financial') {
-        formData.append('financial', buffer, { filename, contentType: mime })
-        hasFinancial = true
+        financialFiles.push(entry)
       } else if (f.category === 'statements' || f.category === 'taxes') {
-        formData.append('bankTax', buffer, { filename, contentType: mime })
-        hasBankTax = true
+        bankTaxFiles.push(entry)
       }
     }
 
-    if (!hasBankTax && !hasFinancial) {
+    if (bankTaxFiles.length === 0 && financialFiles.length === 0) {
       console.log(`⚠️ [onepage] Нет подходящих файлов (statements/taxes/financial) для сессии ${sessionId}`)
       return
     }
 
-    console.log(`📤 [onepage] Отправляем документы сессии ${sessionId} на превью...`)
-    const previewRes = await axios.post(`${cleanBaseUrl}/api/preview`, formData, {
-      headers: formData.getHeaders(),
-      timeout: 180000, // до 3 минут на конвертацию
-      maxContentLength: Infinity,
-      maxBodyLength: Infinity,
-    })
+    let resultBankTax = null
+    let resultFinancial = null
 
-    const previewIds = (previewRes.data?.previews || []).map(p => p.id).filter(Boolean)
-    if (!previewIds.length) {
-      console.warn(`⚠️ [onepage] Сервис вернул пустой список превью для сессии ${sessionId}`)
-      return
+    if (bankTaxFiles.length > 0) {
+      const formDataBankTax = new FormData()
+      for (const { buffer, filename, mime } of bankTaxFiles) {
+        formDataBankTax.append('bankTax', buffer, { filename, contentType: mime })
+      }
+      console.log(`📤 [onepage] Отправляем банковские выписки и налоговые формы (${bankTaxFiles.length} файлов)...`)
+      resultBankTax = await runOneBatch(cleanBaseUrl, formDataBankTax, sessionId, 'bankTax')
     }
 
-    console.log(`📊 [onepage] Превью создано, id: ${previewIds.join(', ')}. Запрашиваем анализ...`)
-    const analyzeRes = await axios.post(`${cleanBaseUrl}/api/analyze`, {
-      ids: previewIds,
-      note: `ikap session ${sessionId}`,
-    }, {
-      timeout: 600000, // до 10 минут на анализ (изображения + GPT)
-    })
+    if (financialFiles.length > 0) {
+      const formDataFinancial = new FormData()
+      for (const { buffer, filename, mime } of financialFiles) {
+        formDataFinancial.append('financial', buffer, { filename, contentType: mime })
+      }
+      console.log(`📤 [onepage] Отправляем финансовую отчётность (${financialFiles.length} файлов)...`)
+      resultFinancial = await runOneBatch(cleanBaseUrl, formDataFinancial, sessionId, 'financial')
+    }
 
-    const result = analyzeRes.data?.result || analyzeRes.data
-    const jsonValue = result ? JSON.stringify(result) : null
-    const textSummary = result?.overallConclusion?.missingSummary || null
+    const result = mergeResults(resultBankTax, resultFinancial)
+    const jsonValue = JSON.stringify(result)
+    const textSummary = result.summaryText || null
 
     await db.prepare(`
       UPDATE reports

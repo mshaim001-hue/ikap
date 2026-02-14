@@ -254,6 +254,7 @@ const Applications = () => {
   const [showStatementsModal, setShowStatementsModal] = useState(false)
   const [showTaxModal, setShowTaxModal] = useState(false)
   const [showFsModal, setShowFsModal] = useState(false)
+  const [showOverviewModal, setShowOverviewModal] = useState(false)
   const dialogEndRef = useRef(null)
 
   // Загружаем список заявок
@@ -848,6 +849,22 @@ const Applications = () => {
                     </button>
                   )
                 })()}
+
+                {/* Комплектность документов (onepage) */}
+                {(() => {
+                  const hasOverview = !!selectedApplication.docsOverviewJson || !!selectedApplication.docsOverviewText
+                  return (
+                    <button
+                      onClick={() => hasOverview && setShowOverviewModal(true)}
+                      className={`analysis-button ${hasOverview ? 'enabled' : 'disabled'}`}
+                      disabled={!hasOverview}
+                      title={hasOverview ? 'Открыть отчёт о комплектности документов' : 'Проверка комплектности ещё не выполнена'}
+                    >
+                      <Paperclip size={16} />
+                      Комплектность документов
+                    </button>
+                  )
+                })()}
               </div>
               {(selectedApplication.taxMissing || selectedApplication.fsMissing) && (
                 <div className="report-preview" style={{ marginTop: 8 }}>
@@ -1056,6 +1073,92 @@ const Applications = () => {
                   </div>
                 </div>
               )}
+
+              {showOverviewModal && selectedApplication && (() => {
+                const json = selectedApplication.docsOverviewJson
+                const text = selectedApplication.docsOverviewText || ''
+                let parsed = null
+                if (json) {
+                  try {
+                    parsed = typeof json === 'object' ? json : JSON.parse(String(json))
+                  } catch (_) {
+                    parsed = null
+                  }
+                }
+                return (
+                  <div className="report-modal-overlay" onClick={() => setShowOverviewModal(false)}>
+                    <div className="report-modal-content" onClick={(e) => e.stopPropagation()}>
+                      <div className="report-modal-header">
+                        <h3>Комплектность документов</h3>
+                        <button onClick={() => setShowOverviewModal(false)} className="report-modal-close">×</button>
+                      </div>
+                      <div className="report-modal-body">
+                        {parsed ? (
+                          <div className="docs-overview-content">
+                            {parsed.completeness?.summary && (
+                              <div className="report-text" style={{ marginBottom: 16, whiteSpace: 'pre-wrap' }}>
+                                {parsed.completeness.summary}
+                              </div>
+                            )}
+                            {parsed.completeness?.overallComplete !== undefined && (
+                              <p style={{ marginBottom: 12, fontWeight: 600, color: parsed.completeness.overallComplete ? '#059669' : '#b45309' }}>
+                                {parsed.completeness.overallComplete ? '✓ Пакет документов полный' : '⚠ Не все документы представлены'}
+                              </p>
+                            )}
+                            {parsed.completeness?.bankStatements && (parsed.completeness.bankStatements.present?.length > 0 || parsed.completeness.bankStatements.missing?.length > 0) && (
+                              <div style={{ marginBottom: 16 }}>
+                                <h4 style={{ marginBottom: 8, fontSize: 14 }}>Банковские выписки</h4>
+                                {parsed.completeness.bankStatements.present?.length > 0 && (
+                                  <p style={{ color: '#059669', fontSize: 13 }}>Есть: {parsed.completeness.bankStatements.present.map(p => p.year && p.description ? `${p.year}: ${p.description}` : JSON.stringify(p)).join('; ')}</p>
+                                )}
+                                {parsed.completeness.bankStatements.missing?.length > 0 && (
+                                  <p style={{ color: '#b45309', fontSize: 13 }}>Не хватает: {parsed.completeness.bankStatements.missing.map(m => m.year && m.description ? `${m.year}: ${m.description}` : JSON.stringify(m)).join('; ')}</p>
+                                )}
+                              </div>
+                            )}
+                            {parsed.completeness?.taxReports && (parsed.completeness.taxReports.present?.length > 0 || parsed.completeness.taxReports.missing?.length > 0) && (
+                              <div style={{ marginBottom: 16 }}>
+                                <h4 style={{ marginBottom: 8, fontSize: 14 }}>Налоговая отчётность</h4>
+                                {parsed.completeness.taxReports.present?.length > 0 && (
+                                  <p style={{ color: '#059669', fontSize: 13 }}>Есть: формы/годы — {parsed.completeness.taxReports.present.map(p => (p.form && p.year ? `форма ${p.form} ${p.year}` : JSON.stringify(p))).join('; ')}</p>
+                                )}
+                                {parsed.completeness.taxReports.missing?.length > 0 && (
+                                  <p style={{ color: '#b45309', fontSize: 13 }}>Не хватает: {parsed.completeness.taxReports.missing.map(m => (m.form && m.year ? `форма ${m.form} ${m.year}` : m.description || JSON.stringify(m))).join('; ')}</p>
+                                )}
+                              </div>
+                            )}
+                            {parsed.completeness?.financialReports && (parsed.completeness.financialReports.present?.length > 0 || parsed.completeness.financialReports.missing?.length > 0) && (
+                              <div style={{ marginBottom: 16 }}>
+                                <h4 style={{ marginBottom: 8, fontSize: 14 }}>Финансовая отчётность</h4>
+                                {parsed.completeness.financialReports.present?.length > 0 && (
+                                  <p style={{ color: '#059669', fontSize: 13 }}>Есть: {parsed.completeness.financialReports.present.map(p => (p.formName && p.year ? `${p.formName} ${p.year}` : JSON.stringify(p))).join('; ')}</p>
+                                )}
+                                {parsed.completeness.financialReports.missing?.length > 0 && (
+                                  <p style={{ color: '#b45309', fontSize: 13 }}>Не хватает: {parsed.completeness.financialReports.missing.map(m => (m.formName && m.year ? `${m.formName} ${m.year}` : JSON.stringify(m))).join('; ')}</p>
+                                )}
+                              </div>
+                            )}
+                            {Array.isArray(parsed.documents) && parsed.documents.length > 0 && (
+                              <div>
+                                <h4 style={{ marginBottom: 8, fontSize: 14 }}>Документы в пакете</h4>
+                                <ul style={{ margin: 0, paddingLeft: 20, fontSize: 13 }}>
+                                  {parsed.documents.map((doc, i) => (
+                                    <li key={i}>{doc.originalName ?? doc.original_name ?? `Документ ${(doc.documentIndex ?? doc.document_index) ?? i + 1}`}</li>
+                                  ))}
+                                </ul>
+                              </div>
+                            )}
+                          </div>
+                        ) : text ? (
+                          <div className="report-text" style={{ whiteSpace: 'pre-wrap' }}>{text}</div>
+                        ) : (
+                          <div className="report-text">Нет данных о комплектности</div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                )
+              })()}
             </div>
 
             {showDialog && (
