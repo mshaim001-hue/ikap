@@ -161,24 +161,12 @@ const githubPagesPatternAlt = /^https:\/\/.*\.githubpages\.io$/
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Разрешаем запросы без origin (например, Postman, curl)
-    if (!origin) {
-      console.log('🌐 CORS: Request without origin (allowed)')
-      return callback(null, true)
-    }
-    
-    // Проверяем точное совпадение с разрешенными источниками
+    if (!origin) return callback(null, true)
     const exactMatch = allowedOrigins.includes(origin)
-    
-    // Проверяем паттерны GitHub Pages
     const isGitHubPages = githubPagesPattern.test(origin) || githubPagesPatternAlt.test(origin)
-    
     if (exactMatch || isGitHubPages) {
-      console.log('✅ CORS: Allowed origin:', origin)
       callback(null, true)
     } else {
-      console.log('❌ CORS blocked origin:', origin)
-      console.log('✅ Allowed origins:', allowedOrigins)
       callback(new Error('Not allowed by CORS'))
     }
   },

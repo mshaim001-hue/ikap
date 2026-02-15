@@ -1095,24 +1095,34 @@ const Applications = () => {
                       <div className="report-modal-body">
                         {parsed ? (
                           <div className="docs-overview-content">
-                            {parsed.completeness?.summary && (
-                              <div className="report-text" style={{ marginBottom: 16, whiteSpace: 'pre-wrap' }}>
-                                {parsed.completeness.summary}
-                              </div>
-                            )}
-                            {parsed.completeness?.overallComplete !== undefined && (
-                              <p style={{ marginBottom: 12, fontWeight: 600, color: parsed.completeness.overallComplete ? '#059669' : '#b45309' }}>
-                                {parsed.completeness.overallComplete ? '✓ Пакет документов полный' : '⚠ Не все документы представлены'}
+                            {(parsed.completeness?.isComplete !== undefined || parsed.completeness?.overallComplete !== undefined) && (
+                              <p style={{ marginBottom: 12, fontWeight: 600, color: (parsed.completeness.isComplete ?? parsed.completeness.overallComplete) ? '#059669' : '#b45309' }}>
+                                {(parsed.completeness.isComplete ?? parsed.completeness.overallComplete) ? '✓ Пакет документов полный' : '⚠ Не все документы представлены'}
                               </p>
+                            )}
+                            {parsed.summaryText && (
+                              <p style={{ marginBottom: 12, fontSize: 13, color: '#6b7280' }}>{parsed.summaryText}</p>
                             )}
                             {parsed.completeness?.bankStatements && (parsed.completeness.bankStatements.present?.length > 0 || parsed.completeness.bankStatements.missing?.length > 0) && (
                               <div style={{ marginBottom: 16 }}>
                                 <h4 style={{ marginBottom: 8, fontSize: 14 }}>Банковские выписки</h4>
                                 {parsed.completeness.bankStatements.present?.length > 0 && (
-                                  <p style={{ color: '#059669', fontSize: 13 }}>Есть: {parsed.completeness.bankStatements.present.map(p => p.year && p.description ? `${p.year}: ${p.description}` : JSON.stringify(p)).join('; ')}</p>
+                                  <p style={{ color: '#059669', fontSize: 13 }}>
+                                    Есть: {parsed.completeness.bankStatements.present.map(p => {
+                                      if (typeof p !== 'object' || p === null) return String(p)
+                                      const y = p.year
+                                      const c = p.coverage || p.description
+                                      return c ? `${y}, период ${c}` : String(y ?? '')
+                                    }).join('; ')}
+                                  </p>
                                 )}
                                 {parsed.completeness.bankStatements.missing?.length > 0 && (
-                                  <p style={{ color: '#b45309', fontSize: 13 }}>Не хватает: {parsed.completeness.bankStatements.missing.map(m => m.year && m.description ? `${m.year}: ${m.description}` : JSON.stringify(m)).join('; ')}</p>
+                                  <p style={{ color: '#b45309', fontSize: 13 }}>
+                                    Не хватает выписок за период: {parsed.completeness.bankStatements.missing.map(m => {
+                                      if (typeof m !== 'object' || m === null) return String(m)
+                                      return m.missingPeriods || m.description || m.year ?? ''
+                                    }).join('; ')}
+                                  </p>
                                 )}
                               </div>
                             )}
@@ -1120,22 +1130,49 @@ const Applications = () => {
                               <div style={{ marginBottom: 16 }}>
                                 <h4 style={{ marginBottom: 8, fontSize: 14 }}>Налоговая отчётность</h4>
                                 {parsed.completeness.taxReports.present?.length > 0 && (
-                                  <p style={{ color: '#059669', fontSize: 13 }}>Есть: формы/годы — {parsed.completeness.taxReports.present.map(p => (p.form && p.year ? `форма ${p.form} ${p.year}` : JSON.stringify(p))).join('; ')}</p>
+                                  <p style={{ color: '#059669', fontSize: 13 }}>
+                                    Есть: {parsed.completeness.taxReports.present.map(p => {
+                                      if (typeof p !== 'object' || p === null) return ''
+                                      const parts = [p.form && p.year ? `форма ${p.form} ${p.year}` : '']
+                                      if (p.period) parts.push(p.period)
+                                      if (p.declarationType) parts.push(`(${p.declarationType})`)
+                                      return parts.filter(Boolean).join(' ')
+                                    }).filter(Boolean).join('; ')}
+                                  </p>
                                 )}
                                 {parsed.completeness.taxReports.missing?.length > 0 && (
-                                  <p style={{ color: '#b45309', fontSize: 13 }}>Не хватает: {parsed.completeness.taxReports.missing.map(m => (m.form && m.year ? `форма ${m.form} ${m.year}` : m.description || JSON.stringify(m))).join('; ')}</p>
+                                  <p style={{ color: '#b45309', fontSize: 13 }}>
+                                    Не хватает: {parsed.completeness.taxReports.missing.map(m => {
+                                      if (typeof m !== 'object' || m === null) return ''
+                                      const parts = [m.form && m.year ? `форма ${m.form} ${m.year}` : '']
+                                      if (m.period) parts.push(m.period)
+                                      return parts.filter(Boolean).join(' ')
+                                    }).filter(Boolean).join('; ')}
+                                  </p>
                                 )}
                               </div>
                             )}
                             {parsed.completeness?.financialReports && (parsed.completeness.financialReports.present?.length > 0 || parsed.completeness.financialReports.missing?.length > 0) && (
                               <div style={{ marginBottom: 16 }}>
                                 <h4 style={{ marginBottom: 8, fontSize: 14 }}>Финансовая отчётность</h4>
-                                {parsed.completeness.financialReports.present?.length > 0 && (
-                                  <p style={{ color: '#059669', fontSize: 13 }}>Есть: {parsed.completeness.financialReports.present.map(p => (p.formName && p.year ? `${p.formName} ${p.year}` : JSON.stringify(p))).join('; ')}</p>
-                                )}
-                                {parsed.completeness.financialReports.missing?.length > 0 && (
-                                  <p style={{ color: '#b45309', fontSize: 13 }}>Не хватает: {parsed.completeness.financialReports.missing.map(m => (m.formName && m.year ? `${m.formName} ${m.year}` : JSON.stringify(m))).join('; ')}</p>
-                                )}
+                                {(() => {
+                                  const formNames = { BB: 'Бухгалтерский баланс', OIK: 'Отчёт об изменениях в капитале', OSD: 'Отчёт о совокупном доходе', ODDS: 'Отчёт о движении денежных средств', OSV: 'Оборотно-сальдовая ведомость' }
+                                  const fmt = (x) => {
+                                    if (typeof x !== 'object' || x === null) return ''
+                                    const name = formNames[x.formCode] || x.formName || x.formCode || '?'
+                                    return x.year ? `${name} ${x.year}` : name
+                                  }
+                                  return (
+                                    <>
+                                      {parsed.completeness.financialReports.present?.length > 0 && (
+                                        <p style={{ color: '#059669', fontSize: 13 }}>Есть: {parsed.completeness.financialReports.present.map(fmt).filter(Boolean).join('; ')}</p>
+                                      )}
+                                      {parsed.completeness.financialReports.missing?.length > 0 && (
+                                        <p style={{ color: '#b45309', fontSize: 13 }}>Не хватает: {parsed.completeness.financialReports.missing.map(fmt).filter(Boolean).join('; ')}</p>
+                                      )}
+                                    </>
+                                  )
+                                })()}
                               </div>
                             )}
                             {Array.isArray(parsed.documents) && parsed.documents.length > 0 && (

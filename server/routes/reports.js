@@ -30,8 +30,8 @@ function createReportsRouter({ db, USE_IKAP2_FOR_STATEMENTS, IKAP2_BACKEND_URL, 
             // Получили отчет от ikap2
             const ikap2Report = ikap2Response.data
 
-            // Локальные поля (налог и фин. отчётность) — не перезатирать данными от ikap2
-            const localReport = await db.prepare('SELECT company_bin, amount, term, purpose, name, email, phone, files_count, tax_status, tax_report_text, fs_status, fs_report_text, fs_report_structured, tax_missing_periods, fs_missing_periods FROM reports WHERE session_id = ?').get(sessionId)
+            // Локальные поля (налог, фин. отчётность, onepage) — не перезатирать данными от ikap2
+            const localReport = await db.prepare('SELECT company_bin, amount, term, purpose, name, email, phone, files_count, tax_status, tax_report_text, fs_status, fs_report_text, fs_report_structured, tax_missing_periods, fs_missing_periods, docs_overview_json, docs_overview_text FROM reports WHERE session_id = ?').get(sessionId)
 
             try {
               await upsertReport(sessionId, {
@@ -75,6 +75,8 @@ function createReportsRouter({ db, USE_IKAP2_FOR_STATEMENTS, IKAP2_BACKEND_URL, 
                 fsReportText: localReport?.fs_report_text,
                 fsReportStructured: localReport?.fs_report_structured,
                 fsMissing: localReport?.fs_missing_periods,
+                docsOverviewJson: localReport?.docs_overview_json ?? null,
+                docsOverviewText: localReport?.docs_overview_text ?? null,
               }
             })
           }

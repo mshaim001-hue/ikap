@@ -49,19 +49,31 @@ function mergeResults(resultBankTax, resultFinancial) {
 
   const c1 = resultBankTax?.completeness || {}
   const c2 = resultFinancial?.completeness || {}
-  const hasBoth = resultBankTax && resultFinancial
+  const bs = c1.bankStatements || c2.bankStatements || { present: [], missing: [] }
+  const tr = c1.taxReports || c2.taxReports || { present: [], missing: [] }
+  const fr = c2.financialReports || c1.financialReports || { present: [], missing: [] }
+  const allMissingEmpty = !(bs.missing?.length || tr.missing?.length || fr.missing?.length)
+
   const completeness = {
-    ...c1,
-    ...c2,
-    bankStatements: c1.bankStatements || c2.bankStatements || { present: [], missing: [] },
-    taxReports: c1.taxReports || c2.taxReports || { present: [], missing: [] },
-    financialReports: c2.financialReports || c1.financialReports || { present: [], missing: [] },
-    overallComplete: hasBoth
-      ? (!!c1.overallComplete && !!c2.overallComplete)
-      : (c1.overallComplete ?? c2.overallComplete ?? null),
+    checkDate: c1.checkDate || c2.checkDate,
+    yearsChecked: c1.yearsChecked || c2.yearsChecked,
+    taxRegime: c1.taxRegime || c2.taxRegime,
+    isComplete: allMissingEmpty,
+    bankStatements: bs,
+    taxReports: tr,
+    financialReports: fr,
   }
 
-  return { documents, completeness, summaryText: completeness.summaryText || null }
+  let summaryText = resultBankTax?.summaryText || resultFinancial?.summaryText
+  if (!summaryText && completeness.isComplete) summaryText = 'Пакет документов полный.'
+  if (!summaryText && !completeness.isComplete) {
+    const parts = []
+    if (bs.missing?.length) parts.push('Банковские выписки: не хватает ' + bs.missing.map(m => m.missingPeriods || m.description || m.year).join('; '))
+    if (tr.missing?.length) parts.push('Налоговые: не хватает ' + tr.missing.length + ' док.')
+    if (fr.missing?.length) parts.push('Фин. отчётность: не хватает ' + fr.missing.map(m => (m.formCode || m.formName || '?') + ' ' + m.year).join(', '))
+    summaryText = parts.join('. ') || null
+  }
+  return { documents, completeness, summaryText }
 }
 
 async function runDocumentsOverviewAnalysis(db, normalizeFileName, baseUrl, sessionId) {
