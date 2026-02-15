@@ -545,13 +545,28 @@ const AgentsChat = ({ onProgressChange }) => {
       setDialogState('data_collection')
       setApplyPromptShown(false)
 
-      // Показываем спиннер перед переходом к вопросам заявки
+      // Сначала показываем требования по документам и кнопку «Продолжить»
+      setIsLoading(true)
+      setTimeout(() => {
+        const docsText = 'Для успешной регистрации заявки нужны документы в формате PDF: банковские выписки, налоговые декларации и финансовая отчётность за 2 последних полных года.\n\nЕсли у вас есть все необходимые документы, нажмите кнопку «Продолжить».'
+        const botMessage = createBotMessage(docsText, {
+          choiceButtons: [{ label: 'Продолжить', value: 'continue_docs' }]
+        })
+        setMessages(prev => [...prev, botMessage])
+        setIsLoading(false)
+      }, 800)
+    }
+
+    if (choice === 'continue_docs') {
+      const userMessage = createUserMessage('Продолжить')
+      setMessages(prev => [...prev, userMessage])
+
       setIsLoading(true)
       setTimeout(() => {
         const botMessage = createBotMessage('Какую сумму в тенге Вы хотите получить?')
         setMessages(prev => [...prev, botMessage])
         setIsLoading(false)
-      }, 800)
+      }, 500)
     }
   }
 
