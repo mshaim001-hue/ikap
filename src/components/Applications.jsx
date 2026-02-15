@@ -1120,7 +1120,7 @@ const Applications = () => {
                                   <p style={{ color: '#b45309', fontSize: 13 }}>
                                     Не хватает выписок за период: {parsed.completeness.bankStatements.missing.map(m => {
                                       if (typeof m !== 'object' || m === null) return String(m)
-                                      return m.missingPeriods || m.description || m.year ?? ''
+                                      return (m.missingPeriods || m.description || m.year) ?? ''
                                     }).join('; ')}
                                   </p>
                                 )}
